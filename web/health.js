@@ -7,18 +7,20 @@
 let extensionUI = null, errorUI = null;
 const base = new URL('./', import.meta.url);
 const query = new URLSearchParams(location.search);
-const language = query.get('freevideo_lang');
-const cn = language === 'zh' || (language !== 'en' && String(navigator.language || '').toLowerCase().startsWith('zh'));
-const t = (en, zh) => cn ? zh : en;
+const storedLang = typeof localStorage !== 'undefined' ? localStorage.getItem('freevideo_lang') : null;
+const language = query.get('freevideo_lang') || storedLang;
+const ru = language === 'ru' || (language !== 'en' && language !== 'zh' && String(navigator.language || '').toLowerCase().startsWith('ru'));
+const cn = language === 'zh' || (language !== 'en' && !ru && String(navigator.language || '').toLowerCase().startsWith('zh'));
+const t = (en, zh, ruText) => ru ? (ruText || en) : (cn ? zh : en);
 // launcher.js removes this flag during setup; read it before that.
 const launchVisit = query.get('freevideo') === 'launch';
 // Every script this folder ships; a test keeps the list in step with web/*.js.
 export const MODULES = ['agent_activity.js', 'agent_connect.js', 'agent_session.js', 'browser_extension.js', 'chain_support.js', 'capability_view.js', 'compatibility.js', 'error_panel.js', 'first_run_guide.js', 'fonts.js', 'freevideo.js', 'generation_progress.js',
     'editor.js', 'editor_actions.js', 'editor_adjust.js', 'editor_adjust_picture.js', 'editor_picture_fields.js', 'editor_picture_session.js', 'editor_preview_picture.js', 'editor_entry.js', 'editor_export_dialog.js', 'editor_first_frame.js', 'editor_genbar.js', 'editor_geometry.js', 'editor_library.js', 'editor_menu.js', 'editor_model.js', 'editor_frame.js', 'editor_player.js', 'editor_room.js', 'editor_select.js', 'editor_state.js', 'editor_store.js', 'editor_tracks.js', 'editor_generation.js', 'editor_transport.js', 'editor_transport_model.js', 'editor_audio.js', 'editor_audio_model.js', 'editor_audio_notes.js', 'editor_audio_replace.js', 'editor_audio_rules.js', 'editor_speed.js', 'editor_speed_model.js',
-    'editor_loader.js', 'editor_text_coverage.js', 'editor_text.js', 'editor_text_model.js', 'editor_text_layout.js', 'editor_notes.js', 'editor_icons.js', 'dialog_keys.js', 'frame_sizes.js', 'health.js', 'image_commands.js', 'image_editor.js', 'image_editor_engine.js', 'launcher.js', 'length_plan.js', 'library.js', 'motion.js', 'output_download.js', 'port_notice.js', 'preview_scene.js',
+    'editor_loader.js', 'editor_text_coverage.js', 'editor_text.js', 'editor_text_model.js', 'editor_text_layout.js', 'editor_notes.js', 'editor_icons.js', 'dialog_keys.js', 'frame_sizes.js', 'health.js', 'i18n.js', 'image_commands.js', 'image_editor.js', 'image_editor_engine.js', 'launcher.js', 'length_plan.js', 'library.js', 'motion.js', 'output_download.js', 'port_notice.js', 'preview_scene.js',
     'progress_connection.js', 'prompt_draft.js', 'prompt_enhance.js', 'prompt_references.js', 'report_issue.js', 'studio_recent.js',
     'result_actions.js', 'sampling_effort.js', 'setup.js', 'share.js', 'share_layout.js', 'studio.js', 'studio_chain.js', 'studio_extend.js', 'studio_length.js', 'first_frame_row.js', 'studio_queue.js', 'studio_size.js',
-    'toolbar_position.js', 'updates.js', 'view_navigation.js', 'wordmark.js'];
+    'toolbar_position.js', 'translations_ru.js', 'updates.js', 'view_navigation.js', 'wordmark.js'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let visibleAt = 0;
 async function waitForVisible() {

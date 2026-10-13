@@ -5,11 +5,7 @@ import { createUpdateNotice, createVersionInfo } from './updates.js';
 import { makeMovable } from './toolbar_position.js';
 import { openEditorView } from './editor_loader.js';
 
-const languageOverride = typeof location !== 'undefined'
-    ? new URLSearchParams(location.search).get('freevideo_lang') : null;
-const cn = languageOverride === 'zh' || (languageOverride !== 'en'
-    && String(navigator.language || '').toLowerCase().startsWith('zh'));
-const t = (en, zh) => cn ? zh : en;
+import { t, isZh as cn, getLanguage, setLanguage } from './i18n.js';
 const preference = 'freevideo.view';
 let toolbar, open, selected, currentView = 'nodes';
 const style = document.createElement('link');
@@ -73,10 +69,17 @@ export function installNavigation(openStudio) {
         const focused = Object.values(app.canvas?.selected_nodes || {}).find(n => n.comfyClass === 'FreeVideoGenerate' || n.type === 'FreeVideoGenerate');
         refreshNavigation(); if (focused || selected) return action(focused || selected);
     };
+    const langBtn = document.createElement('button'); langBtn.type = 'button';
+    langBtn.textContent = getLanguage().toUpperCase(); langBtn.className = 'fv-view-settings fv-view-lang';
+    langBtn.title = t('Switch language', '切换语言', 'Сменить язык');
+    langBtn.onclick = () => {
+        const next = getLanguage() === 'ru' ? 'en' : (getLanguage() === 'en' ? 'zh' : 'ru');
+        setLanguage(next);
+    };
     const settings = document.createElement('button'); settings.type = 'button';
     settings.textContent = t('Settings', '设置'); settings.className = 'fv-view-settings'; settings.onclick = openSetup;
     row.append(grip, brand, viewSwitch('nodes', openCreativeWorkspace, () => {}, () => choose(node =>
-        openEditorView(node))), createVersionInfo(cn).element, settings); toolbar.append(row);
+        openEditorView(node))), createVersionInfo(cn).element, langBtn, settings); toolbar.append(row);
     let shown = false;
     try { shown = localStorage.getItem('freevideo.view-guide') === '1'; } catch { /* Show once this session. */ }
     if (!shown) {

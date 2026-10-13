@@ -1,7 +1,8 @@
 import { api } from '../../scripts/api.js';
+import { t as i18nT, getLanguage } from './i18n.js';
 
 // Every platform downloads from one release: the latest vX.Y.Z, or the rolling nightly.
-const releasePage = 'https://github.com/FlashML-org/FreeVideo/releases/latest';
+const releasePage = 'https://github.com/mrtek/FreeVideoRU/releases/latest';
 const nightlyPage = 'https://github.com/FlashML-org/FreeVideo/releases/tag/nightly';
 const storageKey = 'freevideo.dismissed-update';
 const listeners = new Set();
@@ -12,12 +13,12 @@ let loadedVersion, updating = false, offline = false, failure = '';
 try { dismissed = sessionStorage.getItem(storageKey); } catch { /* Session memory still works. */ }
 // The launcher passes its language in the first address, which ComfyUI later
 // rewrites; keep it when reloading into an updated engine.
-const languageHint = (() => { try { return new URLSearchParams(location.search).get('freevideo_lang'); } catch { return null; } })();
+const languageHint = (() => { try { return new URLSearchParams(location.search).get('freevideo_lang') || localStorage.getItem('freevideo_lang'); } catch { return null; } })();
 const identity = candidate => candidate ? [candidate.version, candidate.revision, candidate.built_at].join(':') : '';
 const displayVersion = release => release?.product_version ? 'v' + release.product_version : release?.version || '—';
 // The running release's product version ("0.3.4"), once the first check has answered.
 export const productVersion = () => value?.current_release?.product_version || null;
-const localizedNotes = (release, cn) => release?.release_notes?.[cn ? 'zh' : 'en'];
+const localizedNotes = (release, cn) => { const lang = getLanguage(); return release?.release_notes?.[lang] || release?.release_notes?.[cn ? 'zh' : 'en'] || release?.release_notes?.en; };
 const versionParts = value => String(value || '').split('.').map(Number);
 const newerThan = (a, b) => {
     const [x, y] = [versionParts(a), versionParts(b)];
@@ -103,7 +104,7 @@ export function startUpdateChecks() {
 }
 
 export function createUpdateNotice(cn) {
-    const t = (en, zh) => cn ? zh : en;
+    const t = (en, zh) => i18nT(en, zh);
     const element = document.createElement('aside'); element.className = 'fv-update-notice';
     element.hidden = true; element.setAttribute('role', 'status');
     const label = document.createElement('span');
@@ -183,7 +184,7 @@ export function createUpdateNotice(cn) {
 }
 
 function showReleaseNotes(cn) {
-    const t = (en, zh) => cn ? zh : en;
+    const t = (en, zh) => i18nT(en, zh);
     const dialog = document.createElement('dialog'); dialog.className = 'fv-release-notes';
     const title = document.createElement('h2'); title.textContent = t('Version & release notes', '版本与更新说明');
     dialog.setAttribute('aria-label', title.textContent);

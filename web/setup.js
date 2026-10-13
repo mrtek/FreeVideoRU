@@ -9,11 +9,7 @@ const css = document.createElement('link');
 css.rel = 'stylesheet'; css.href = new URL('./setup.css', import.meta.url).href;
 document.head.append(css);
 
-const languageOverride = typeof location !== 'undefined'
-    ? new URLSearchParams(location.search).get('freevideo_lang') : null;
-const cn = languageOverride === 'zh' || (languageOverride !== 'en'
-    && String(navigator.language || '').toLowerCase().startsWith('zh'));
-const t = (en, zh) => cn ? zh : en;
+import { t, isZh as cn, getLanguage, setLanguage } from './i18n.js';
 const gib = n => Number.isFinite(n) ? (n / 2 ** 30).toFixed(1) + " GiB" : "—";
 const failureText = value => {
     const text = String(value || ''), matches = [...text.matchAll(/MODEL_MISMATCH_REPAIR: ([^\r\n]+)/g)];
@@ -43,6 +39,20 @@ export async function openSetup() {
     dismiss.setAttribute('aria-label', t('Close', '关闭')); dismiss.onclick = () => closeDialog(dialog);
     heading.append(wordmark(), node('h2', t('Settings', '设置')), dismiss);
     dialog.setAttribute('aria-label', t('FreeVideo settings', 'FreeVideo 设置'));
+    const langRow = node('div'); langRow.className = 'fv-row'; langRow.style.padding = '4px 0 12px 0';
+    const langLabel = node('label', t('Language: ', '语言：', 'Язык: '));
+    langLabel.style.display = 'flex'; langLabel.style.alignItems = 'center'; langLabel.style.gap = '8px'; langLabel.style.fontWeight = '500';
+    const langSelect = node('select');
+    for (const [id, label] of [['ru', 'Русский (Russian)'], ['en', 'English'], ['zh', '中文 (Chinese)']]) {
+        const opt = node('option', label); opt.value = id;
+        if (getLanguage() === id) opt.selected = true;
+        langSelect.append(opt);
+    }
+    langSelect.onchange = () => {
+        setLanguage(langSelect.value);
+        location.reload();
+    };
+    langLabel.append(langSelect); langRow.append(langLabel);
     const installation = node('details'); installation.open = true;
     installation.append(node('summary', t('Installation & model folders', '安装与模型目录')));
     const inputs = node("div"); installation.append(inputs);
@@ -153,7 +163,7 @@ export async function openSetup() {
         const {openCreativeWorkspace} = await import('./view_navigation.js');
         return openCreativeWorkspace();
     }});
-    dialog.append(heading, installation, downloads, agentConnect(t, api), advanced, guideReplay);
+    dialog.append(heading, langRow, installation, downloads, agentConnect(t, api), advanced, guideReplay);
     const motions = [...dialog.querySelectorAll('details')].map(animateDetails);
     dialog.addEventListener('cancel', e => { e.preventDefault(); closeDialog(dialog); });
     document.body.append(dialog); dialog.showModal();

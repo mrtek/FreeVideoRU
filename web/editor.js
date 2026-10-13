@@ -27,8 +27,8 @@ const editorStyles = Promise.all(['editor.css', 'editor_tracks.css', 'editor_fra
     const ready = 'sheet' in style ? new Promise(resolve => { style.onload = style.onerror = resolve; }) : Promise.resolve();
     document.head.append(style); return ready;
 }));
+import { t, isZh as cn } from './i18n.js';
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
-const language = () => new URLSearchParams(location.search).get('freevideo_lang') || navigator.language;
 function restoreGeneration(record, before, prepared) {
     const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
     const entries = value => new Map(value.tracks.flatMap(track => track.clips.map(clip => [clip.id, {track: track.id, clip}])));
@@ -86,7 +86,6 @@ export function suspendCanvasPointer(canvas) {
 // `components` replaces the optional progress module (see loadEditorComponents); tests also pass their generation stand-in here.
 export function openEditor({api, app, from = null, panel = {}, components: given = undefined, onView = view => viewChanged(view)}) {
     if (opened) { opened.element.focus(); return opened; }
-    const t = (en, zh) => String(language()).toLowerCase().startsWith('zh') ? zh : en;
     const returnFocus = document.activeElement;
     const even = value => Math.max(2, Math.floor(value / 2) * 2);
     const initial = () => model.emptyProject({width: even(panel.width || 1344), height: even(panel.height || 768), settings: panel.settings || null,

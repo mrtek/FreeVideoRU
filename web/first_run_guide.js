@@ -1,26 +1,33 @@
+import { t, isZh, isRu } from './i18n.js';
+
 const FILE = '/userdata/' + encodeURIComponent('freevideo/guide.json');
 let attempted = false, current = null;
 
 export const REPLAY_TEXT = {
-    title: ['Getting started', '新手指引'],
-    again: ['Show again', '再看一遍'],
-    waiting: ['Waiting for the workspace to be ready. The guide will start automatically.', '正在等待创作面板就绪，随后会自动开始指引。'],
-    cancel: ['Cancel', '取消'],
-    unavailable: ['Open a creation workflow to view the guide.', '请先打开创作工作流，再查看指引。'],
+    title: ['Getting started', '新手指引', 'Руководство пользователя'],
+    again: ['Show again', '再看一遍', 'Показать снова'],
+    waiting: ['Waiting for the workspace to be ready. The guide will start automatically.', '正在等待创作面板就绪，随后会自动开始指引。', 'Ожидание готовности рабочего пространства. Руководство начнется автоматически.'],
+    cancel: ['Cancel', '取消', 'Отмена'],
+    unavailable: ['Open a creation workflow to view the guide.', '请先打开创作工作流，再查看指引。', 'Откройте панель творчества для просмотра руководства.'],
 };
 
 export const CHAPTERS = [
     {id: 'describe', anchor: '[data-fv-guide="describe"]', added: false,
         en: 'Type your prompt here. You can have an agent follow the Skill at the top right, or turn on FreeToken enhancement.',
-        zh: '在这里输入提示词。可以让 Agent 参考右⁠上⁠角的 Skill，或开启 FreeToken 提示词增强。'},
+        zh: '在这里输入提示词。可以让 Agent 参考右⁠上⁠角的 Skill，或开启 FreeToken 提示词增强。',
+        ru: 'Введите промпт здесь. Вы можете использовать Skill в правом верхнем углу для агента или включить улучшение FreeToken.'},
     {id: 'range', anchor: '[data-fv-guide="range"]', added: true,
-        en: 'See the available sizes and lengths here, and how long each takes.', zh: '在这里查看可生成的尺\u2060寸、时长和预计用时。'},
+        en: 'See the available sizes and lengths here, and how long each takes.', zh: '在这里查看可生成的尺\u2060寸、时长和预计用时。',
+        ru: 'Здесь отображаются доступные размеры, длительность и расчетное время генерации.'},
     {id: 'generate', anchor: '[data-fv-guide="generate"]', added: false,
-        en: 'Choose "Generate video". Progress and the time left appear in the preview.', zh: '点“生成视频”，进度和剩\u2060余\u2060时\u2060间会显示在预览区。'},
+        en: 'Choose "Generate video". Progress and the time left appear in the preview.', zh: '点“生成视频”，进度和剩\u2060余\u2060时\u2060间会显示在预览区。',
+        ru: 'Нажмите «Сгенерировать видео». Прогресс и оставшееся время отобразятся в окне предпросмотра.'},
     {id: 'longer', anchor: '[data-fv-guide="longer"]', added: true,
-        en: 'For a longer video, or to change part of one, choose "Edit".', zh: '要做更长的视频，或者修\u2060改\u2060其\u2060中\u2060一\u2060段，点“剪辑视图”。'},
+        en: 'For a longer video, or to change part of one, choose "Edit".', zh: '要做更长的视频，或者修\u2060改\u2060其\u2060中\u2060一\u2060段，点“剪辑视图”。',
+        ru: 'Для создания более длинного видео или редактирования фрагмента перейдите в «Монтаж».'},
     {id: 'agent', anchor: '[data-fv-guide="agent"]', added: true,
-        en: 'Connect Claude Code, Codex or another agent in Settings and let it make videos.', zh: '在设置里连接 Claude Code、Codex 等 Agent，让它生成视频。'},
+        en: 'Connect Claude Code, Codex or another agent in Settings and let it make videos.', zh: '在设置里连接 Claude Code、Codex 等 Agent，让它生成视频。',
+        ru: 'Подключите Claude Code, Codex или другого агента в Настройках, чтобы создавать видео автоматически.'},
 ];
 
 export function guideSteps({record, available = [], returning = false, blockers = {}, all = false}) {
@@ -91,7 +98,7 @@ const visible = e => {
 const clamp = (n, low, high) => Math.max(low, Math.min(high, n));
 
 export function createGuideReplayEntry({dialog, cn, openWorkspace, replay = showGuide}) {
-    const text = key => REPLAY_TEXT[key][cn ? 1 : 0];
+    const text = key => isRu() ? (REPLAY_TEXT[key][2] || REPLAY_TEXT[key][0]) : (cn ? REPLAY_TEXT[key][1] : REPLAY_TEXT[key][0]);
     const section = el('section', null, 'fv-guide-replay'), row = el('div', null, 'fv-guide-replay-row');
     const button = el('button', text('again')); button.type = 'button';
     const status = el('div', null, 'fv-muted'); status.setAttribute('role', 'status'); status.hidden = true;
@@ -113,7 +120,6 @@ export function createGuideReplayEntry({dialog, cn, openWorkspace, replay = show
 }
 
 export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
-    const t = (en, zh) => cn ? zh : en;
     const automatic = !attempted;
     if (!document.querySelector('link[data-fv-first-run-guide]')) {
         const css = el('link'); css.rel = 'stylesheet'; css.dataset.fvFirstRunGuide = '';
@@ -204,7 +210,7 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
         ring = el('div', null, 'fv-guide-ring'); ring.setAttribute('aria-hidden', 'true');
         bubble = el('div', null, 'fv-guide-bubble'); bubble.setAttribute('role', 'dialog'); bubble.setAttribute('aria-modal', 'false');
         bubble.setAttribute('aria-label', t('Getting started', '使用指引')); bubble.setAttribute('aria-describedby', 'fv-guide-message');
-        const message = el('p', cn ? steps[index].zh : steps[index].en, 'fv-guide-message'); message.id = 'fv-guide-message';
+        const message = el('p', t(steps[index].en, steps[index].zh, steps[index].ru), 'fv-guide-message'); message.id = 'fv-guide-message';
         message.setAttribute('aria-live', 'polite'); message.setAttribute('aria-atomic', 'true');
         const footer = el('div', null, 'fv-guide-footer'), dots = el('div', null, 'fv-guide-dots'), actions = el('div', null, 'fv-guide-actions');
         dots.setAttribute('aria-label', t('Guide progress', '指引进度'));

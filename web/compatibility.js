@@ -1,10 +1,6 @@
 import { api } from '../../scripts/api.js';
 
-const languageOverride = typeof location !== 'undefined'
-    ? new URLSearchParams(location.search).get('freevideo_lang') : null;
-const cn = languageOverride === 'zh' || (languageOverride !== 'en'
-    && String(navigator.language || '').toLowerCase().startsWith('zh'));
-const t = (en, zh) => cn ? zh : en;
+import { t, isZh as cn } from './i18n.js';
 const unavailable = () => t('Device information is unavailable; compatibility settings are off.', '无法获取设备信息，兼容性设置已关闭。');
 let current;
 const element = (tag, text) => { const node = document.createElement(tag); if (text) node.textContent = text; return node; };

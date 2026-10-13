@@ -29,11 +29,7 @@ import { firstFrameRow } from './first_frame_row.js';
 import { createStudioChain, chainPosition, readChainResult, sumPartEstimates, singleRunSnapshot } from './studio_chain.js?v=20261011-length';
 import { createExtendState, extendText, extendSourceExists, readExtendRecord, extendSnapshot, mountExtendThumbnail } from './studio_extend.js';
 
-const languageOverride = typeof location !== 'undefined'
-    ? new URLSearchParams(location.search).get('freevideo_lang') : null;
-const cn = languageOverride === 'zh' || (languageOverride !== 'en'
-    && String(navigator.language || '').toLowerCase().startsWith('zh'));
-const t = (en, zh) => cn ? zh : en;
+import { t, isZh as cn } from './i18n.js';
 const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = new URL('./studio.css', import.meta.url).href; document.head.append(css);
 const effortCss = document.createElement('link'); effortCss.rel = 'stylesheet'; effortCss.href = new URL('./sampling_effort.css', import.meta.url).href; document.head.append(effortCss);
 const enhanceCss = document.createElement('link'); enhanceCss.rel = 'stylesheet'; enhanceCss.href = new URL('./prompt_enhance.css', import.meta.url).href; document.head.append(enhanceCss);
