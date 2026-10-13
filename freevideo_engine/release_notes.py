@@ -36,6 +36,13 @@ def notes(value):
                 or not all(_text(item, 600) for item in changes)):
             return None
         result[language] = dict(summary=row['summary'].strip(), changes=[item.strip() for item in changes])
+    if 'ru' in value:
+        row = value.get('ru')
+        if isinstance(row, dict) and _text(row.get('summary'), 400):
+            changes = row.get('changes')
+            if (isinstance(changes, list) and 1 <= len(changes) <= 12
+                    and all(_text(item, 600) for item in changes)):
+                result['ru'] = dict(summary=row['summary'].strip(), changes=[item.strip() for item in changes])
     return result if len(json.dumps(result).encode('utf-8')) <= MAX_NOTES_BYTES else None
 
 
@@ -156,7 +163,10 @@ def markdown(value):
         return re.sub(r'([\\`*_{}\[\]()#+.!<>|~-])', r'\\\1', text)
     title = 'FreeVideo v' + data['product_version']
     rows = ['# ' + title, '', 'Build / 构建号: ' + escape(str(value['version'])), '']
-    for language, heading in (('en', "What's new"), ('zh', '更新内容')):
+    headings = [('en', "What's new"), ('zh', '更新内容')]
+    if 'ru' in release:
+        headings.append(('ru', 'Что нового'))
+    for language, heading in headings:
         row = release[language]
         rows.extend(['## ' + heading, '', escape(row['summary']), ''])
         rows.extend('- ' + escape(item) for item in row['changes'])

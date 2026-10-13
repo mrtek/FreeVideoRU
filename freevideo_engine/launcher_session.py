@@ -144,7 +144,9 @@ class Session:
                 self.activate_offline(root)
         self.inspect_compatibility()
 
-    def t(self, en, zh):
+    def t(self, en, zh, ru=None):
+        if self.language.startswith('ru'):
+            return ru if ru is not None else en
         return zh if self.language.startswith('zh') else en
 
     def engine_root(self):
@@ -577,11 +579,17 @@ class Session:
 
     def _browser_url(self, address):
         """Return the URL used by the browser, with the launcher locale hint."""
-        if not address or not self.language.startswith('zh'):
+        if not address:
+            return address
+        if self.language.startswith('zh'):
+            lang = 'zh'
+        elif self.language.startswith('ru'):
+            lang = 'ru'
+        else:
             return address
         parsed = urlsplit(address)
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        query['freevideo_lang'] = 'zh'
+        query['freevideo_lang'] = lang
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
                            urlencode(query), parsed.fragment))
 
@@ -1272,7 +1280,8 @@ class Session:
         offer = self.archive_offer()
         if offer and offer['bytes'] >= 2**20:
             return self.t('The offline package ZIP files you imported still take %s. FreeVideo no longer needs them.',
-                          '导入用过的离线包压缩包还占着 %s，FreeVideo 已经用不到它们。') % size_text(offer['bytes'])
+                          '导入用过的离线包压缩包还占着 %s，FreeVideo 已经用不到它们。',
+                          'Импортированные ZIP-архивы офлайн-пакетов занимают %s. FreeVideo они больше не нужны.') % size_text(offer['bytes'])
         return ''
 
     def archives_confirm_text(self):
@@ -1281,18 +1290,20 @@ class Session:
             return ''
         count = len(offer['paths'])
         english = 'Delete 1 ZIP file (%s)? This cannot be undone.' if count == 1 else 'Delete %d ZIP files (%%s)? This cannot be undone.' % count
-        return self.t(english % size_text(offer['bytes']), '删除 %d 个压缩包（%s）？删除后不能恢复。' % (count, size_text(offer['bytes'])))
+        return self.t(english % size_text(offer['bytes']), '删除 %d 个压缩包（%s）？删除后不能恢复。' % (count, size_text(offer['bytes'])),
+                      'Удалить %d ZIP-архив(ов) (%s)? Это действие нельзя отменить.' % (count, size_text(offer['bytes'])))
 
     def archives_done_text(self):
         freed = getattr(self, 'archives_freed', 0) or 0
-        return self.t('ZIP files deleted · %s freed', '已删除压缩包 · 释放 %s') % size_text(freed) if freed >= 2**20 else ''
+        return self.t('ZIP files deleted · %s freed', '已删除压缩包 · 释放 %s', 'ZIP-архивы удалены · освобождено %s') % size_text(freed) if freed >= 2**20 else ''
 
     def archives_failed_text(self):
         failed = getattr(self, 'archives_failed', 0) or 0
         if not failed:
             return ''
         return self.t('1 ZIP file could not be deleted.' if failed == 1 else '%d ZIP files could not be deleted.' % failed,
-                      '%d 个压缩包没能删除。' % failed)
+                      '%d 个压缩包没能删除。' % failed,
+                      'Не удалось удалить %d ZIP-архив(ов).' % failed)
 
     def licenses(self, row):
         """What the consent accepts, listed when the user reads the licences: an offline runtime's, or the installation plan's."""
@@ -1309,25 +1320,27 @@ class Session:
         from .failure_details import REPAIR_KINDS, launcher_failure, redacted_launcher_error, display_launcher_error
         from .launcher_copy import display, progress_view, source_name
         zh = self.language.startswith('zh')
+        ru = self.language.startswith('ru')
+        lang = 'ru' if ru else ('zh' if zh else 'en')
         row = self.controller.state
         task = row.get('task', {})
         port_from = int(row['moved_from']) if row.get('status') == 'open' and 'moved_from' in row else 0
         port_to = (urlsplit(row['url']).port or 80) if port_from else 0
-        progress = progress_view(task.get('progress') or {}, zh)
-        overall = progress_view(row.get('overall') or task.get('phase_progress') or {}, zh)
+        progress = progress_view(task.get('progress') or {}, zh=zh, ru=ru)
+        overall = progress_view(row.get('overall') or task.get('phase_progress') or {}, zh=zh, ru=ru)
         if self.importer.busy:
             # The sidebar's Working card follows the offline import, not the idle installer.
             state = self.importer.state
             if state.get('status') == 'downloading':
-                label = self.t('Downloading models', '下载模型')
+                label = self.t('Downloading models', '下载模型', 'Скачивание моделей')
             elif state.get('status') == 'preparing':
-                label = self.t('Checking packages', '检查配套包')
+                label = self.t('Checking packages', '检查配套包', 'Проверка пакетов')
             else:
-                label = self.t('Importing offline packages', '导入离线包')
+                label = self.t('Importing offline packages', '导入离线包', 'Импорт офлайн-пакетов')
                 if (state.get('count') or 0) > 1:
                     label += ' %d/%d' % (state.get('index') or 1, state['count'])
                 if state.get('detail'):
-                    label += ' · ' + display(state['detail'], zh)
+                    label += ' · ' + display(state['detail'], zh=zh, ru=ru)
             overall = dict(label=label, done=state.get('done'), total=state.get('total'))
         shortcut = row.get('shortcut') or {}
         raw_error = self._raw_error()
@@ -1336,11 +1349,11 @@ class Session:
         by_id = {r['id']: r for r in self.model_groups}
         ready = bool(row.get('selection', {}).get('ready') or row.get('status') == 'open')
         models = []
-        states = {'ready': ('Ready', '已就绪'), 'done': ('Done', '已完成'), 'waiting': ('Waiting for scan', '等待检查'),
-                  'pending': ('Download needed', '需要下载'), 'replace': ('Needs replacing', '需要替换'),
-                  'queued': ('Waiting to download', '等待下载'), 'downloading': ('Downloading', '正在下载'),
-                  'verifying': ('Downloaded; verifying', '已下载，正在校验'),
-                  'paused': ('Paused', '已暂停')}
+        states = {'ready': ('Ready', '已就绪', 'Готово'), 'done': ('Done', '已完成', 'Завершено'), 'waiting': ('Waiting for scan', '等待检查', 'Ожидание проверки'),
+                  'pending': ('Download needed', '需要下载', 'Требуется скачивание'), 'replace': ('Needs replacing', '需要替换', 'Требуется замена'),
+                  'queued': ('Waiting to download', '等待下载', 'Ожидание скачивания'), 'downloading': ('Downloading', '正在下载', 'Скачивание'),
+                  'verifying': ('Downloaded; verifying', '已下载，正在校验', 'Скачано; проверка'),
+                  'paused': ('Paused', '已暂停', 'Приостановлено')}
         review = row.get('status') == 'review'
         for name in FAMILIES:
             if name == 'sampling' and name not in by_id and not self.form['sampling_caches']:
@@ -1448,14 +1461,14 @@ class Session:
         if alias_failure(model_upgrade.get('error', '')):
             model_upgrade['error'] = display_launcher_error(model_upgrade['error'], zh=zh)
         return plain_data(dict(sampling_cache_bytes=total_bytes(), version=__version__,
-            disk=disk, decimal_sizes=sys.platform == 'darwin', zh=self.language.startswith('zh'), form=dict(self.form),
+            disk=disk, decimal_sizes=sys.platform == 'darwin', zh=zh, ru=ru, language=lang, form=dict(self.form),
             page=self.page, status=row.get('status', 'idle'), busy=self.controller.busy or self.importer.busy or self.cleaner.busy,
             cleanup=cleanup,
             can_cleanup=not (self.controller.busy or self.importer.busy or self.cleaner.busy or self.closing
                 or self.update_intent or self.engine_updating or self.updater and self.updater.busy
                 or self.upgrade.active or self.model_switch),
             model_upgrade=dict(model_upgrade, switching=bool(self.model_switch)),
-            offline=dict(progress_view(self.importer.state, zh), runtime=bool(self.form['offline_runtime']),
+            offline=dict(progress_view(self.importer.state, zh=zh, ru=ru), runtime=bool(self.form['offline_runtime']),
                 runtime_supported=runtime_packages_supported(),
                 models=len(self.form['offline_models']), guide=package_instructions(self.form['new_comfy'] and self.form['environment_method'] == 'manual'
                                            and not self.form['offline_runtime'], zh)),
@@ -1468,9 +1481,9 @@ class Session:
             progress_text=file_text, remaining_seconds=remaining,
             elapsed=duration(time.monotonic()-self.started) if self.started else '', summary=' · '.join(estimate),
             failure=failure,
-            source=source, source_name=source_name(source, zh), proxy_mode=preferences['proxy_mode'],
+            source=source, source_name=source_name(source, zh=zh, ru=ru), proxy_mode=preferences['proxy_mode'],
             probe=probe, speeds=speeds, token_set=bool(self.token),
-            log=self.tail.text, logs=[dict(label=display(n, zh), path=str(p)) for n, p in self.controller.terminal_sources()],
+            log=self.tail.text, logs=[dict(label=display(n, zh=zh, ru=ru), path=str(p)) for n, p in self.controller.terminal_sources()],
             url=(self._browser_url(row.get('url', '')) if row.get('status') == 'open' else ''), shortcut=shortcut,
             port_from=port_from, port_to=port_to,
             old_versions=self.old_versions_text(), copied_models=self.copied_models_text(),
@@ -1480,7 +1493,7 @@ class Session:
             update=update, engine_update_available=bool(row.get('engine_update_available')),
             settings_path=str(self.store.primary),
             review_id=row.get('plan', {}).get('plan_id', ''),
-            consent=self.t('I accept the installation plan and model / toolkit licenses.', '我同意安装计划及模型／工具包许可证。'),
+            consent=self.t('I accept the installation plan and model / toolkit licenses.', '我同意安装计划及模型／工具包许可证。', 'Я принимаю план установки и лицензии моделей / инструментов.'),
             licenses=self.licenses(row), portable=False, needs_consent=bool(getattr(self.controller, 'fixed_environment', False) is True
                 and not (io_path(self.controller.root) / 'engine/portable-consent.json').exists()),
             review=dict(engine=str(row.get('selection', {}).get('engine', self.form['engine'])),

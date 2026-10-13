@@ -6,101 +6,103 @@
 </div>
 
 <p align="center">
-| <a href="https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo.exe"><b>Windows</b></a> | <a href="https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Mac-arm64.dmg"><b>macOS</b></a> | <a href="https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Linux-x86_64.AppImage"><b>Linux</b></a> | <a href="docs/community-results.md"><b>Community Results</b></a> | <a href="https://freevideo-community.pages.dev/#gallery"><b>Gallery</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Discord</b></a> | <a href="https://freevideo-community.pages.dev/qq"><b>QQ Group</b></a> | <a href="https://freevideo-community.pages.dev/wechat"><b>WeChat Group</b></a> |
+| <a href="https://github.com/mrtek/FreeVideoRU/releases/latest/download/FreeVideoRU.exe"><b>Windows</b></a> | <a href="https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Mac-arm64.dmg"><b>macOS</b></a> | <a href="https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Linux-x86_64.AppImage"><b>Linux</b></a> | <a href="docs/community-results.md"><b>Тесты сообщества</b></a> | <a href="https://freevideo-community.pages.dev/#gallery"><b>Галерея</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Discord</b></a> | <a href="https://freevideo-community.pages.dev/qq"><b>Группа QQ</b></a> | <a href="https://freevideo-community.pages.dev/wechat"><b>Группа WeChat</b></a> |
 </p>
 
-<p align="center">English · <a href="README.zh-CN.md">中文</a></p>
+<p align="center">Русский · <a href="README.en.md">English</a> · <a href="README.zh-CN.md">中文</a></p>
 
-Make videos on the computer you already own. Powered by [Video DeltaNet (VDN)](https://openvdn.github.io/), FreeVideo runs MiniMax H3 in as little as 8 GB of VRAM and 16 GB of RAM, with acceleration adapted to your&nbsp;hardware.
+Создавайте видео на компьютере, который у вас уже есть. Благодаря [Video DeltaNet (VDN)](https://openvdn.github.io/), FreeVideo запускает MiniMax H3 всего на 8 ГБ видеопамяти (VRAM) и 16 ГБ оперативной памяти (RAM), подбирая оптимальное аппаратное ускорение под вашу систему.
 
 https://github.com/user-attachments/assets/ecda7d0d-7fbe-4e0c-8c29-8f3315bafc15
 
-<p align="center"><a href="https://freevideo-community.pages.dev/#gallery">More clips and the four quality levels side by side in the gallery →</a></p>
+<p align="center"><a href="https://freevideo-community.pages.dev/#gallery">Больше видеоклипов и сравнение четырех уровней качества в галерее →</a></p>
 
-## News
+## Новости
 
-- **2026-10-07** · **[v0.3.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.2): preview first.** See a half-resolution preview first and finish only the videos you like.
-- **2026-10-07** · **[v0.3.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.0): a faster int8 model.** GeForce and RTX 30-series cards switch to int8; an RTX 3090 makes a 5-second video about 2.3x faster.
-- **2026-10-06** · **[Gallery](https://freevideo-community.pages.dev/#gallery) is live.** Watch 20-second clips made with FreeVideo, and the four quality levels side by side.
-- **2026-10-06** · **[v0.2.3](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.3): videos carry their workflow.** Drop a FreeVideo video onto the ComfyUI canvas to restore its prompt, seed and settings. Earlier videos can get theirs too.
-- **2026-10-05** · **[v0.2.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.0): four quality levels.** Choose Light, Medium, High or Max for each video; higher levels give higher quality but take longer. Results can be exported as sharing images or videos with the generation time and GPU.
-- **2026-10-05** · **[v0.1.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.1.2): FreeVideo on Mac.** Apple silicon Macs generate MiniMax H3 videos locally (preview).
-- **2026-10-03** · **Community LoRAs.** Use MiniMax H3 LoRAs right in your workflow. See [examples](docs/LoRA.md).
-- **2026-10-02** · **FreeVideo is open source.** MiniMax H3 on consumer GPUs with as little as 8 GB of VRAM.
+- **2026-10-07** · **[v0.3.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.2): сначала предпросмотр.** Быстрый предпросмотр в половинном разрешении позволяет оценить результат и завершить рендеринг только тех видео, которые вам нравятся.
+- **2026-10-07** · **[v0.3.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.0): ускоренная модель int8.** Видеокарты GeForce и серии RTX 30 переходят на квантование int8; на RTX 3090 создание 5-секундного видео стало быстрее примерно в 2.3 раза.
+- **2026-10-06** · **Открыта [Галерея](https://freevideo-community.pages.dev/#gallery).** Смотрите 20-секундные ролики, созданные в FreeVideo, и наглядное сравнение всех четырех уровней качества.
+- **2026-10-06** · **[v0.2.3](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.3): видео сохраняют свой workflow.** Перетащите готовое видео FreeVideo на холст ComfyUI, чтобы мгновенно восстановить промпт, сид и все параметры генерации. Ранее созданные видео также поддерживаются.
+- **2026-10-05** · **[v0.2.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.0): четыре уровня качества.** Выбирайте Light, Medium, High или Max для каждого видео: высокие уровни дают максимальное качество, но требуют больше времени. Результаты можно экспортировать как изображения или видео для публикации с указанием времени генерации и модели GPU.
+- **2026-10-05** · **[v0.1.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.1.2): FreeVideo на Mac.** Компьютеры Mac на базе Apple Silicon теперь поддерживают локальную генерацию видео MiniMax H3 (предварительная версия).
+- **2026-10-03** · **Пользовательские LoRA.** Используйте LoRA для MiniMax H3 прямо в рабочем процессе. См. [примеры](docs/LoRA.md).
+- **2026-10-02** · **FreeVideo в открытом доступе.** Запуск MiniMax H3 на потребительских видеокартах всего от 8 ГБ VRAM.
 
-## About
+## О проекте
 
-FreeVideo is a local inference engine for MiniMax H3 on consumer GPUs, built on [OpenVDN](https://github.com/OpenVDN)'s 8-step [VDN-H3](https://huggingface.co/OpenVDN/vdn-minimax-h3) model with [Video DeltaNet](https://openvdn.github.io/)'s hybrid attention.
+FreeVideo — это локальный движок инференса для MiniMax H3 на потребительских видеокартах, созданный на базе 8-шаговой модели [VDN-H3](https://huggingface.co/OpenVDN/vdn-minimax-h3) от [OpenVDN](https://github.com/OpenVDN) с гибридным механизмом внимания [Video DeltaNet](https://openvdn.github.io/).
 
-It coordinates VRAM, system memory and disk, adapting weight placement, compute precision and attention kernels to the available hardware. FreeVideo runs as a ComfyUI plugin, with launchers for Windows, macOS and Linux. Its core features include:
+Он интеллектуально распределяет ресурсы видеопамяти (VRAM), оперативной памяти (RAM) и диска, адаптируя размещение весов, точность вычислений и ядра внимания под доступное оборудование. FreeVideo работает как плагин для ComfyUI и предоставляет удобные лаунчеры для Windows, macOS и Linux.
 
-- **Hardware-adaptive execution**: Chooses the weight format for each GPU, int8 on GeForce and RTX 30-series cards and FP8 on workstation and datacenter cards, and automatically probes the available attention kernels.
-- **Low-memory inference**: Weight streaming, asynchronous prefetching and chunked computation keep peak memory low, enabling inference with as little as 8 GB of VRAM and 16 GB of RAM.
-- **Multimodal inputs**: Text prompts, first and last frames, and image, video and audio references.
-- **Community LoRAs**: Use MiniMax H3 LoRAs in your workflow. See [examples](docs/LoRA.md).
-- **ComfyUI integration**: A dedicated creative workspace inside ComfyUI that supports two-pass sampling and batch generation and keeps a history of past creations. For finer control, switch to the node view to add LoRAs or customize the workflow.
-- **One-click deployment**: The Windows, Mac and Linux launchers set up ComfyUI, the runtime environment and the models, reuse existing models, and support offline installation.
+Основные возможности:
 
-## Getting Started
+- **Аппаратно-адаптивное исполнение**: автоматически выбирает формат весов для каждого GPU (int8 для потребительских GeForce и серии RTX 30, FP8 для профессиональных карт и дата-центров) и на лету тестирует наиболее производительные ядра внимания.
+- **Инференс с низким потреблением памяти**: потоковая загрузка весов (weight streaming), асинхронный префетчинг и блочные вычисления удерживают пиковое потребление памяти на минимальном уровне, позволяя работать всего с 8 ГБ VRAM и 16 ГБ RAM.
+- **Мультимодальные входные данные**: текстовые описания (промпты), первый и последний кадры, а также референсные изображения, видео и аудио.
+- **Поддержка LoRA сообщества**: подключение адаптеров LoRA для MiniMax H3 напрямую к генерации. См. [руководство](docs/LoRA.md).
+- **Интеграция с ComfyUI**: выделенное творческое пространство в ComfyUI с поддержкой двухпроходного сэмплинга, пакетной генерации и сохранением истории проектов. Для тонкой настройки доступен стандартный режим узлов (node graph).
+- **Установка в один клик**: готовые графические лаунчеры для Windows, Mac и Linux самостоятельно настраивают ComfyUI, среду Python и модели, подхватывают уже скачанные файлы и поддерживают офлайн-установку.
+
+## Начало работы
 
 ### Windows
 
-1. [Download FreeVideo.exe](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo.exe) and run it.
-2. Select an existing ComfyUI folder or install a new one. Existing model folders can be added for reuse; missing models are downloaded automatically.
-3. Click **Install & launch**. ComfyUI opens in the browser with the FreeVideo workspace.
+1. [Скачайте FreeVideoRU.exe](https://github.com/mrtek/FreeVideoRU/releases/latest/download/FreeVideoRU.exe) (или [FreeVideo.exe](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo.exe) с зеркала FlashML) и запустите.
+2. Выберите существующую папку ComfyUI или настройте новую. Также можно указать путь к уже имеющимся папкам с моделями; недостающие файлы загрузятся автоматически.
+3. Нажмите **Установить и запустить** (Install & launch). ComfyUI откроется в браузере с рабочей средой FreeVideo.
 
 <div align="center">
-  <img alt="FreeVideo creative workspace" src="https://github.com/user-attachments/assets/7647a6f8-4306-403c-b147-45d7a393e18d" width="92%">
+  <img alt="Творческое пространство FreeVideo" src="https://github.com/user-attachments/assets/7647a6f8-4306-403c-b147-45d7a393e18d" width="92%">
 </div>
 
-**Offline installation:** Download the packages from [Quark](https://pan.quark.cn/s/c51235b84618) and drag the ZIP files into the launcher without extracting them. A fully offline installation needs the four model packs (video model, text encoder, video & audio decoder, and sampling caches), plus the environment package for a new ComfyUI installation. After importing only the environment package, you can also choose **Automatic download** for the models (v0.3.12 or newer). The audio reference cache is optional and is used only when a reference includes audio.
+**Офлайн-установка:** Скачайте пакеты с [Quark](https://pan.quark.cn/s/c51235b84618) и перетащите скачанные ZIP-файлы прямо в окно лаунчера без предварительной распаковки. Для полностью автономной установки требуются 4 пакета моделей (видеомодель, текстовый кодировщик, декодер видео и аудио, а также кэш сэмплинга), плюс архив среды выполнения для новой установки ComfyUI. Если импортировать только архив среды, для моделей можно выбрать **Автоматическое скачивание** (в версии v0.3.12 и новее). Кэш аудиореференсов опционален и требуется только в случае, если входной референс содержит аудиодорожку.
 
-### macOS (Apple silicon preview)
+### macOS (предварительная версия для Apple silicon)
 
-1. [Download FreeVideo-Mac-arm64.dmg](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Mac-arm64.dmg), open it and drag **FreeVideo.app** into **Applications**.
-2. Open FreeVideo, then select an existing ComfyUI folder or install a new one. Existing model folders can be added for reuse; the runtime environment and missing models are downloaded automatically.
-3. Click **Install & launch**. ComfyUI opens in the browser with the FreeVideo workspace.
+1. [Скачайте FreeVideo-Mac-arm64.dmg](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Mac-arm64.dmg), откройте образ и перетащите **FreeVideo.app** в папку **Программы** (Applications).
+2. Запустите FreeVideo, выберите папку ComfyUI (или установите новую). Среда выполнения и недостающие модели будут загружены автоматически.
+3. Нажмите **Установить и запустить**. ComfyUI откроется в браузере со средой FreeVideo.
 
-This preview has been tested on an M5 Mac with 24 GB of unified memory. See the [Mac&nbsp;guide](docs/Mac.md) for generation times and memory.
+Предварительная версия протестирована на Mac M5 с 24 ГБ объединенной памяти. См. [руководство для Mac](docs/Mac.md) с замерами времени генерации и потребления памяти.
 
-The Mac preview isn't notarized by Apple yet, so macOS blocks it the first time you open it. Download it only from the Releases page, then check the file and approve it as described in the [Mac guide](docs/Mac.md#first-open). This approves FreeVideo only; your other security settings stay as they are.
+*Примечание:* Сборка для Mac пока не нотариализована Apple, поэтому при первом открытии macOS может заблокировать запуск. Скачивайте сборку только из официальных релизов, после чего подтвердите запуск, как описано в [руководстве для Mac](docs/Mac.md#first-open).
 
-### Existing ComfyUI
+### Существующий ComfyUI
 
-Install FreeVideo as a custom node:
+Установите FreeVideo как кастомную ноду (custom node):
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/FlashML-org/FreeVideo.git
+git clone https://github.com/mrtek/FreeVideoRU.git
 ```
 
-Restart ComfyUI, open **Workflow → Browse Templates → FreeVideo → FreeVideo-All-in-One**, and complete the setup in FreeVideo **Settings**.
+Перезапустите ComfyUI, перейдите в **Workflow → Browse Templates → FreeVideo → FreeVideo-All-in-One** и завершите начальную настройку в окне FreeVideo **Settings**.
 
 ### Linux
 
-**Desktop:** [Download FreeVideo-Linux-x86_64.AppImage](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Linux-x86_64.AppImage), make it executable and open it, then follow the same steps as on Windows.
+**Desktop:** [Скачайте FreeVideo-Linux-x86_64.AppImage](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Linux-x86_64.AppImage), сделайте файл исполняемым (`chmod +x FreeVideo-Linux-x86_64.AppImage`), запустите и следуйте инструкциям мастера настройки.
 
-**Terminal or server:**
+**Терминал или сервер:**
 
 ```bash
-git clone https://github.com/FlashML-org/FreeVideo.git && cd FreeVideo
+git clone https://github.com/mrtek/FreeVideoRU.git && cd FreeVideoRU
 ./setup.sh
 ```
 
-Setup installs FreeVideo, ComfyUI and the models, then opens FreeVideo in the browser. Afterwards, type `freevideo` to open it again. On a server, connect from your own computer through SSH, or run `freevideo server --listen 0.0.0.0` for an access link on your local network. See the [Linux guide](docs/Linux.md).
+Скрипт установит FreeVideo, ComfyUI и модели, а затем откроет интерфейс в браузере. Для последующего запуска используйте команду `freevideo`. На удаленном сервере подключитесь через SSH-туннель или запустите `freevideo server --listen 0.0.0.0` для доступа по локальной сети. Подробнее см. в [руководстве по Linux](docs/Linux.md).
 
-### More details
+### Дополнительно
 
-- [FreeVideo Adaptive Execution Planner](docs/execution-planning.md)
-- [Community results](docs/community-results.md)
+- [Адаптивный планировщик выполнения FreeVideo](docs/execution-planning.md)
+- [Результаты тестов сообщества](docs/community-results.md)
 
-### Support
+### Поддержка
 
-Report bugs in [GitHub Issues](https://github.com/FlashML-org/FreeVideo/issues), or ask questions on [Discord](https://discord.gg/MsA277cJzZ), [QQ](https://freevideo-community.pages.dev/qq) or [WeChat](https://freevideo-community.pages.dev/wechat).
+Сообщайте об ошибках в [GitHub Issues](https://github.com/mrtek/FreeVideoRU/issues), либо в оригинальном репозитории [FlashML-org/FreeVideo](https://github.com/FlashML-org/FreeVideo/issues). Также присоединяйтесь к сообществу в [Discord](https://discord.gg/MsA277cJzZ), [QQ](https://freevideo-community.pages.dev/qq) или [WeChat](https://freevideo-community.pages.dev/wechat).
 
-## Citation
+## Цитирование
 
-FreeVideo is based on VDN-H3. If you use FreeVideo in your research, please cite the [Video DeltaNet paper](https://arxiv.org/abs/2609.20744):
+FreeVideo базируется на архитектуре VDN-H3. Если вы используете FreeVideo в академических исследованиях, пожалуйста, процитируйте публикацию [Video DeltaNet](https://arxiv.org/abs/2609.20744):
 
 ```bibtex
 @article{xi2026videodeltanet,
@@ -111,32 +113,32 @@ FreeVideo is based on VDN-H3. If you use FreeVideo in your research, please cite
 }
 ```
 
-## Team
+## Команда проекта
 
-### Project Team
+### Основная команда
 
 [Bowen Xue](https://github.com/KBRASK) · [Shuo Yang](https://github.com/andy-yang-1) · [Haocheng Xi](https://github.com/haochengxi) · [Xiaoze Fan](https://github.com/jason-fxz) · [Chenfeng Xu](https://github.com/chenfengxu714)
 
-### Special Thanks
+### Особая благодарность
 
-Special thanks to [**AIwood爱屋研究室**](https://space.bilibili.com/503934057) and [**T8star-Aix**](https://space.bilibili.com/385085361) for testing the project and providing valuable feedback.
+Особая благодарность [**AIwood爱屋研究室**](https://space.bilibili.com/503934057) и [**T8star-Aix**](https://space.bilibili.com/385085361) за всестороннее тестирование проекта и ценную обратную связь.
 
-*Listed in chronological order of participation.*
+*Указаны в хронологическом порядке участия.*
 
-## Acknowledgment
+## Благодарности
 
-We thank [OpenVDN](https://github.com/OpenVDN) for [Video DeltaNet / VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) and its open-source model weights, training code and inference implementation.
+Мы благодарим команду [OpenVDN](https://github.com/OpenVDN) за проект [Video DeltaNet / VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3), открытые веса модели, код обучения и алгоритмы инференса.
 
-We thank Impossible Research for providing computation resources.
+Благодарим Impossible Research за предоставленные вычислительные мощности.
 
-We also thank [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) for the base model and the following projects:
+Также выражаем признательность [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) за базовую модель и разработчикам следующих проектов:
 [ComfyUI](https://github.com/Comfy-Org/ComfyUI),
 [Diffusers](https://github.com/huggingface/diffusers),
 [SageAttention](https://github.com/thu-ml/SageAttention),
-the [MiniMax H3 latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler),
-the [H3 text encoder for ComfyUI](https://huggingface.co/t8star/Vdn-Minimax-H3-Comfy) and
+[MiniMax H3 latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler),
+[H3 text encoder для ComfyUI](https://huggingface.co/t8star/Vdn-Minimax-H3-Comfy) и
 [Qt for Python](https://doc.qt.io/qtforpython-6/).
 
-## License
+## Лицензия
 
-The code is released under the [Apache License 2.0](LICENSE). The model weights are licensed under the [MiniMax H3 Community License](https://huggingface.co/OpenVDN/vdn-minimax-h3-edge/blob/main/LICENSE), which includes territorial and acceptable-use restrictions.
+Исходный код распространяется под лицензией [Apache License 2.0](LICENSE). Веса моделей лицензированы согласно [MiniMax H3 Community License](https://huggingface.co/OpenVDN/vdn-minimax-h3-edge/blob/main/LICENSE), которая содержит региональные ограничения и правила допустимого использования.

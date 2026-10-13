@@ -6,6 +6,7 @@ __pycache__/
 ci-artifacts/
 *.egg-info/
 build/
+build_output/
 dist/
 .env
 .env.*

@@ -38,9 +38,21 @@ ApplicationWindow {
     property string previousPage: ""
     property bool errorDetailsOpen: false
     property string previousError: ""
-    function t(en, zh) { return s.zh ? zh : en }
+    FTranslations { id: i18n }
+    function t(en, zh, ru) {
+        if (s.ru) {
+            if (ru !== undefined) return ru
+            var r = i18n.ru[en]
+            return r !== undefined ? r : en
+        }
+        return s.zh ? zh : en
+    }
     function releaseVersion(value) { return value && value.product_version ? "v" + value.product_version : value && value.version || "—" }
-    function releaseSummary(value) { return value && value.release_notes ? value.release_notes[s.zh ? "zh" : "en"].summary : "" }
+    function releaseSummary(value) {
+        if (!value || !value.release_notes) return ""
+        if (s.ru && value.release_notes.ru) return value.release_notes.ru.summary
+        return value.release_notes[s.zh ? "zh" : "en"] ? value.release_notes[s.zh ? "zh" : "en"].summary : ""
+    }
     readonly property var currentRelease: s.update.current_release || {version: s.update.current}
     readonly property var engineRelease: s.update.engine_release || {}
     readonly property string engineBuild: engineRelease.version || s.update.installed || ""
@@ -51,8 +63,8 @@ ApplicationWindow {
     readonly property string stepText: s.progress_text || s.detail || ""
     // While something downloads, the installer gives the seconds left from its bytes and speed; nothing otherwise.
     readonly property string remainingText: !number(s.remaining_seconds) || s.remaining_seconds <= 0 ? ""
-        : s.remaining_seconds < 60 ? t("Less than a minute left", "预计还需不到 1 分钟")
-        : t("About " + Math.round(s.remaining_seconds / 60) + "\u00a0min left", "预计还需约 " + Math.round(s.remaining_seconds / 60) + "\u00a0分钟")
+        : s.remaining_seconds < 60 ? t("Less than a minute left", "预计还需不到 1 分钟", "Осталось менее минуты")
+        : t("About " + Math.round(s.remaining_seconds / 60) + "\u00a0min left", "预计还需约 " + Math.round(s.remaining_seconds / 60) + "\u00a0分钟", "Осталось около " + Math.round(s.remaining_seconds / 60) + "\u00a0мин")
     readonly property var availableRelease: s.update.candidate || (s.update.engine ? currentRelease : null)
     readonly property var availableEarlier: s.update.candidate ? (s.update.candidate_earlier || []) : s.update.engine ? (s.update.engine_earlier || []) : []
     function sourceName(value) { return ({"auto": t("Automatic", "自动选择"), "official": "Hugging Face", "hf-mirror": t("HF Mirror", "HF 镜像"), "modelscope": t("ModelScope", "魔搭")})[value] || value }
@@ -76,14 +88,15 @@ ApplicationWindow {
         var d = disk
         if (!d) return ""
         var en = "\"" + d.name + "\"", zh = "“" + d.name + "”"
-        if (d.problem === "fat32") return t(en + " uses FAT32, which limits each file to 4 GB, too small for the model files.", zh + "是 FAT32 格式，单个文件最大 4 GB，放不下模型。")
-        if (d.problem === "exfat") return t(en + " uses exFAT, where the FreeVideo environment cannot run.", zh + "是 exFAT 格式，装不了 FreeVideo 的运行环境。")
-        if (d.problem === "disconnected") return t(en + " is not connected. Connect it to continue.", zh + "没有连接，请接上这块硬盘。")
-        if (d.problem === "read-only") return t(en + " is read-only on this Mac.", zh + "在这台 Mac 上是只读的。")
+        if (d.problem === "fat32") return t(en + " uses FAT32, which limits each file to 4 GB, too small for the model files.", zh + "是 FAT32 格式，单个文件最大 4 GB，放不下模型。", "Диск " + en + " в формате FAT32 с ограничением 4 ГБ на файл; файлы моделей не поместятся.")
+        if (d.problem === "exfat") return t(en + " uses exFAT, where the FreeVideo environment cannot run.", zh + "是 exFAT 格式，装不了 FreeVideo 的运行环境。", "Диск " + en + " в формате exFAT, где среда FreeVideo не может работать.")
+        if (d.problem === "disconnected") return t(en + " is not connected. Connect it to continue.", zh + "没有连接，请接上这块硬盘。", "Диск " + en + " не подключен. Подключите его для продолжения.")
+        if (d.problem === "read-only") return t(en + " is read-only on this Mac.", zh + "在这台 Mac 上是只读的。", "Диск " + en + " доступен только для чтения на этом Mac.")
         if (d.short) return t(en + " has " + d.free + " available; this installation needs about " + d.need + ".",
-                              zh + "可用 " + d.free + "，这次安装需要约 " + d.need + "。")
-        return t(d.name + " · " + d.free + " available", d.name + " · 可用 " + d.free)
-            + (d.need ? t(" · about " + d.need + " needed", " · 需要约 " + d.need) : "")
+                              zh + "可用 " + d.free + "，这次安装需要约 " + d.need + "。",
+                              "На диске " + en + " доступно " + d.free + "; для этой установки требуется около " + d.need + ".")
+        return t(d.name + " · " + d.free + " available", d.name + " · 可用 " + d.free, d.name + " · доступно " + d.free)
+            + (d.need ? t(" · about " + d.need + " needed", " · 需要约 " + d.need, " · требуется около " + d.need) : "")
     }
     // The label before diskLine() when the line states the disk rather than a problem.
     function diskLabel() { return disk && !disk.problem && !disk.short ? t("Disk:", "所在硬盘：") : "" }
@@ -344,13 +357,13 @@ ApplicationWindow {
                     }
                     FText { id: connected; x: 23; anchors.verticalCenter: parent.verticalCenter; text: t("ComfyUI connected", "ComfyUI 已连接"); font.pixelSize: theme.micro; color: theme.success }
                 }
-                // Both languages stay visible; the current one is marked.
+                // Languages stay visible; the current one is marked.
                 FSegmented {
                     objectName: "languageSwitch"; compact: true; anchors.verticalCenter: parent.verticalCenter
-                    width: 104; current: s.zh ? "zh" : "en"
-                    options: [{value: "zh", label: "中文"}, {value: "en", label: "EN"}]
+                    width: 156; current: s.ru ? "ru" : (s.zh ? "zh" : "en")
+                    options: [{value: "zh", label: "中文"}, {value: "en", label: "EN"}, {value: "ru", label: "RU"}]
                     onPicked: function(value) { if (value !== current) backend.edit("language", value) }
-                    Accessible.name: t("Language", "语言")
+                    Accessible.name: t("Language", "语言", "Язык")
                 }
             }
         }
@@ -396,11 +409,11 @@ ApplicationWindow {
                         }
                         // Repair sets up again from the launcher's own engine, so it brings the update along.
                         FText { objectName: "repairUpdatesEngine"; visible: !!s.update.with_repair; Layout.fillWidth: true; color: theme.text
-                                text: t("Repair also updates the engine to " + releaseVersion(currentRelease) + ".", "修复时会一并更新到新版引擎 " + releaseVersion(currentRelease) + "。") }
+                                text: t("Repair also updates the engine to " + releaseVersion(currentRelease) + ".", "修复时会一并更新到新版引擎 " + releaseVersion(currentRelease) + "。", "Восстановление также обновит движок до " + releaseVersion(currentRelease) + ".") }
                         Flow {
                             Layout.fillWidth: true; spacing: 8
                             FButton { objectName: "moveToDisk"; visible: diskFailure && s.form.new_comfy && !!bestDisk; enabled: !s.busy; primary: true
-                                      text: bestDisk ? t("Install on \"" + bestDisk.name + "\"", "改装到“" + bestDisk.name + "”") : ""
+                                      text: bestDisk ? t("Install on \"" + bestDisk.name + "\"", "改装到“" + bestDisk.name + "”", "Установить на «" + bestDisk.name + "»") : ""
                                       onClicked: backend.useDisk(bestDisk.path) }
                             FButton { objectName: "chooseDisk"; visible: diskFailure && s.form.new_comfy && diskChoices.length > (bestDisk ? 1 : 0); enabled: !s.busy
                                       text: t("Other disks…", "其他硬盘…"); onClicked: diskDialogOpen = true }
@@ -1018,8 +1031,8 @@ ApplicationWindow {
                                 Layout.fillWidth: true; spacing: 12
                                 FText { text: t("Language", "语言"); Layout.fillWidth: true }
                                 FSegmented {
-                                    Layout.preferredWidth: 200; current: s.zh ? "zh" : "en"; onPicked: function(value) { if (value !== current) backend.edit("language", value) }
-                                    options: [{value: "zh", label: "简体中文"}, {value: "en", label: "English"}]
+                                    Layout.preferredWidth: 290; current: s.ru ? "ru" : (s.zh ? "zh" : "en"); onPicked: function(value) { if (value !== current) backend.edit("language", value) }
+                                    options: [{value: "zh", label: "简体中文"}, {value: "en", label: "English"}, {value: "ru", label: "Русский"}]
                                 }
                             }
                             FDivider {}
@@ -1174,7 +1187,7 @@ ApplicationWindow {
             id: diskContents; spacing: 12
             FText { text: t("Choose a disk", "选择安装硬盘"); font.pixelSize: theme.section + 2; font.weight: Font.DemiBold; Layout.fillWidth: true }
             FText { objectName: "diskDialogText"; Layout.fillWidth: true; color: theme.muted; font.pixelSize: theme.micro + 1
-                    text: (disk && disk.need ? t("This installation needs about " + disk.need + ".\n", "这次安装需要约 " + disk.need + "。\n") : "")
+                    text: (disk && disk.need ? t("This installation needs about " + disk.need + ".\n", "这次安装需要约 " + disk.need + "。\n", "Для этой установки требуется около " + disk.need + ".\n") : "")
                           + t("FreeVideo is installed in a FreeVideo folder on the disk you choose.", "FreeVideo 会装在所选硬盘的 FreeVideo 文件夹里。") }
             Repeater {
                 model: diskChoices
@@ -1196,7 +1209,7 @@ ApplicationWindow {
                                         : modelData.problem === "fat32" ? t("FAT32 not supported", "不支持 FAT32")
                                         : t("Not enough space", "空间不够") }
                         }
-                        FText { text: t(modelData.free + " available", "可用 " + modelData.free); color: theme.muted; font.pixelSize: theme.micro + 1; font.features: { "tnum": 1 }; wrapMode: Text.NoWrap; Layout.alignment: Qt.AlignVCenter }
+                        FText { text: t(modelData.free + " available", "可用 " + modelData.free, modelData.free + " доступно"); color: theme.muted; font.pixelSize: theme.micro + 1; font.features: { "tnum": 1 }; wrapMode: Text.NoWrap; Layout.alignment: Qt.AlignVCenter }
                     }
                     MouseArea {
                         id: diskArea; anchors.fill: parent; hoverEnabled: true; enabled: modelData.enough && !s.busy
@@ -1259,7 +1272,7 @@ ApplicationWindow {
             FText { text: s.update.candidate ? t("Update available", "有可用更新") : s.update.engine ? t("Engine update", "引擎更新") : t("Updates", "更新"); font.pixelSize: theme.section + 2; font.weight: Font.DemiBold }
             FText { objectName: "updateDialogText"; text: s.update.phase === "waiting" ? t("A video is still generating. FreeVideo restarts and updates as soon as it finishes.", "还有视频正在生成，完成后会自动重启并更新。") : s.update.status === "ready" && s.update.candidate ? t("Downloaded. Restart to finish; models and settings are kept.", "下载完成，重启即可完成更新，模型和设置都会保留。") : s.update.candidate ? t("FreeVideo ", "FreeVideo ") + releaseVersion(s.update.candidate) + t(" is available (current ", " 已发布（当前 ") + releaseVersion(currentRelease) + t("). Updating keeps your models and settings. FreeVideo restarts after the download; running videos finish first.", "）。更新会保留模型和设置，下载完成后自动重启；正在生成的视频会先完成。") : s.update.engine ? t("This launcher already includes engine ", "启动器已带有新版引擎 ") + releaseVersion(currentRelease) + t(" (installed: ", "（已安装 ") + engineVersion + (s.status === "open" ? t("). Updating takes about a minute, restarts ComfyUI once and keeps your models and settings.", "）。更新约需 1 分钟，会重启一次 ComfyUI，模型和设置都会保留。") : t("). Updating takes about a minute, then FreeVideo starts; models and settings are kept.", "）。更新约需 1 分钟，完成后自动启动，模型和设置都会保留。")) : s.update.status === "current" ? t("You're up to date.", "已是最新版本。") : s.update.status === "development" ? t("Running from source. Update with Git.", "当前从源码运行，请通过 Git 更新。") : s.update.status === "error" ? t("Could not check for updates.", "暂时无法检查更新。") : t("Checking the latest release…", "正在检查最新版本…"); color: theme.muted; Layout.fillWidth: true }
             FMeter { Layout.fillWidth: true; visible: s.update.status === "downloading"; active: true; fraction: s.update.progress && s.update.progress.total ? s.update.progress.done/s.update.progress.total : -1 }
-            FReleaseNotes { objectName: "updateReleaseNotes"; visible: !!availableRelease; Layout.fillWidth: true; release: availableRelease; earlier: availableEarlier; zh: s.zh; heading: t("What's new", "更新内容") + " · " + releaseVersion(availableRelease) }
+            FReleaseNotes { objectName: "updateReleaseNotes"; visible: !!availableRelease; Layout.fillWidth: true; release: availableRelease; earlier: availableEarlier; zh: s.zh; ru: s.ru; heading: t("What's new", "更新内容") + " · " + releaseVersion(availableRelease) }
             FButton { text: t("Version & release notes", "版本与更新说明"); flat: true; onClicked: releaseNotesOpen = true }
             FText { visible: !!s.update.error; text: s.update.error || ""; color: theme.danger; Layout.fillWidth: true; font.pixelSize: theme.micro }
             FButton { objectName: "updateManualDownloadButton"; text: t("Download from the release page ↗", "去发布页手动下载 ↗"); flat: true; Layout.fillWidth: true; visible: s.update.status === "error" && !!s.update.release_page; onClicked: backend.link(s.update.release_page) }
@@ -1354,9 +1367,9 @@ ApplicationWindow {
                 ColumnLayout {
                     id: releaseContents; width: releaseScroll.availableWidth; spacing: 18
                     FText { text: t("Version & release notes", "版本与更新说明"); font.pixelSize: theme.section + 2; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                    FReleaseNotes { visible: !!s.update.candidate; Layout.fillWidth: true; release: s.update.candidate; earlier: s.update.candidate_earlier || []; zh: s.zh; heading: t("Available update", "可用更新") + " · " + releaseVersion(s.update.candidate) }
+                    FReleaseNotes { visible: !!s.update.candidate; Layout.fillWidth: true; release: s.update.candidate; earlier: s.update.candidate_earlier || []; zh: s.zh; ru: s.ru; heading: t("Available update", "可用更新") + " · " + releaseVersion(s.update.candidate) }
                     FDivider { visible: !!s.update.candidate }
-                    FReleaseNotes { objectName: "currentReleaseNotes"; Layout.fillWidth: true; release: currentRelease; zh: s.zh; heading: (separateVersions ? t("Launcher", "启动器") : t("Current version", "当前版本")) + " · " + releaseVersion(currentRelease) }
+                    FReleaseNotes { objectName: "currentReleaseNotes"; Layout.fillWidth: true; release: currentRelease; zh: s.zh; ru: s.ru; heading: (separateVersions ? t("Launcher", "启动器") : t("Current version", "当前版本")) + " · " + releaseVersion(currentRelease) }
                     FText { objectName: "engineReleaseInfo"; visible: !!engineRelease.product_version || !!engineBuild
                             text: t("Engine in use: ", "正在使用的引擎：") + (engineRelease.product_version
                                   ? engineVersion + (engineBuild ? t(" (build ", "（构建号 ") + engineBuild + t(")", "）") : "")

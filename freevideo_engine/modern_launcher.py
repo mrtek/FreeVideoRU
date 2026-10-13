@@ -161,7 +161,7 @@ def create_ui(session, *, show=True):
         def browse(self, key):
             if session.controller.busy:
                 return
-            path = QFileDialog.getExistingDirectory(None, session.t('Choose folder', '选择文件夹'),
+            path = QFileDialog.getExistingDirectory(None, session.t('Choose folder', '选择文件夹', 'Выберите папку'),
                 str(session.form.get(key) or ''), QFileDialog.ShowDirsOnly)
             if path:
                 self.invoke(session.add_folder, path) if key == 'model_dirs' else self.invoke(session.edit, key, path)
@@ -170,7 +170,7 @@ def create_ui(session, *, show=True):
         def browsePackages(self):
             if session.controller.busy or session.importer.busy:
                 return
-            paths, _ = QFileDialog.getOpenFileNames(None, session.t('Import offline packages', '导入离线包'),
+            paths, _ = QFileDialog.getOpenFileNames(None, session.t('Import offline packages', '导入离线包', 'Импорт офлайн-пакетов'),
                                                     '', 'FreeVideo (*.zip)')
             if paths:
                 self.invoke(session.import_packages, paths)
@@ -183,7 +183,7 @@ def create_ui(session, *, show=True):
         def browseRuntimePackage(self):
             if session.controller.busy or session.importer.busy:
                 return
-            paths, _ = QFileDialog.getOpenFileNames(None, session.t('Choose environment ZIP', '选择运行环境包'),
+            paths, _ = QFileDialog.getOpenFileNames(None, session.t('Choose environment ZIP', '选择运行环境包', 'Выберите ZIP среды выполнения'),
                                                     '', 'FreeVideo (*.zip)')
             if paths:
                 self.invoke(session.import_packages, paths)
@@ -194,7 +194,7 @@ def create_ui(session, *, show=True):
             for value in urls:
                 url = value if isinstance(value, QUrl) else QUrl(str(value))
                 if not url.isLocalFile():
-                    session.error = session.t('Drop downloaded ZIP files here.', '请拖入已下载到本机的 ZIP 文件。')
+                    session.error = session.t('Drop downloaded ZIP files here.', '请拖入已下载到本机的 ZIP 文件。', 'Перетащите скачанные ZIP-файлы сюда.')
                     self.refresh()
                     return
                 paths.append(url.toLocalFile())

@@ -120,6 +120,184 @@ ZH.update(NAMES.values())
 ZH.update([('Downloading components', '正在下载组件'), ('Preparing components', '正在准备组件'),
            ('Downloading runtime packages', '正在下载运行组件'), ('Finding existing models', '正在查找已有模型')])
 
+RU_SOURCES = {
+    'auto': 'Автоматически', 'official': 'Hugging Face',
+    'hf-mirror': 'Зеркало HF', 'modelscope': 'ModelScope',
+    'user': 'Пользовательский источник',
+}
+
+RU = dict([
+    ('Prepare Python', 'Подготовка Python'),
+    ('Install Python', 'Установка Python'),
+    ('Prepare download tools', 'Подготовка инструментов скачивания'),
+    ('Tsinghua mirror', 'Зеркало Tsinghua'),
+    ('GitHub mirror', 'Зеркало GitHub'),
+    ('attempt', 'Подключение'),
+    ('fallback', 'Смена источника скачивания'),
+    ('route-retry', 'Смена соединения'),
+    ('verifying', 'Проверка'),
+    ('no-progress', 'Нет прогресса скачивания'),
+    ('slow-transfer', 'Постоянно низкая скорость'),
+    ('resume-refused', 'Источник не поддерживает докачку'),
+    ('Download PyTorch + CUDA', 'Скачивание среды GPU'),
+    ('Use existing Python', 'Использование имеющегося Python'),
+    ('Create Python environment', 'Создание среды выполнения'),
+    ('Install PyTorch + CUDA', 'Установка среды GPU'),
+    ('Install engine dependencies', 'Установка компонентов генерации'),
+    ('Install encoder support', 'Установка компонентов кодировщика'),
+    ('Install model support', 'Установка компонентов моделей'),
+    ('Download model code', 'Скачивание компонентов моделей'),
+    ('Check text encoder', 'Проверка текстового кодировщика'),
+    ('Download model weights', 'Скачивание необходимых моделей'),
+    ('Reuse models / download missing files', 'Использование имеющихся моделей и докачка недостающих'),
+    ('Verify / reuse local models', 'Проверка и использование имеющихся моделей'),
+    ('Verify existing models', 'Проверка имеющихся моделей'),
+    ('Check existing model folders', 'Поиск имеющихся моделей'),
+    ('Find existing models', 'Поиск имеющихся моделей'),
+    ('Verify local model', 'Проверка локальной модели'),
+    ('Copy local model', 'Копирование модели'),
+    ('Reuse local model', 'Использование модели'),
+    ('Existing models checked', 'Проверка имеющихся моделей завершена'),
+    ('Check local models', 'Проверка локальных моделей'),
+    ('Local models verified', 'Локальные модели проверены'),
+    ('Optimize model storage', 'Подготовка моделей'),
+    ('Finish model storage', 'Завершение подготовки моделей'),
+    ('Test GPU acceleration', 'Проверка ускорения GPU'),
+    ('Check GPU runtime', 'Проверка среды GPU'),
+    ('Check installed packages', 'Проверка среды выполнения'),
+    ('Save installed versions', 'Сохранение информации об установке'),
+    ('Check build tools', 'Проверка инструментов сборки'),
+    ('Build SageAttention 2', 'Подготовка ускорения GPU'),
+    ('Install SageAttention 2', 'Установка компонентов ускорения GPU'),
+    ('Prepare dependencies', 'Подготовка компонентов'),
+    ('Install components in parallel', 'Установка компонентов и моделей'),
+    ('Install with space saver', 'Установка компонентов и моделей (экономия места)'),
+    ('Download the faster model', 'Скачивание более быстрой модели'),
+    ('Model downloaded', 'Модель скачана'),
+    ('Model download incomplete', 'Скачивание модели не завершено'),
+    ('Release installation cache', 'Освобождение кэша установки'),
+    ('Install acceleration and download models', 'Установка ускорения и скачивание моделей'),
+    ('Verify installation on your GPU', 'Проверка ускорения GPU'),
+    ('Finish setup', 'Завершение установки'),
+    ('Setup complete', 'Установка завершена'),
+    ('Setup interrupted', 'Установка приостановлена'),
+    ('Setup failed', 'Установка не завершена'),
+    ('Download ComfyUI', 'Скачивание ComfyUI'),
+    ('Create ComfyUI Python environment', 'Создание среды ComfyUI'),
+    ('Prepare ComfyUI GPU packages', 'Подготовка компонентов ускорения ComfyUI'),
+    ('Install ComfyUI packages', 'Установка компонентов ComfyUI'),
+    ('Check ComfyUI dependencies', 'Проверка окружения ComfyUI'),
+    ('Finish ComfyUI setup', 'Завершение установки ComfyUI'),
+    ('ComfyUI ready', 'ComfyUI готов к работе'),
+    ('Prepare ComfyUI', 'Подготовка ComfyUI'),
+    ('Update ComfyUI packages', 'Обновление компонентов ComfyUI'),
+    ('Install FreeVideo workflow', 'Установка рабочего процесса FreeVideo'),
+    ('Open ComfyUI', 'Открыть ComfyUI'),
+    ('Starting ComfyUI', 'Запуск ComfyUI'),
+    ('Loading nodes and the web interface', 'Загрузка узлов и интерфейса'),
+    ('Checking configuration', 'Проверка конфигурации'),
+    ('Check installation', 'Проверка установки'),
+    ('Verify bundled files', 'Проверка офлайн-пакетов'),
+    ('Check local files', 'Проверка локальных файлов'),
+    ('All bundled files verified', 'Офлайн-пакеты проверены'),
+    ('Detecting your GPU and testing acceleration', 'Определение видеокарты и проверка ускорения'),
+    ('Start ComfyUI', 'Запуск ComfyUI'),
+    ('Open FreeVideo workflow', 'Открыть рабочий процесс FreeVideo'),
+    ('Ready', 'Готово'),
+    ('Verified and ready', 'Проверено и готово'),
+    ('Stopped; files retained', 'Приостановлено; файлы сохранены'),
+    ('Local verification stopped; files retained', 'Проверка приостановлена; файлы сохранены'),
+    ('Download and prepare the private Python runtime', 'Подготовка среды Python'),
+    ('Check the Python already prepared by the launcher', 'Проверка имеющегося Python'),
+    ('Prepare an isolated environment for FreeVideo', 'Создание изолированной среды FreeVideo'),
+    ('Download and install the GPU runtime packages', 'Скачивание и установка компонентов GPU'),
+    ('Download and install video and text encoding libraries', 'Скачивание и установка библиотек генерации'),
+    ('Connect the encoder to FreeVideo', 'Подключение кодировщика к FreeVideo'),
+    ('Install the verified model code', 'Установка проверенного кода моделей'),
+    ('Prepare model source files while runtime packages download', 'Скачивание компонентов моделей'),
+    ('Verify that the text encoding library loads', 'Проверка текстового кодировщика'),
+    ('Download and verify the video model and text encoder', 'Скачивание и проверка моделей'),
+    ('Prepare compact FP8 weights for your GPU', 'Подготовка весов FP8 для вашей видеокарты'),
+    ('Prepare the model weights for your GPU', 'Подготовка весов модели для вашей видеокарты'),
+    ('Run small checks on your GPU', 'Проверка доступности ускорения GPU'),
+    ('Verify prepared weights and apply your storage choice', 'Проверка файлов моделей'),
+    ('Verify dependency compatibility', 'Проверка совместимости зависимостей'),
+    ('Record versions for future diagnostics', 'Сохранение информации о версиях'),
+    ('Verify the compiler before building GPU acceleration', 'Проверка компилятора'),
+    ('Compile acceleration for your GPU', 'Компиляция ускорения GPU'),
+    ('the first build takes longer', 'первая сборка занимает больше времени'),
+    ('Install the prepared GPU acceleration package', 'Установка компонентов ускорения GPU'),
+    ('Install the verified Windows acceleration package', 'Установка компонентов ускорения Windows'),
+    ('Verify CUDA and the Windows runtime libraries', 'Проверка библиотек CUDA и среды Windows'),
+    ('Prepare verified source files', 'Подготовка файлов компонентов'),
+    ('Download verified source code', 'Скачивание проверенных исходных файлов'),
+    ('Prepare source files for installation', 'Подготовка файлов установки'),
+    ('Download and verify required files', 'Скачивание и проверка необходимых файлов'),
+    ('Dependencies resolved', 'Зависимости проверены'),
+    ('preparing downloads', 'подготовка к скачиванию'),
+    ('Downloads ready', 'Скачивание завершено'),
+    ('Downloading packages', 'Скачивание компонентов'),
+    ('installing packages', 'установка компонентов'),
+    ('Packages installed', 'Компоненты установлены'),
+    ('finishing checks', 'завершение проверок'),
+    ('Installing packages', 'Установка компонентов'),
+    ('Compiling CUDA kernels', 'Компиляция ядер CUDA'),
+    ('Load cached blocks and upload resident weights', 'Загрузка модели'),
+    ('Finish model placement', 'Завершение размещения модели'),
+    ('Verify cached weights', 'Проверка кэша модели'),
+    ('Read and convert source weights', 'Конвертация формата модели'),
+    ('Storage ready', 'Файлы модели готовы'),
+    ('Download', 'Скачивание'),
+    ('Model', 'Модель'),
+    ('Video model', 'Видеомодель'),
+    ('Video decoder', 'Видеодекодер'),
+    ('text encoder', 'текстовый кодировщик'),
+    ('Text encoder', 'Текстовый кодировщик'),
+    ('Video & audio decoder', 'Аудио- и видеодекодер'),
+    ('Sampling caches', 'Кэш сэмплинга'),
+    ('ModelScope', 'ModelScope'),
+    ('ModelScope parallel', 'ModelScope (параллельно)'),
+    ('HF Mirror', 'Зеркало HF'),
+    ('HF Xet', 'Hugging Face'),
+    ('HF HTTP', 'Hugging Face'),
+    ('Parallel HTTP', 'Параллельное скачивание'),
+    ('Custom source', 'Пользовательский источник'),
+    ('Model source', 'Источник моделей'),
+    ('official source', 'официальный источник'),
+    ('Nanjing University mirror', 'Зеркало Нанкинского университета'),
+    ('Tsinghua mirror', 'Зеркало Tsinghua'),
+    ('GitHub mirror', 'Зеркало GitHub'),
+    ('your Python mirror', 'пользовательское зеркало Python'),
+    ('your configured source', 'пользовательский источник'),
+    ('Retrying same source', 'Повторная попытка'),
+    ('Retrying same source with direct connection', 'Повторная попытка через прямое соединение'),
+    ('Retrying same source with configured proxy', 'Повторная попытка через прокси'),
+    ('Resume unavailable; checking another source', 'Докачка недоступна; проверка другого источника'),
+    ('Paused; existing data kept', 'Приостановлено; скачанные данные сохранены'),
+    ('Restart explicitly allowed', 'Перезапуск файла разрешен'),
+    ('Restarting this file; incompatible fragments retained on disk', 'Перезапуск скачивания; фрагменты сохранены на диске'),
+    ('Cannot resume this format; enable restart in Setup', 'Не удается возобновить; разрешите перезапуск в настройках'),
+    ('Download response too large', 'Слишком большой ответ при скачивании'),
+    ('switching source', 'переключение источника'),
+    ('Download memory budget reached', 'Достигнут лимит памяти скачивания'),
+    ('switching to streaming', 'переключение на потоковую передачу'),
+    ('Download source failed', 'Сбой источника скачивания'),
+    ('trying another source', 'попытка использовать другой источник'),
+    ('Download counter mismatch', 'Несоответствие счетчика скачивания'),
+    ('setup', 'установка'),
+    ('initialize', 'инициализация'),
+    ('launch', 'запуск'),
+    ('Hugging Face · Video', 'Hugging Face · Видео'),
+    ('Hugging Face · Audio', 'Hugging Face · Аудио'),
+    ('Downloading components', 'Идет скачивание компонентов'),
+    ('Preparing components', 'Идет подготовка компонентов'),
+    ('Downloading runtime packages', 'Идет скачивание компонентов среды'),
+    ('Finding existing models', 'Поиск имеющихся моделей'),
+    ('Checking packages', 'Проверка пакетов'),
+    ('Downloading models', 'Скачивание моделей'),
+    ('Importing offline packages', 'Импорт офлайн-пакетов'),
+])
+
 
 def size_text(value, decimal_sizes=False):
     if decimal_sizes:
@@ -130,12 +308,44 @@ def size_text(value, decimal_sizes=False):
     return '%.1f GiB' % (value / 2**30) if value >= 2**30 else '%d MiB' % (value // 2**20)
 
 
-def source_name(value, zh=False):
+def source_name(value, zh=False, ru=False):
+    if ru:
+        return RU_SOURCES.get(value, value)
     return SOURCES.get(value, (value, value))[bool(zh)]
 
 
-def display(value, zh=False):
+def display(value, zh=False, ru=False):
     value = clean(value)
+    if ru:
+        if value in RU:
+            return RU[value]
+        if value in SOURCES:
+            return source_name(value, ru=True)
+        if ' · ' in value:
+            return ' · '.join(display(part, ru=True) for part in value.split(' · '))
+        for prefix, translated in (
+            ('Switched current download to ', 'Переключено на '), ('Connecting to ', 'Подключение к '),
+            ('Assemble downloaded parts', 'Объединение загруженных частей'), ('Reuse verified FP8 ', 'Использование кэша FP8 '),
+            ('Prepare FP8 ', 'Подготовка кэша FP8 '), ('Verified ', 'Проверено '), ('Verify ', 'Проверка '),
+            ('Download ', 'Скачивание '), ('Prepare ', 'Подготовка '), ('Source: ', 'Источник: '), ('Log: ', 'Лог: '),
+        ):
+            if value.startswith(prefix):
+                return translated + display(value[len(prefix):], ru=True)
+        for pattern, translated in (
+            (r'Downloading packages · about (.+) across (\d+) files', r'Скачивание компонентов · около \1, файлов: \2'),
+            (r'about (.+) across (\d+) files', r'около \1, файлов: \2'),
+            (r'(\d+) files / folders scanned', r'Отсканировано файлов и папок: \1'),
+            (r'(\d+ / \d+) files', r'\1 файлов'), (r'shard (\d+ / \d+)', r'фрагмент \1'),
+            (r'([\d.]+ MiB) retained', r'Сохранено \1'), (r'([\d.]+ GiB) released', r'Освобождено \1'),
+            (r'([\d.]+ MiB) downloaded', r'Загружено \1'),
+            (r'Resuming ([\d.]+ MiB) retained', r'Возобновление скачивания, сохранено \1'),
+            (r'retry (\d+) in (\d+)s', r'Повтор \1 через \2 с'),
+            (r'Receiving objects:.*', 'Скачивание компонентов'), (r'Resolving deltas:.*', 'Обработка компонентов'),
+            (r'Updating files:.*', 'Подготовка файлов'),
+        ):
+            if re.fullmatch(pattern, value):
+                return re.sub(pattern, translated, value)
+        return value
     if not zh:
         # English names for stages whose internal names describe how they run, not what they do.
         return {'检查配套包': 'Checking packages', '下载模型': 'Downloading models',
@@ -174,6 +384,7 @@ def display(value, zh=False):
     return value
 
 
-def progress_view(event, zh=False):
-    return {key: display(value, zh) if key in ('label', 'detail', 'name') else value
+def progress_view(event, zh=False, ru=False):
+    return {key: display(value, zh=zh, ru=ru) if key in ('label', 'detail', 'name') else value
             for key, value in event.items()}
+
