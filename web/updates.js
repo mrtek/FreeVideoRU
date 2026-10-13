@@ -3,7 +3,7 @@ import { t as i18nT, getLanguage } from './i18n.js';
 
 // Every platform downloads from one release: the latest vX.Y.Z, or the rolling nightly.
 const releasePage = 'https://github.com/mrtek/FreeVideoRU/releases/latest';
-const nightlyPage = 'https://github.com/FlashML-org/FreeVideo/releases/tag/nightly';
+const nightlyPage = 'https://github.com/mrtek/FreeVideoRU/releases/tag/nightly';
 const storageKey = 'freevideo.dismissed-update';
 const listeners = new Set();
 // Launcher phases during which the server may disappear and come back updated.

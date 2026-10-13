@@ -500,7 +500,7 @@ function show(problems) {
     for (const [index, text] of adviceText.split('GitHub issue').entries()) {
         if (index) {
             const link = document.createElement('a');
-            link.textContent = 'GitHub issue'; link.href = 'https://github.com/FlashML-org/FreeVideo/issues';
+            link.textContent = 'GitHub issue'; link.href = 'https://github.com/mrtek/FreeVideoRU/issues';
             link.target = '_blank'; link.rel = 'noopener noreferrer';
             Object.assign(link.style, {color: '#6db8fa', textDecoration: 'underline', font: 'inherit'});
             advice.append(link);

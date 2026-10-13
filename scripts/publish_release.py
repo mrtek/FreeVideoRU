@@ -28,7 +28,7 @@ from freevideo_engine.release_notes import notes, version_key  # noqa: E402
 PLATFORMS = (CHANNEL, MAC_CHANNEL, LINUX_CHANNEL)
 LEGACY_PLATFORMS = (CHANNEL, MAC_CHANNEL)
 NAMES = {CHANNEL: 'Windows', MAC_CHANNEL: 'Mac', LINUX_CHANNEL: 'Linux'}
-PAGE = 'https://github.com/FlashML-org/FreeVideo'
+PAGE = 'https://github.com/mrtek/FreeVideoRU'
 LOGO = '''<div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://freevideo-community.pages.dev/logo-dark.svg">
@@ -324,7 +324,7 @@ def main():
     parser.add_argument('--macos', type=Path, required=True)
     parser.add_argument('--linux', type=Path, required=True)
     parser.add_argument('--sha', required=True)
-    parser.add_argument('--repository', default=os.environ.get('GH_REPO', 'FlashML-org/FreeVideo'))
+    parser.add_argument('--repository', default=os.environ.get('GH_REPO', 'mrtek/FreeVideoRU'))
     args = parser.parse_args()
     builds = load_builds(args.windows, args.macos, args.linux)
     if build_track(builds[CHANNEL]['identity']) != args.track:

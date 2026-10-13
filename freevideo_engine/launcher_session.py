@@ -727,10 +727,13 @@ class Session:
         An older launcher opened later would otherwise offer a downgrade."""
         if not (self.selected and self.controller.state.get('engine_update_available')):
             return False
-        # The order the installation check applies: an offered update is never refused there.
-        from .release_notes import older
+        from .release_notes import older, product_version, version_key
         self.bundled_identity = self.stamped(self.source, self.bundled_identity)
         self.engine_identity = self.stamped((self.selected or {}).get('source'), self.engine_identity)
+        bundled_ver = product_version(self.bundled_identity[1].get('product_version'))
+        engine_ver = product_version(self.engine_identity[1].get('product_version'))
+        if bundled_ver and engine_ver and version_key(bundled_ver) <= version_key(engine_ver):
+            return False
         return not older(self.bundled_identity[1], self.engine_identity[1])
 
     def update_key(self):

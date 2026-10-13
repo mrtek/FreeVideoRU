@@ -1,7 +1,7 @@
 // Send the redacted diagnostic report as a GitHub issue: the report menu's
 // entry, and a tip above that menu after a finished video, shown until the
 // user closes it once.
-const ISSUE_FORM = 'https://github.com/FlashML-org/FreeVideo/issues/new';
+const ISSUE_FORM = 'https://github.com/mrtek/FreeVideoRU/issues/new';
 const TIP_KEY = 'freevideo.report-tip';
 
 const gb = bytes => Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / 2 ** 30) : null;
