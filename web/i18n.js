@@ -46,12 +46,20 @@ export const isEn = () => currentLanguage === 'en';
 function translatePattern(en) {
     if (!en || typeof en !== 'string') return null;
     let m;
-    if ((m = en.match(/^About\s+(\d+)\s+min$/i))) return `Около ${m[1]} мин`;
-    if ((m = en.match(/^About\s+(\d+)\s+s$/i))) return `Около ${m[1]} с`;
-    if ((m = en.match(/^About\s+(\d+)\s+h$/i))) return `Около ${m[1]} ч`;
-    if ((m = en.match(/^About\s+(\d+)[\s\u00a0]+min\s+left$/i))) return `Осталось около ${m[1]} мин`;
-    if ((m = en.match(/^About\s+(\d+)[\s\u00a0]+s\s+left$/i))) return `Осталось около ${m[1]} с`;
+    if ((m = en.match(/^(\d+)\s*s$/i))) return `${m[1]} с`;
+    if ((m = en.match(/^(\d+)\s*min$/i))) return `${m[1]} мин`;
+    if ((m = en.match(/^(\d+)\s*h$/i))) return `${m[1]} ч`;
+    if ((m = en.match(/^About\s+(\d+)\s+min(?:ute)?s?$/i))) return `около ${m[1]} мин`;
+    if ((m = en.match(/^About\s+(\d+)\s+s(?:econd)?s?$/i))) return `около ${m[1]} с`;
+    if ((m = en.match(/^About\s+(\d+)\s+h(?:our)?s?$/i))) return `около ${m[1]} ч`;
+    if ((m = en.match(/^About\s+(\d+)[\s\u00a0]+min(?:ute)?s?\s+left$/i))) return `Осталось около ${m[1]} мин`;
+    if ((m = en.match(/^About\s+(\d+)[\s\u00a0]+s(?:econd)?s?\s+left$/i))) return `Осталось около ${m[1]} с`;
+    if ((m = en.match(/^Part\s+(\d+)\s*\/\s*(\d+)$/i))) return `Часть ${m[1]}/${m[2]}`;
+    if ((m = en.match(/^Version\s+(\d+)$/i))) return `Версия ${m[1]}`;
     if ((m = en.match(/^Sampling\s+(\d+)\s*\/\s*(\d+)$/i))) return `Сэмплирование ${m[1]} / ${m[2]}`;
+    if ((m = en.match(/^Generating\s+(\d+)%$/i))) return `Генерация ${m[1]}%`;
+    if ((m = en.match(/^Cancel\s*·\s*(\d+)%$/i))) return `Отмена · ${m[1]}%`;
+    if ((m = en.match(/^Cancel\s*·\s*Downloading\s+(\d+)%$/i))) return `Отмена · Загрузка ${m[1]}%`;
     if ((m = en.match(/^Take\s+(\d+)$/i))) return `Дубль ${m[1]}`;
     if ((m = en.match(/^In queue\s*·\s*#(\d+)$/i))) return `В очереди · #${m[1]}`;
     if ((m = en.match(/^First-pass preview\s*·\s*(\d+)\s*[×x]\s*(\d+)$/i))) return `Предпросмотр первого прохода · ${m[1]} × ${m[2]}`;
@@ -61,6 +69,10 @@ function translatePattern(en) {
     if ((m = en.match(/^Done in\s+(.+)$/i))) return `Готово за ${m[1]}`;
     if ((m = en.match(/^Failed after\s+(.+)$/i))) return `Сбой через ${m[1]}`;
     if ((m = en.match(/^Auto subtitles\s*·\s*Download\s+(\d+)\s+MB$/i))) return `Автосубтитры · Скачать ${m[1]} МБ`;
+    if ((m = en.match(/^(.+),\s*clip\s+(\d+),\s*(\d+)\s*s,\s*(.+)$/i))) {
+        const tr1 = RU_DICT[m[1]] || m[1], tr4 = RU_DICT[m[4]] || m[4];
+        return `${tr1}, фрагмент ${m[2]}, ${m[3]} с, ${tr4}`;
+    }
     return null;
 }
 
