@@ -131,7 +131,7 @@ def manifest(value):
             not isinstance(build.get('version'), str) or not 1 <= len(build['version']) <= 64 or
             not re.fullmatch(r'[0-9a-f]{40,64}', str(build.get('revision', ''))) or
             type(build.get('built_at')) is not int or build['built_at'] <= 0 or
-            build.get('repository') != 'FlashML-org/FreeVideo' or build.get('schema') != 1 or
+            build.get('repository') not in ('FlashML-org/FreeVideo', 'mrtek/FreeVideoRU') or build.get('schema') != 1 or
             build.get('channel') not in ('windows-preview', 'macos-preview', 'linux-preview') or
             build.get('track', 'stable') != 'stable' or type(value.get('gui')) is not bool or
             not isinstance(files, dict) or not 1 <= len(files) <= MAX_FILES or
