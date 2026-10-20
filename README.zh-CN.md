@@ -19,7 +19,8 @@ https://github.com/user-attachments/assets/ecda7d0d-7fbe-4e0c-8c29-8f3315bafc15
 
 ## 更新动态
 
-- **2026-10-07** · **[v0.3.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.2)：先出预览。** 先看半分辨率预览，满意的再继续二采。
+- **2026-10-13** · **[v0.4.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.4.0)：Agent 全自动生成、分钟级长视频和剪辑视图。** 连接 Claude Code、Codex 等 AI Agent，让它全自动生成视频；一条视频可以生成到一分钟以上；在时间线上剪辑。
+- **2026-10-07** · **[v0.3.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.2)：先出预览。** 先看半分辨率预览，满意的再继续生成。
 - **2026-10-07** · **[v0.3.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.0)：更快的 int8 模型。** GeForce 和 RTX 30 系显卡改用 int8，RTX 3090 生成 5 秒视频快约 2.3 倍。
 - **2026-10-06** · **[作品展示](https://freevideo-community.pages.dev/#gallery)上线。** 观看 FreeVideo 生成的 20 秒视频，以及四档质量的并排对比。
 - **2026-10-06** · **[v0.2.3](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.3)：视频自带工作流。** 把 FreeVideo 生成的视频拖到 ComfyUI 画布上，即可还原提示词、种子和全部参数，之前的视频也能补上。
@@ -93,6 +94,7 @@ git clone https://github.com/FlashML-org/FreeVideo.git && cd FreeVideo
 
 - [FreeVideo Adaptive Execution Planner](docs/zh-CN/execution-planning.md)
 - [社区实测](docs/zh-CN/community-results.md)
+- [感谢社区](docs/zh-CN/community-thanks.md)
 
 ### 问题反馈
 

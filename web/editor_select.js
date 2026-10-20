@@ -5,6 +5,7 @@ import {copyContent, pasteContent, copyRange, pasteRange, playheadTargets, remov
 export {copyContent, pasteContent} from './editor_room.js';
 import {transportSnapPoints} from './editor_transport_model.js';
 import {unlockedIds} from './editor_audio_model.js';
+import {isTextTrack, textDropLocked} from './editor_text_model.js';
 
 const end = clip => clip.start + clip.frames;
 const busy = clip => ['queued', 'running'].includes(clip.pending);
@@ -84,6 +85,7 @@ export function createSelectionActions({state, t = en => en, actions = {}, clipb
             const ids = selectedIds(state.record, state.selection);
             if (key === 'a') { state.select(selection(unlockedIds(state.record))); return {ok: true}; }
             if (['b', 'q', 'w'].includes(key) && !playheadIds(state.record, state.selection, state.playhead).length) {
+                actions.notify?.(t('Select a clip and move the playhead onto it.', '先选中片段，再把播放头移到片段上。'));
                 return {ok: false, reason: 'playhead'};
             }
             if (key === 'b') { state.apply(t('Split', '剪开'), record => actionsModel.splitAt(record, ids, state.playhead)); return {ok: true}; }
@@ -143,11 +145,13 @@ export function createSelectionActions({state, t = en => en, actions = {}, clipb
 // project, dispatching selection events, or rebuilding clip DOM.
 export function prepareMove(record, ids) {
     const selected = model.linkedIds(record, ids), members = all(record).filter(clip => selected.has(clip.id));
-    const rows = record.tracks.map(track => ({moving: track.clips.filter(clip => selected.has(clip.id)), others: track.clips.filter(clip => !selected.has(clip.id))}));
+    const rows = record.tracks.map(track => ({locked: isTextTrack(track) && track.locked,
+        moving: track.clips.filter(clip => selected.has(clip.id)), others: track.clips.filter(clip => !selected.has(clip.id))}));
     const start = Math.min(...members.map(clip => clip.start)), stop = Math.max(...members.map(end));
-    return {ids: [...selected], start, end: stop, members, preview(delta) {
+    return {ids: [...selected], start, end: stop, members, preview(delta, trackId = null) {
         delta = Math.max(-start, delta);
-        let code = members.some(busy) ? 'busy' : null;
+        let code = rows.some(row => row.locked && row.moving.length) || textDropLocked(record, members, trackId) ? 'locked'
+            : members.some(busy) ? 'busy' : null;
         for (const {moving, others} of rows) {
             let i = 0;
             for (const clip of moving) {
@@ -241,7 +245,8 @@ export function createSelectionGestures({state, element, content, scroll, clips,
             const clip = clips.get(g.id).clip, desired = clip.start + Math.round((p.x - g.start.x) * model.FPS / state.zoom);
             const points = [...g.points, ...[desired, desired + clip.frames].map(frame => Math.round(frame / (5 * model.FPS)) * 5 * model.FPS)];
             const aligned = snap(Math.max(0, desired), transportSnapPoints(state, points, event), state.zoom, {offsets: [0, clip.frames]});
-            const result = g.plan.preview(aligned.frame - clip.start); g.result = result;
+            const track = [...rows].find(([, row]) => p.y >= row.top && p.y <= row.top + row.height)?.[0];
+            const result = g.plan.preview(aligned.frame - clip.start, track); g.result = result;
             if (result.code === 'busy') {
                 if (!g.warned) { g.warned = true; commands.report(new model.EditError('busy')); }
                 return;
@@ -283,6 +288,7 @@ export function createSelectionGestures({state, element, content, scroll, clips,
             if (cancel) state.select(g.previous);
             else if (g.type === 'box') { const ids = g.selected || (adding(g) ? selectedIds(g.record, g.previous) : []); state.select(selection(ids), {history: true}); anchor = ids.at(-1) ?? null; }
             else if (g.type === 'move' && !g.moved) choose(g.id);
+            else if (g.type === 'move' && g.result?.code === 'locked') commands.report(new model.EditError('locked'));
             else if (g.type === 'move' && g.result && !g.result.code) state.apply(t('Move', '移动'), record => actionsModel.moveParts(record, g.plan.ids, {frames: g.result.delta, track: null}));
         } catch (error) { commands.report(error); }
         finally { paint(selectedIds(state.record, state.selection)); renderSelection(); actions.gestureEnd?.(); }

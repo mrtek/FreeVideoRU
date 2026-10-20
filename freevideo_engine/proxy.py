@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 from urllib import request
@@ -13,6 +14,62 @@ PROXY_KEYS = ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
               'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')
 MODES = ('auto', 'proxy', 'direct')
 GIT_PROXY_PATTERN = r'^(http\..*proxy|https\.proxy|remote\..*\.proxy|core\.gitproxy)$'
+
+
+def local_addresses():
+    """IPv4 interfaces served by the launcher's 0.0.0.0 proxy, on every OS."""
+    import ipaddress
+    import psutil
+    found = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect(('8.8.8.8', 80))
+            found.append(route.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        found.extend(row.address for rows in psutil.net_if_addrs().values() for row in rows
+                     if row.family == socket.AF_INET)
+    except OSError:
+        pass
+    result = []
+    for host in found:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if ip.version == 4 and not (ip.is_loopback or ip.is_unspecified or ip.is_link_local):
+            result.append(str(ip))
+    return list(dict.fromkeys(result))
+
+
+def bypass_local(environ, *addresses):
+    """Keep this computer's UI traffic local without changing download routes."""
+    env = dict(environ)
+    if not configured(env):
+        # A lone NO_PROXY makes urllib and its users skip the proxy saved in the
+        # operating system, so add exceptions only beside a proxy variable.
+        return env
+    import ipaddress
+    import psutil
+    hosts = ['localhost', '127.0.0.1', '::1', '0.0.0.0', '::', *addresses]
+    try:
+        hosts.extend(row.address.split('%', 1)[0] for rows in psutil.net_if_addrs().values()
+                     for row in rows if row.family in (socket.AF_INET, socket.AF_INET6))
+    except OSError:
+        pass
+    existing = ','.join(env.get(key, '') for key in ('no_proxy', 'NO_PROXY'))
+    entries = [value.strip() for value in existing.split(',') if value.strip()]
+    for host in hosts:
+        if host:
+            entries.append(host)
+            try:
+                if ipaddress.ip_address(host).version == 6:
+                    entries.append('[' + host + ']')
+            except ValueError:
+                pass
+    env['no_proxy'] = env['NO_PROXY'] = ','.join(dict.fromkeys(entries))
+    return env
 
 
 def inherited(environ=None):

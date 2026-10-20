@@ -67,7 +67,9 @@ def embed_comfy_metadata(path, *, prompt=None, workflow=None, backup=None):
                 shutil.copy2(path, backup)
             if backup.stat().st_size != size:
                 raise ValueError('The backup is incomplete')
+        original = path.stat()
         os.replace(temporary, path)
+        _restore_times(path, original)
         return True
     except Exception:
         logging.warning('FreeVideo could not store the workflow in %s; the video is unchanged.', path, exc_info=True)
@@ -75,6 +77,15 @@ def embed_comfy_metadata(path, *, prompt=None, workflow=None, backup=None):
         if made_backup and backup.exists():
             backup.unlink()  # the original is still in place, so this copy is not needed
         return False
+
+
+def _restore_times(path, original):
+    """The library orders videos and dates them by the file's modification time,
+    so a rewrite keeps the original's access and modification times."""
+    try:
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    except OSError:
+        logging.warning('FreeVideo could not keep the original time of %s.', path, exc_info=True)
 
 
 def _media(path):
@@ -176,6 +187,42 @@ def backfill(output_directory, *, stop=None):
     return counts
 
 
+TIMES_MARKER = '.workflow-times-restored.json'
+
+
+def restore_backfilled_times(output_directory, *, stop=None):
+    """Videos that were rewritten before the original time was kept took the
+    time of the rewrite. Their backup is the original file (a hard link or a
+    copy that keeps the time), so its time goes back onto the video. Only a
+    video that is newer than its own backup and still carries a workflow is
+    touched. Runs once; returns the number restored, or None when it already ran."""
+    root = Path(output_directory).resolve() / 'FreeVideo'
+    marker = root / TIMES_MARKER
+    if marker.is_file() or not root.is_dir():
+        return None
+    from .monitoring import save
+    restored = 0
+    complete = True
+    for backup in sorted(root.glob('*/*/' + BACKUP_NAME)):
+        if stop is not None and stop.is_set():
+            return restored
+        video = backup.with_name('video.mp4')
+        try:
+            if backup.is_symlink() or video.is_symlink() or not backup.is_file() or not video.is_file():
+                continue
+            before, now = backup.stat(), video.stat()
+            if now.st_mtime_ns <= before.st_mtime_ns or not has_workflow(video):
+                continue
+            os.utime(video, ns=(before.st_atime_ns, before.st_mtime_ns))
+            restored += 1
+        except Exception:
+            complete = False
+            logging.warning('FreeVideo could not restore the time of %s.', video, exc_info=True)
+    if complete:
+        save(marker, dict(schema=1, completed_at=time.time(), restored=restored))
+    return restored
+
+
 DISMISSED = '.workflow-backfill-dismissed.json'
 _job = {'state': 'idle', 'result': None}
 _job_lock = threading.Lock()
@@ -231,6 +278,16 @@ def register():
             result = dict(embedded=0, skipped=0, pending=0, failed=1)
         with _job_lock:
             _job.update(state='done', result=result)
+
+    def restore_times():
+        try:
+            count = restore_backfilled_times(folder_paths.get_output_directory())
+            if count:
+                logging.info('FreeVideo restored the original time of %d earlier videos.', count)
+        except Exception:
+            logging.warning('FreeVideo could not restore the time of earlier videos.', exc_info=True)
+
+    threading.Thread(target=restore_times, name='freevideo-workflow-times', daemon=True).start()
 
     @server.routes.get('/freevideo/workflow-backfill')
     async def status(request):

@@ -1,4 +1,5 @@
-import {agentPost} from './agent_session.js';
+import {retryAgentPost} from './agent_session.js';
+import {issueButton} from './issue_button.js';
 // What agents connected to this FreeVideo are doing. Their requests share the
 // studio's queue, so people can see them, follow progress and stop them.
 const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = new URL('./agent_activity.css', import.meta.url).href; document.head.append(css);
@@ -6,10 +7,10 @@ const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = n
 const KINDS = {
     generate: ['Generating', '生成中', 'M4 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm13 4 5-3v8l-5-3'],
     assemble: ['Assembling', '拼接中', 'M3 6h7v12H3zM14 6h7v12h-7zM10 12h4'],
-    vlm: ['Reviewing', '审看中', 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z'],
-    enhance: ['Writing prompt', '润色提示词', 'M4 20l4-1 10-10-3-3L5 16zM14 7l3 3M18 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z'],
+    vlm: ['Checking', '检查中', 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z'],
+    enhance: ['Enhancing prompt', '增强提示词', 'M4 20l4-1 10-10-3-3L5 16zM14 7l3 3M18 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z'],
 };
-const NAMES = {generate: ['Video', '视频'], assemble: ['Sequence', '成片'], vlm: ['Review', '审看'], enhance: ['Prompt', '提示词']};
+const NAMES = {generate: ['Video', '视频'], assemble: ['Sequence', '成片'], vlm: ['Check', '检查'], enhance: ['Prompt', '提示词']};
 
 // Short reasons for the failures people can act on; the engine's own message stays in the tooltip.
 const REASONS = {
@@ -27,19 +28,122 @@ function glyph(path) {
     const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', path); svg.append(p);
     return svg;
 }
-const seconds = (s, t) => t(`${Math.max(1, Math.round(s))} s`, `${Math.max(1, Math.round(s))} 秒`);
+// The same two wordings as the conversation's cards.
+const left = (s, t) => s >= 60 ? t(`About ${Math.ceil(s / 60)} min`, `约 ${Math.ceil(s / 60)} 分钟`) : t('Under 1 min', '不到 1 分钟');
 // The engine's phases in the reader's language.
 function phaseText(p, t) {
     const step = p.step;
-    if (p.phase === 'sampling' && step?.total) return t(`Sampling ${step.done} / ${step.total}`, `采样 ${step.done} / ${step.total}`);
-    return {encoding: t('Reading prompt and media', '编码提示词与素材'), load: t('Loading the model', '加载模型'),
+    // The first step is still getting ready: the line does not count from zero. A row here does not know which
+    // part of a long video it is on, and a later part loads nothing, so it does not say the model is loading.
+    if (p.phase === 'sampling' && step?.total) return step.done >= 1 ? t(`Step ${step.done} / ${step.total}`, `生成 ${step.done} / ${step.total}`) : t('Preparing', '准备中');
+    return {encoding: t('Reading prompt and media', '读取提示词和素材'), load: t('Loading the model', '加载模型'),
         decode: t('Saving video and audio', '保存视频与音频'), starting: t('Starting', '启动中'),
-        loading: t('Loading the VLM', '加载视觉模型'), answering: t('Answering', '回答中'), rewriting: t('Writing', '改写中'),
+        loading: t('Loading the model', '加载模型'), answering: t('Answering', '回答中'), rewriting: t('Enhancing prompt', '增强提示词'),
         assembling: t('Joining clips', '拼接片段'), 'preparing images': t('Preparing images', '准备图片'),
         finishing: t('Finishing', '收尾中')}[p.phase] || '';
 }
 
-export function createAgentActivity(t, api, host, {interval = [1500, 8000]} = {}) {
+function status(job, t) {
+    const [en, zh] = KINDS[job.kind] || KINDS.generate;
+    if (job.status === 'running') return t(en, zh);
+    if (job.status === 'cancelling') return t('Stopping', '正在停止');
+    if (job.status === 'queued') return job.progress?.queue_position
+        ? t(`In queue · #${job.progress.queue_position}`, `排队 · 第 ${job.progress.queue_position} 位`) : t('Queued', '排队中');
+    if (job.status === 'waiting') return job.waiting_for ? t('Waiting for earlier tasks', '等待前面的任务') : t('Waiting for the GPU', '等待显卡');
+    return {succeeded: t('Done', '已完成'), failed: t('Failed', '失败'), cancelled: t('Cancelled', '已取消')}[job.status] || job.status;
+}
+function title(job, t) {
+    const name = NAMES[job.kind] || NAMES.generate;
+    return job.label || (t(name[0], name[1]) + (job.take ? ' · ' + t(`Take ${job.take}`, `第 ${job.take} 条`) : ''));
+}
+function row(job, t, api, refresh, open, cancellationErrors) {
+    const item = el('li', 'fv-agent-job'); item.dataset.status = job.status; item.dataset.job = job.id;
+    item.append(glyph((KINDS[job.kind] || KINDS.generate)[2]));
+    const body = el('div', 'fv-agent-body');
+    const head = el('div', 'fv-agent-head');
+    head.append(el('strong', null, title(job, t)), el('span', 'fv-agent-state', status(job, t)));
+    body.append(head);
+    const p = job.progress || {};
+    if (job.status === 'running' || job.status === 'queued') {
+        const bar = el('div', 'fv-agent-bar'), fill = el('i');
+        const fraction = Math.max(0, Math.min(1, Number(p.fraction) || 0));
+        fill.style.transform = `scaleX(${job.status === 'queued' ? 0 : Math.max(.02, fraction)})`;
+        bar.append(fill); bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-valuemin', '0');
+        bar.setAttribute('aria-valuemax', '100'); bar.setAttribute('aria-valuenow', String(Math.round(fraction * 100)));
+        body.append(bar);
+    }
+    const meta = [];
+    if (job.status === 'running' && phaseText(p, t)) meta.push(phaseText(p, t));
+    if (job.status === 'running' && p.remaining_seconds > 0) meta.push(left(p.remaining_seconds, t));
+    const reason = job.status === 'failed' && REASONS[job.error?.code];
+    if (reason) meta.push(t(...reason));
+    else if (job.status === 'failed') meta.push(t(job.error?.message || 'Did not finish', job.error?.error_zh || '没有完成'));
+    if (job.project) meta.push(job.project);
+    const foot = el('div', 'fv-agent-foot');
+    const details = el('p', 'fv-agent-meta', meta.join(' · '));
+    if (reason && job.error?.message) details.title = job.error.message;
+    foot.append(details);
+    const issue = issueButton(t, () => ({where: ['Agent activity', 'Agent 任务'], message: details.textContent}));
+    issue.hidden = !cancellationErrors.has(job.id); foot.append(issue);
+    if (['waiting', 'queued', 'running'].includes(job.status)) {
+        const stop = el('button', 'fv-agent-stop', t('Stop', '停止')); stop.type = 'button';
+        stop.setAttribute('aria-label', t('Stop ', '停止 ') + title(job, t));
+        stop.onclick = async () => {
+            stop.disabled = true; stop.textContent = t('Stopping', '正在停止');
+            try {
+                const response = await retryAgentPost(api, '/freevideo/agent/activity/cancel', {id: job.id});
+                if (!response?.ok) {
+                    const message = t('Could not stop. Click again.', '没能停止，请再点一次。');
+                    details.textContent = message;
+                    cancellationErrors.set(job.id, message);
+                    issue.hidden = false;
+                } else { cancellationErrors.delete(job.id); issue.hidden = true; }
+            } finally { refresh(); }
+            stop.disabled = false; stop.textContent = t('Stop', '停止');
+        };
+        foot.append(stop);
+    }
+    if (job.work) {
+        // The result is a work: show that one in Creations. (The file itself needs the Agent's token.)
+        const show = el('button', 'fv-agent-open', t('Open', '打开')); show.type = 'button';
+        show.setAttribute('aria-label', t('Open in Creations: ', '在作品中打开：') + title(job, t));
+        show.onclick = () => open(job);
+        foot.append(show);
+    }
+    body.append(foot);
+    if (cancellationErrors.has(job.id)) details.textContent = cancellationErrors.get(job.id);
+    item.append(body);
+    return item;
+}
+// Running first, then the rest in the order they will run; finished ones after, newest first.
+function rows(jobs, t, api, refresh, open, cancellationErrors) {
+    const rank = {running: 0, cancelling: 0, queued: 1, waiting: 2};
+    const active = jobs.filter(j => j.status in rank)
+        .sort((a, b) => rank[a.status] - rank[b.status] || String(a.created_at).localeCompare(String(b.created_at)));
+    const done = jobs.filter(j => !(j.status in rank))
+        .sort((a, b) => String(b.finished_at).localeCompare(String(a.finished_at)));
+    const items = active.map(job => row(job, t, api, refresh, open, cancellationErrors));
+    if (done.length) {
+        const divider = el('li', 'fv-agent-divider', t('Last 30 minutes', '最近 30 分钟'));
+        divider.setAttribute('role', 'presentation');
+        items.push(divider, ...done.map(job => row(job, t, api, refresh, open, cancellationErrors)));
+    }
+    return items;
+}
+// A re-render keeps keyboard focus on the same control.
+function refill(root, list, items) {
+    const focused = root.contains(document.activeElement) ? document.activeElement : null;
+    const key = focused && [focused.closest('[data-job]')?.dataset.job, focused.className];
+    list.replaceChildren(...items);
+    return key;
+}
+
+// "Open" on a finished video leads to that work in Creations.
+async function showWork(t, job) {
+    (await import('./library.js')).openLibrary(t, {selectedWork: job.work});
+}
+
+export function createAgentActivity(t, api, host, {interval = [1500, 8000], open = job => showWork(t, job)} = {}) {
     const element = el('button', 'fv-agent-pill'); element.type = 'button'; element.hidden = true;
     element.setAttribute('aria-haspopup', 'dialog'); element.setAttribute('aria-expanded', 'false');
     const dot = el('span', 'fv-agent-dot'), label = el('span', 'fv-agent-label');
@@ -48,96 +152,20 @@ export function createAgentActivity(t, api, host, {interval = [1500, 8000]} = {}
     panel.setAttribute('aria-label', t('Agent jobs', 'Agent 任务'));
     host.append(panel);
     let data = {active: 0, jobs: []}, timer = null, disposed = false, failures = 0;
+    const cancellationErrors = new Map();
 
-    function status(job) {
-        const [en, zh] = KINDS[job.kind] || KINDS.generate;
-        if (job.status === 'running') return t(en, zh);
-        if (job.status === 'queued') return job.progress?.queue_position
-            ? t(`In queue · #${job.progress.queue_position}`, `排队 · 第 ${job.progress.queue_position} 位`) : t('Queued', '排队中');
-        if (job.status === 'waiting') return job.waiting_for ? t('Waiting for earlier steps', '等待前序任务') : t('Waiting for the GPU', '等待显卡');
-        return {succeeded: t('Done', '已完成'), failed: t('Failed', '失败'), cancelled: t('Cancelled', '已取消')}[job.status] || job.status;
-    }
-    function title(job) {
-        const name = NAMES[job.kind] || NAMES.generate;
-        return job.label || (t(name[0], name[1]) + (job.take ? ' · ' + t(`Take ${job.take}`, `第 ${job.take} 条`) : ''));
-    }
-    function row(job) {
-        const item = el('li', 'fv-agent-job'); item.dataset.status = job.status; item.dataset.job = job.id;
-        item.append(glyph((KINDS[job.kind] || KINDS.generate)[2]));
-        const body = el('div', 'fv-agent-body');
-        const head = el('div', 'fv-agent-head');
-        head.append(el('strong', null, title(job)), el('span', 'fv-agent-state', status(job)));
-        body.append(head);
-        const p = job.progress || {};
-        if (job.status === 'running' || job.status === 'queued') {
-            const bar = el('div', 'fv-agent-bar'), fill = el('i');
-            const fraction = Math.max(0, Math.min(1, Number(p.fraction) || 0));
-            fill.style.transform = `scaleX(${job.status === 'queued' ? 0 : Math.max(.02, fraction)})`;
-            bar.append(fill); bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-valuemin', '0');
-            bar.setAttribute('aria-valuemax', '100'); bar.setAttribute('aria-valuenow', String(Math.round(fraction * 100)));
-            body.append(bar);
-        }
-        const meta = [];
-        if (job.status === 'running' && phaseText(p, t)) meta.push(phaseText(p, t));
-        if (job.status === 'running' && p.remaining_seconds > 0) meta.push(t(`about ${seconds(p.remaining_seconds, t)} left`, `约剩 ${seconds(p.remaining_seconds, t)}`));
-        const reason = job.status === 'failed' && REASONS[job.error?.code];
-        if (reason) meta.push(t(...reason));
-        else if (job.error?.message && job.status === 'failed') meta.push(job.error.message);
-        if (job.project) meta.push(job.project);
-        if (job.client) meta.push(job.client);
-        const foot = el('div', 'fv-agent-foot');
-        const details = el('p', 'fv-agent-meta', meta.join(' · '));
-        if (reason && job.error?.message) details.title = job.error.message;
-        foot.append(details);
-        if (['waiting', 'queued', 'running'].includes(job.status)) {
-            const stop = el('button', 'fv-agent-stop', t('Stop', '停止')); stop.type = 'button';
-            stop.setAttribute('aria-label', t('Stop ', '停止 ') + title(job));
-            stop.onclick = async () => {
-                stop.disabled = true;
-                try {
-                    await agentPost(api, '/freevideo/agent/activity/cancel', {id: job.id});
-                } finally { poll(); }
-            };
-            foot.append(stop);
-        }
-        if (job.video) {
-            const open = el('a', 'fv-agent-open', t('Open', '打开'));
-            open.href = api.apiURL ? api.apiURL(job.video) : job.video; open.target = '_blank'; open.rel = 'noopener';
-            open.setAttribute('aria-label', t('Open video of ', '打开视频：') + title(job));
-            foot.append(open);
-        }
-        body.append(foot);
-        item.append(body);
-        return item;
-    }
     function renderPanel() {
-        // Keep keyboard focus on the same control across a refresh.
-        const focused = panel.contains(document.activeElement) ? document.activeElement : null;
-        const key = focused && [focused.closest('[data-job]')?.dataset.job, focused.className];
-        panel.replaceChildren();
         const header = el('header');
-        header.append(el('h2', null, t('Agent jobs', 'Agent 任务')),
-            el('p', null, t('Requests from AI agents connected to FreeVideo. They share the queue with your videos.',
-                '已连接的 AI Agent 提交的任务，与您的生成共用同一个队列。')));
-        // Running first, then the rest in the order they will run; finished ones after, newest first.
-        const rank = {running: 0, queued: 1, waiting: 2};
-        const active = data.jobs.filter(j => j.status in rank)
-            .sort((a, b) => rank[a.status] - rank[b.status] || String(a.created_at).localeCompare(String(b.created_at)));
-        const done = data.jobs.filter(j => !(j.status in rank))
-            .sort((a, b) => String(b.finished_at).localeCompare(String(a.finished_at)));
+        header.append(el('h2', null, t('Agent jobs', 'Agent 任务')));
         const list = el('ol');
-        for (const job of active) list.append(row(job));
-        if (done.length) {
-            const divider = el('li', 'fv-agent-divider', t('Last 30 minutes', '最近 30 分钟'));
-            divider.setAttribute('role', 'presentation');
-            list.append(divider);
-            for (const job of done) list.append(row(job));
-        }
+        const key = refill(panel, list, rows(data.jobs, t, api, poll, job => { setOpen(false); open(job); }, cancellationErrors));
+        panel.replaceChildren();
         panel.append(header, list);
         if (key) (panel.querySelector(`[data-job="${key[0]}"] .${key[1].split(' ')[0]}`) || panel).focus?.();
     }
     function render() {
         const jobs = data.jobs || [];
+        for (const job of jobs) if (!['waiting', 'queued', 'running', 'cancelling'].includes(job.status)) cancellationErrors.delete(job.id);
         element.hidden = !jobs.length;
         if (!jobs.length) { setOpen(false); return; }
         const running = jobs.find(j => j.status === 'running'), active = data.active || 0;

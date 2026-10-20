@@ -1,7 +1,11 @@
 import { t, isZh, isRu } from './i18n.js';
+import {SHOWCASE_TEXT, showcaseChapter, loadShowcaseImage} from './entry_showcase.js';
 
 const FILE = '/userdata/' + encodeURIComponent('freevideo/guide.json');
-let attempted = false, current = null;
+const attempted = new Set();
+let current = null;
+const guides = new Map();
+const recordWrites = new WeakMap();
 
 export const REPLAY_TEXT = {
     title: ['Getting started', '新手指引', 'Руководство пользователя'],
@@ -9,13 +13,18 @@ export const REPLAY_TEXT = {
     waiting: ['Waiting for the workspace to be ready. The guide will start automatically.', '正在等待创作面板就绪，随后会自动开始指引。', 'Ожидание готовности рабочего пространства. Руководство начнется автоматически.'],
     cancel: ['Cancel', '取消', 'Отмена'],
     unavailable: ['Open a creation workflow to view the guide.', '请先打开创作工作流，再查看指引。', 'Откройте панель творчества для просмотра руководства.'],
+    manual: ['User guide', '使用说明', 'Инструкция'],
 };
 
 export const CHAPTERS = [
     {id: 'describe', anchor: '[data-fv-guide="describe"]', added: false,
         en: 'Type your prompt here. You can have an agent follow the Skill at the top right, or turn on FreeToken enhancement.',
-        zh: '在这里输入提示词。可以让 Agent 参考右⁠上⁠角的 Skill，或开启 FreeToken 提示词增强。',
-        ru: 'Введите промпт здесь. Вы можете использовать Skill в правом верхнем углу для агента или включить улучшение FreeToken.'},
+        zh: '在这里输入提示词。可以让 Agent 参⁠考 Skill，或开启 FreeToken 提示词增强。',
+        ru: 'Введите промпт здесь. Вы можете использовать Skill для агента или включить улучшение FreeToken.'},
+    {id: 'media', anchor: '[data-fv-guide="media"]', added: true,
+        en: 'Add reference images or a first or last frame here. Type @ in the prompt to use them.',
+        zh: '在此添加参\u2060考\u2060图、首\u2060帧或尾\u2060帧，并在描述中输入 @ 引用。',
+        ru: 'Добавьте опорные изображения, первый или последний кадр здесь. Введите @ в промпте для ссылки на них.'},
     {id: 'range', anchor: '[data-fv-guide="range"]', added: true,
         en: 'See the available sizes and lengths here, and how long each takes.', zh: '在这里查看可生成的尺\u2060寸、时长和预计用时。',
         ru: 'Здесь отображаются доступные размеры, длительность и расчетное время генерации.'},
@@ -23,16 +32,29 @@ export const CHAPTERS = [
         en: 'Choose "Generate video". Progress and the time left appear in the preview.', zh: '点“生成视频”，进度和剩\u2060余\u2060时\u2060间会显示在预览区。',
         ru: 'Нажмите «Сгенерировать видео». Прогресс и оставшееся время отобразятся в окне предпросмотра.'},
     {id: 'longer', anchor: '[data-fv-guide="longer"]', added: true,
-        en: 'For a longer video, or to change part of one, choose "Edit".', zh: '要做更长的视频，或者修\u2060改\u2060其\u2060中\u2060一\u2060段，点“剪辑视图”。',
-        ru: 'Для создания более длинного видео или редактирования фрагмента перейдите в «Монтаж».'},
+        en: 'For a longer video, enter a longer duration and it is made in parts automatically. You can also add parts one by one in "Edit".',
+        zh: '填写更长的时长会自动分段生成，也可在“剪辑视图”中逐段接续。',
+        ru: 'Для создания более длинного видео укажите большую длительность — оно будет сгенерировано по частям автоматически. Вы также можете добавлять части по одной в «Монтаже».'},
     {id: 'agent', anchor: '[data-fv-guide="agent"]', added: true,
-        en: 'Connect Claude Code, Codex or another agent in Settings and let it make videos.', zh: '在设置里连接 Claude Code、Codex 等 Agent，让它生成视频。',
-        ru: 'Подключите Claude Code, Codex или другого агента в Настройках, чтобы создавать видео автоматически.'},
+        en: 'To have an AI agent such as Claude Code or Codex make videos for you, choose "Autopilot".',
+        zh: '要让 Claude Code、Codex 等 Agent 替你生\u2060成\u2060视\u2060频，点“AI 全自动”。',
+        ru: 'Чтобы поручить создание видео AI-агенту, такому как Claude Code или Codex, выберите «AI Автопилот».'},
+    {id: 'editor-timeline', group: 'editor', anchor: '[data-fv-guide="editor-timeline"]', added: true,
+        en: 'Drag a video here.', zh: '把视频拖到这里。', ru: 'Перетащите видео сюда.'},
+    {id: 'editor-trim', group: 'editor', anchor: '[data-fv-guide="editor-trim"]', added: true,
+        en: 'Drag the right edge to make this part longer.', zh: '拖右边缘，把这一段拉长。', ru: 'Потяните за правый край, чтобы удлинить эту часть.'},
+    {id: 'editor-empty', group: 'editor', anchor: '[data-fv-guide="editor-empty"]', added: true,
+        en: 'Drag in an empty spot to add a new part.', zh: '在空白处拖出新的一段。', ru: 'Потяните на пустом месте, чтобы добавить новую часть.'},
+    {id: 'editor-describe', group: 'editor', anchor: '[data-fv-guide="editor-describe"]',
+        anchors: ['[data-fv-guide="editor-describe"]', '[data-fv-guide="editor-generate"]'], added: true,
+        en: 'Describe it, then choose "Generate".', zh: '填写描述，然后点“\u2060生\u2060成\u2060”\u2060。', ru: 'Опишите фрагмент и нажмите «Сгенерировать».'},
 ];
 
-export function guideSteps({record, available = [], returning = false, blockers = {}, all = false}) {
+const chaptersFor = (group, chapters = CHAPTERS) => chapters.filter(c => (c.group || 'studio') === group);
+
+export function guideSteps({record, available = [], returning = false, blockers = {}, all = false, group = 'studio', chapters = CHAPTERS}) {
     if (Object.values(blockers).some(Boolean)) return [];
-    return CHAPTERS.filter(chapter => available.includes(chapter.id)
+    return chaptersFor(group, chapters).filter(chapter => available.includes(chapter.id)
         && (all || (!record?.seen.includes(chapter.id) && (record || !returning || chapter.added))));
 }
 
@@ -42,6 +64,9 @@ export function guideRecord(record, ids) {
 
 export async function readGuideRecord(api) {
     try {
+        // Switching workspaces can race a slow acknowledgement from the old
+        // guide. Read after its writes so the next group retains those ids.
+        await recordWrites.get(api);
         const reply = await api.fetchApi(FILE, {cache: 'no-store'});
         if (reply.status === 404) return {ok: true, record: null};
         if (!reply.ok) return {ok: false};
@@ -51,15 +76,19 @@ export async function readGuideRecord(api) {
     } catch { return {ok: false}; }
 }
 
-export async function saveGuideRecord(api, record) {
-    try {
-        return (await api.fetchApi(FILE + '?overwrite=true', {method: 'POST', body: JSON.stringify(record), keepalive: true})).ok;
-    } catch { return false; }
+export function saveGuideRecord(api, record) {
+    const pending = (recordWrites.get(api) || Promise.resolve()).then(async () => {
+        try {
+            return (await api.fetchApi(FILE + '?overwrite=true', {method: 'POST', body: JSON.stringify(record), keepalive: true})).ok;
+        } catch { return false; }
+    });
+    recordWrites.set(api, pending);
+    return pending;
 }
 
 // An empty record checks write access before drawing anything. Never infer a
 // new installation from an unreadable library, or consume an absent chapter.
-export async function prepareGuide(api, available) {
+export async function prepareGuide(api, available, group = 'studio', chapters = CHAPTERS) {
     const loaded = await readGuideRecord(api);
     if (!loaded.ok) return null;
     let record = loaded.record, returning = false;
@@ -72,8 +101,8 @@ export async function prepareGuide(api, available) {
             returning = data.items.length > 0;
         } catch { return null; }
     }
-    const steps = guideSteps({record, available, returning});
-    record = guideRecord(record, returning ? CHAPTERS.filter(c => !c.added && available.includes(c.id)).map(c => c.id) : []);
+    const steps = guideSteps({record, available, returning, group, chapters});
+    record = guideRecord(record, returning ? chaptersFor(group, chapters).filter(c => !c.added && available.includes(c.id)).map(c => c.id) : []);
     if (!steps.length) {
         if (returning) await saveGuideRecord(api, record);
         return null;
@@ -82,8 +111,26 @@ export async function prepareGuide(api, available) {
     return {record, steps};
 }
 
+export async function prepareShowcase(api, version, available, group = 'studio') {
+    const chapter = showcaseChapter(version);
+    if (!chapter) return null;
+    // Preserve the normal migration for a returning user without guide.json:
+    // acknowledge available basic anchors, but leave every added chapter unseen.
+    const inherited = chaptersFor(group).map(c => ({...c, group: 'showcase'}));
+    const prepared = await prepareGuide(api, [chapter.id, ...available], 'showcase', [chapter, ...inherited]);
+    return prepared?.steps.some(c => c.id === chapter.id) ? {...prepared, chapter, steps: [chapter]} : null;
+}
+
 export function showGuide({all = true} = {}) {
+    current = [...document.querySelectorAll('dialog[open]')].map(dialog => guides.get(dialog)).filter(Boolean).at(-1) || current;
     return (all ? current?.replay() : current?.show()) || Promise.resolve(false);
+}
+
+// A how-to is a short list of steps played over the live interface. The same layer, ring and bubble as the guide are used,
+// nothing is recorded, and a step whose control is not on screen shows its picture instead of a ring.
+export function showHowTo(steps) {
+    current = [...document.querySelectorAll('dialog[open]')].map(dialog => guides.get(dialog)).filter(Boolean).at(-1) || current;
+    return current?.tour(steps) || Promise.resolve(false);
 }
 
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
@@ -97,12 +144,52 @@ const visible = e => {
 };
 const clamp = (n, low, high) => Math.max(low, Math.min(high, n));
 
+// The tutorial book's "walk me through it" buttons call this; the how-tos load only when one is asked for.
+if (typeof window !== 'undefined') window.freevideoHowTo = {start: id => import('./howto.js').then(({startHowTo}) => startHowTo(id)),
+    available: id => import('./howto.js').then(({howToAvailable}) => howToAvailable(id))};
+
 export function createGuideReplayEntry({dialog, cn, openWorkspace, replay = showGuide}) {
     const text = key => isRu() ? (REPLAY_TEXT[key][2] || REPLAY_TEXT[key][0]) : (cn ? REPLAY_TEXT[key][1] : REPLAY_TEXT[key][0]);
     const section = el('section', null, 'fv-guide-replay'), row = el('div', null, 'fv-guide-replay-row');
     const button = el('button', text('again')); button.type = 'button';
     const status = el('div', null, 'fv-muted'); status.setAttribute('role', 'status'); status.hidden = true;
-    row.append(el('h3', text('title')), button); section.append(row, status);
+    const actions = el('div', null, 'fv-guide-replay-actions');
+    // "User guide" lists a few how-tos; choosing one plays it over the real interface.
+    const manual = el('button', text('manual')); manual.type = 'button'; manual.setAttribute('aria-haspopup', 'menu'); manual.setAttribute('aria-expanded', 'false');
+    const menu = el('div', null, 'fv-guide-howtos'); menu.setAttribute('role', 'menu'); menu.hidden = true;
+    const closeMenu = () => { menu.hidden = true; manual.setAttribute('aria-expanded', 'false'); };
+    // The last row opens the whole tutorial book; Settings closes first so a how-to started from the book plays over the workspace.
+    const openBook = el('button', cn ? '教程' : 'Tutorial'); openBook.type = 'button'; openBook.setAttribute('role', 'menuitem');
+    openBook.onclick = async () => {
+        closeMenu();
+        try {
+            const {openTutorialBook} = await import('./tutorial_book.js');
+            await new Promise(resolve => { dialog.addEventListener('close', resolve, {once: true}); dialog.close(); });
+            openTutorialBook();
+        } catch { status.textContent = text('unavailable'); status.hidden = false; }
+    };
+    manual.onclick = async () => {
+        if (!menu.hidden) { closeMenu(); return; }
+        try {
+            const {availableHowToList, startHowTo} = await import('./howto.js');
+            menu.replaceChildren(...(await availableHowToList(cn)).map(item => {
+                const choice = el('button', item.title); choice.type = 'button'; choice.setAttribute('role', 'menuitem');
+                choice.onclick = async () => {
+                    closeMenu();
+                    try {
+                        if (!await openWorkspace()) { status.textContent = text('unavailable'); status.hidden = false; return; }
+                        await new Promise(resolve => { dialog.addEventListener('close', resolve, {once: true}); dialog.close(); });
+                        await startHowTo(item.id, {openWorkspace});
+                    } catch { status.textContent = text('unavailable'); status.hidden = false; }
+                };
+                return choice;
+            }), openBook);
+            menu.hidden = false; manual.setAttribute('aria-expanded', 'true');
+        } catch { status.textContent = text('unavailable'); status.hidden = false; }
+    };
+    section.addEventListener('keydown', event => { if (event.key === 'Escape' && !menu.hidden) { event.stopPropagation(); closeMenu(); manual.focus(); } });
+    actions.append(manual, button);
+    row.append(el('h3', text('title')), actions); section.append(row, menu, status);
     button.onclick = async () => {
         button.disabled = true;
         try {
@@ -119,8 +206,23 @@ export function createGuideReplayEntry({dialog, cn, openWorkspace, replay = show
     return section;
 }
 
-export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
-    const automatic = !attempted;
+// Custom targets return viewport rectangles on every layout pass. They never
+// insert hit targets or change the editor's pointer handling.
+export function guideTarget(dialog, chapter, targets = {}) {
+    if (chapter.target) return chapter.target(dialog);
+    if (targets[chapter.id]) return targets[chapter.id]();
+    const nodes = (chapter.anchors || [chapter.anchor]).map(selector => dialog.querySelector(selector));
+    if (nodes.some(node => !visible(node))) return null;
+    const rects = nodes.map(node => node.getBoundingClientRect());
+    const left = Math.min(...rects.map(r => r.left)), top = Math.min(...rects.map(r => r.top));
+    const right = Math.max(...rects.map(r => r.right)), bottom = Math.max(...rects.map(r => r.bottom));
+    return {node: nodes[0], rect: {left, top, right, bottom, width: right - left, height: bottom - top}};
+}
+
+export function createFirstRunGuide({dialog, api, cn, isBusy = () => false, group = 'studio', targets = {}, onShowcaseTry = null}) {
+    const t = (en, zh) => cn ? zh : en;
+    const automatic = !attempted.has(group), editor = group === 'editor';
+    const chapters = chaptersFor(group);
     if (!document.querySelector('link[data-fv-first-run-guide]')) {
         const css = el('link'); css.rel = 'stylesheet'; css.dataset.fvFirstRunGuide = '';
         css.href = new URL('./first_run_guide.css', import.meta.url).href; document.head.append(css);
@@ -128,13 +230,22 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
     let disposed = false, touched = false, stopped = false, layer = null, bubble = null, ring = null, arrow = null;
     let steps = [], index = 0, record = null, manual = false, restoreFocus = null, pollTimer = null, frame = null;
     let serverBlocked = false, checking = false, preparing = false;
-    let waiting = null, replayTimer = null;
+    let waiting = null, replayTimer = null, touring = false;
+    let showcase = null;
     const heldKeys = new Set();
     const target = chapter => dialog.querySelector(chapter.anchor);
-    const available = () => CHAPTERS.filter(c => visible(target(c))).map(c => c.id);
+    const resolved = chapter => {
+        const value = guideTarget(dialog, chapter, targets);
+        return value && visible(value.node) && value.rect.width > 0 && value.rect.height > 0 ? value : null;
+    };
+    const available = () => chapters.filter(c => resolved(c)).map(c => c.id);
+    const shown = step => resolved(step) || (step.image && touring);
     function blocked() {
-        return !dialog.open || serverBlocked || isBusy()
-            || [...document.querySelectorAll('dialog[open]')].some(e => e !== dialog)
+        return !dialog.open || !dialog.isConnected || dialog.inert || serverBlocked || isBusy()
+            // Create stays open underneath Edit. It is an inactive workspace,
+            // while settings, export options and other dialogs still block.
+            || [...document.querySelectorAll('dialog[open]')].some(e => e !== dialog
+                && !(editor && e.matches('dialog.fv-studio:not(.fv-editor)')))
             || [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], .p-dialog-mask, .p-overlay-mask:not(.p-blockui-mask)')]
                 .some(e => e !== dialog && !layer?.contains(e) && visible(e))
             || [...document.querySelectorAll('.fv-failure, .fv-health, .fv-update-notice, .fv-prewarm, [data-fv-guide-blocker]')]
@@ -155,43 +266,67 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
         layer?.remove(); layer = bubble = ring = arrow = null;
         if (restore && focused && restoreFocus?.isConnected) restoreFocus.focus({preventScroll: true});
     }
-    function interrupt() { if (automatic && dialog.open) attempted = true; stopped = true; clearTimeout(pollTimer); hide(); }
+    function interrupt() { if (automatic && dialog.open) attempted.add(group); stopped = true; touring = false; clearTimeout(pollTimer); hide(); }
     function remember() {
         if (manual) return;
-        record = guideRecord(record, steps.filter(c => visible(target(c))).map(c => c.id));
+        // Empty projects acknowledge the optional trim chapter too, so importing
+        // later cannot turn a completed three-step guide into a second prompt.
+        record = guideRecord(record, showcase ? [showcase.id] : editor ? chapters.map(c => c.id) : steps.filter(c => resolved(c)).map(c => c.id));
         // A failed write stays quiet. This page's single attempt is already used.
         saveGuideRecord(api, record).then(ok => { if (!ok && !disposed) interrupt(); });
     }
-    function finish() { remember(); stopped = true; clearTimeout(pollTimer); hide(); }
+    function finish() { remember(); stopped = true; touring = false; clearTimeout(pollTimer); hide(); }
     function position() {
         if (!layer) return;
         if (blocked()) { interrupt(); return; }
-        const node = target(steps[index]);
-        if (!visible(node)) {
+        if (showcase) return; // The entry card is centered with CSS at every size.
+        let value = resolved(steps[index]);
+        if (value?.reveal) { value.reveal(); value = resolved(steps[index]); }
+        if (!value && steps[index].image && touring) {
+            // No control to point at: the picture stands in for it, in the middle of the window.
+            const frame = dialog.getBoundingClientRect(), wide = Math.min(440, frame.width - 48);
+            ring.hidden = arrow.hidden = true; bubble.style.width = `${wide}px`;
+            const box = bubble.getBoundingClientRect();
+            Object.assign(bubble.style, {left: `${clamp(frame.left + (frame.width - box.width) / 2, 12, innerWidth - box.width - 12)}px`,
+                top: `${clamp(frame.top + (frame.height - box.height) / 2, 12, innerHeight - box.height - 12)}px`});
+            bubble.dataset.side = 'center';
+            return;
+        }
+        if (!value) {
             steps.splice(index, 1);
             if (!steps.length) interrupt();
             else { index = Math.min(index, steps.length - 1); draw(); }
             return;
         }
-        const r = node.getBoundingClientRect(), bounds = dialog.getBoundingClientRect();
-        const xmin = Math.max(24, bounds.left + 12), ymin = Math.max(24, bounds.top + 12);
-        const xmax = Math.min(innerWidth - 24, bounds.right - 12), ymax = Math.min(innerHeight - 24, bounds.bottom - 12);
+        const {node, rect: raw} = value, bounds = dialog.getBoundingClientRect();
+        const margin = editor ? 12 : 24;
+        const xmin = Math.max(margin, bounds.left + 12), ymin = Math.max(margin, bounds.top + 12);
+        const xmax = Math.min(innerWidth - margin, bounds.right - 12), ymax = Math.min(innerHeight - margin, bounds.bottom - 12);
+        const r = editor ? {left: Math.max(0, raw.left), top: Math.max(0, raw.top),
+            right: Math.min(innerWidth, raw.right), bottom: Math.min(innerHeight, raw.bottom)} : raw;
+        r.width = r.right - r.left; r.height = r.bottom - r.top;
+        if (r.width <= 0 || r.height <= 0) { interrupt(); return; }
         bubble.style.width = `${Math.min(340, xmax - xmin)}px`;
         const b = bubble.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
         const x = clamp(cx - b.width / 2, xmin, xmax - b.width), y = clamp(cy - b.height / 2, ymin, ymax - b.height);
         const below = {side: 'below', x, y: r.bottom + 24}, above = {side: 'above', x, y: r.top - b.height - 24};
         const narrow = innerWidth <= 680;
-        const candidates = steps[index].id === 'longer'
+        const candidates = editor
+            ? steps[index].id === 'editor-refs' && narrow ? [below, above]  // the description box stays in view
+                : [{...above, x: steps[index].id === 'editor-describe' ? clamp(r.left, xmin, xmax - b.width) : x}]
+            : steps[index].id === 'longer'
             ? [{side: 'below', x: clamp(r.right - b.width, xmin, xmax - b.width), y: r.bottom + 24}, above, below]
             : narrow ? [{side: 'below', x, y: ymax - b.height}, above, below]
                 : [{side: 'right', x: r.right + 24, y}, {side: 'left', x: r.left - b.width - 24, y}, below, above];
         const fits = c => c.x >= xmin && c.y >= ymin && c.x + b.width <= xmax + .5 && c.y + b.height <= ymax + .5
             && !(c.x < r.right + 8 && c.x + b.width > r.left - 8 && c.y < r.bottom + 8 && c.y + b.height > r.top - 8);
-        const place = candidates.find(fits);
+        // A how-to's ring may be a whole section; with no clear spot the bubble sits over its lower part rather than ending the walk-through.
+        const place = candidates.find(fits) || (touring && !editor ? candidates[0] : null);
         if (!place) { interrupt(); return; }
         const style = getComputedStyle(node);
-        Object.assign(ring.style, {left: `${r.left - 4}px`, top: `${r.top - 4}px`, width: `${r.width + 8}px`, height: `${r.height + 8}px`,
-            borderRadius: ['borderTopLeftRadius', 'borderTopRightRadius', 'borderBottomRightRadius', 'borderBottomLeftRadius'].map(n => `${(parseFloat(style[n]) || 0) + 4}px`).join(' ')});
+        const pad = editor ? 0 : 4;
+        Object.assign(ring.style, {left: `${r.left - pad}px`, top: `${r.top - pad}px`, width: `${r.width + 2 * pad}px`, height: `${r.height + 2 * pad}px`,
+            borderRadius: ['borderTopLeftRadius', 'borderTopRightRadius', 'borderBottomRightRadius', 'borderBottomLeftRadius'].map(n => `${(parseFloat(style[n]) || 0) + pad}px`).join(' ')});
         Object.assign(bubble.style, {left: `${place.x}px`, top: `${place.y}px`}); bubble.dataset.side = place.side;
         arrow.style.left = arrow.style.top = '';
         if (['left', 'right'].includes(place.side)) arrow.style.top = `${clamp(cy - place.y - 6, 20, b.height - 32)}px`;
@@ -200,13 +335,32 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
     const follow = () => { if (layer && frame === null) frame = requestAnimationFrame(() => { frame = null; position(); }); };
     function draw() {
         hide(false);
-        while (steps[index] && !visible(target(steps[index]))) steps.splice(index, 1);
+        if (showcase) {
+            layer = el('div', null, 'fv-guide-layer fv-entry-showcase'); layer.dataset.chapter = showcase.id;
+            bubble = el('section', null, 'fv-showcase-card'); bubble.setAttribute('role', 'dialog'); bubble.tabIndex = -1;
+            bubble.setAttribute('aria-modal', 'true'); bubble.setAttribute('aria-labelledby', 'fv-showcase-title');
+            const title = el('h2', t(...SHOWCASE_TEXT.title)); title.id = 'fv-showcase-title';
+            const close = el('button', '×', 'fv-showcase-close'); close.type = 'button';
+            close.setAttribute('aria-label', t(...SHOWCASE_TEXT.close)); close.onclick = finish;
+            const next = el('button', t(...SHOWCASE_TEXT.try), 'fv-guide-next'); next.type = 'button';
+            next.onclick = () => { finish(); onShowcaseTry(t(...SHOWCASE_TEXT.example)); };
+            bubble.append(close, title, showcase.image, next); layer.append(bubble); dialog.append(layer);
+            position();
+            if (layer) { bubble.focus({preventScroll: true}); remember(); }
+            return;
+        }
+        if (touring) try { steps[index]?.prepare?.(dialog); } catch { /* the step then falls back to its picture */ }
+        resolved(steps[index])?.reveal?.();
+        while (steps[index] && !shown(steps[index])) steps.splice(index, 1);
         if (!steps[index]) { interrupt(); return; }
-        const node = target(steps[index]), r = node.getBoundingClientRect(), bounds = dialog.getBoundingClientRect();
-        const clip = node.closest('.fv-controls, .fv-preview-column')?.getBoundingClientRect() || bounds;
-        if (innerWidth <= 680 || r.top < clip.top + 8 || r.bottom > clip.bottom - 8)
-            node.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
-        layer = el('div', null, 'fv-guide-layer'); layer.dataset.chapter = steps[index].id;
+        const found = resolved(steps[index]), bounds = dialog.getBoundingClientRect();
+        if (found) {
+            const {node, rect: r} = found;
+            const clip = node.closest('.fv-controls, .fv-preview-column')?.getBoundingClientRect() || bounds;
+            if (!editor && (innerWidth <= 680 || r.top < clip.top + 8 || r.bottom > clip.bottom - 8))
+                node.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+        }
+        layer = el('div', null, 'fv-guide-layer'); layer.dataset.chapter = steps[index].id; layer.dataset.group = group;
         ring = el('div', null, 'fv-guide-ring'); ring.setAttribute('aria-hidden', 'true');
         bubble = el('div', null, 'fv-guide-bubble'); bubble.setAttribute('role', 'dialog'); bubble.setAttribute('aria-modal', 'false');
         bubble.setAttribute('aria-label', t('Getting started', '使用指引')); bubble.setAttribute('aria-describedby', 'fv-guide-message');
@@ -221,8 +375,12 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
         const next = el('button', index === steps.length - 1 ? t('Got it', '知道了') : t('Next', '下一步'), 'fv-guide-next');
         next.type = 'button'; next.onclick = () => { if (index === steps.length - 1) finish(); else { remember(); index++; draw(); } };
         actions.append(next); footer.append(dots, actions); arrow = el('span', null, 'fv-guide-arrow'); arrow.setAttribute('aria-hidden', 'true');
+        if (!found && steps[index].image) {
+            const picture = el('img', null, 'fv-guide-picture'); picture.alt = ''; picture.src = new URL('./howto/' + steps[index].image + (cn ? '-zh' : '-en') + '.png', import.meta.url).href;
+            picture.onerror = () => { picture.remove(); follow(); }; picture.onload = follow; bubble.prepend(picture);
+        }
         bubble.append(message, footer, arrow); layer.append(ring, bubble); dialog.append(layer);
-        resizeObserver.disconnect(); resizeObserver.observe(node); resizeObserver.observe(dialog);
+        resizeObserver.disconnect(); if (found) resizeObserver.observe(found.node); resizeObserver.observe(dialog);
         position(); if (layer) next.focus({preventScroll: true});
     }
     async function poll() {
@@ -234,17 +392,35 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
     }
     async function show(all = false, request = null) {
         const cancelled = () => request && waiting !== request;
-        if (all) serverBlocked = false;
+        if (all || editor) serverBlocked = false;
         if (disposed || preparing || layer || !dialog.open || blocked() || (!all && (touched || stopped))) return false;
         preparing = true; manual = all;
         await document.fonts.ready;
         if (cancelled() || [...document.querySelectorAll('.p-blockui-mask')].some(visible)) { preparing = false; return false; }
         const ready = await serverState();
+        if (editor) serverBlocked = !ready;
         let prepared = null;
-        if (ready && !disposed && !cancelled() && !blocked() && (all || !touched)) {
-            if (all) prepared = {record, steps: guideSteps({available: available(), all: true})};
-            else prepared = await prepareGuide(api, available());
+        // The showcase is an added chapter, including for returning installations.
+        // Manual settings replay stays the ordinary guide. The shared controller
+        // supplies queue checks, focus isolation, interruption and disposal.
+        if (ready && !all && onShowcaseTry && visible(dialog.querySelector('[data-fv-guide="agent"]')) && !disposed && !blocked() && !touched) {
+            try {
+                const reply = await api.fetchApi('/freevideo/updates?client=1');
+                if (reply.ok) {
+                    const entry = await prepareShowcase(api, (await reply.json()).current_release?.product_version, available(), group);
+                    if (entry) {
+                        const image = await loadShowcaseImage();
+                        if (image) { showcase = {...entry.chapter, image}; prepared = entry; }
+                    }
+                }
+            } catch { /* Optional entry presentation never blocks the workspace. */ }
         }
+        if (ready && !disposed && !cancelled() && !blocked() && (all || !touched)) {
+            if (all) { showcase = null; prepared = {record, steps: guideSteps({available: available(), all: true, group})}; }
+            else prepared ||= await prepareGuide(api, available(), group);
+        }
+        // Media/storage reads can overlap a generation submitted from another tab.
+        if (showcase && !all && !await serverState()) { preparing = false; return false; }
         preparing = false;
         if (!prepared?.steps.length || disposed || cancelled() || blocked() || (!all && (touched || stopped))) return false;
         stopped = false; serverBlocked = false; record = prepared.record; steps = prepared.steps; index = 0;
@@ -263,7 +439,7 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
     }
     async function replay() {
         if (disposed || !dialog.open) return false;
-        attempted = true; manual = true; clearTimeout(startTimer); interrupt(); cancelReplay();
+        attempted.add(group); manual = true; clearTimeout(startTimer); interrupt(); cancelReplay();
         waiting = el('div', null, 'fv-guide-wait');
         const message = el('p', t(...REPLAY_TEXT.waiting)); message.setAttribute('role', 'status');
         const cancel = el('button', t(...REPLAY_TEXT.cancel)); cancel.type = 'button'; cancel.onclick = cancelReplay;
@@ -271,18 +447,30 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
         await retryReplay();
         return true;
     }
+    async function tour(list) {
+        if (disposed || !dialog.open) return false;
+        attempted.add(group); clearTimeout(startTimer); interrupt(); cancelReplay();
+        stopped = false; serverBlocked = false; manual = true; touring = true; record = null;
+        steps = list.map(step => ({...step})); index = 0; restoreFocus = document.activeElement;
+        draw();
+        return Boolean(layer);
+    }
     const touch = event => {
-        if (!dialog.contains(event.target) || layer?.contains(event.target)) return;
-        if (automatic) attempted = true;
+        if (touring || !dialog.contains(event.target) || layer?.contains(event.target)) return;
+        if (automatic) attempted.add(group);
         touched = true;
         if (layer) finish(); else stopped = true;
     };
     const key = event => {
+        // While a how-to plays the person types and clicks as asked; only Escape belongs to the bubble.
+        if (layer && touring && event.key !== 'Escape' && !bubble.contains(event.target)) return;
         if (layer) {
             heldKeys.add(event.key); event.stopImmediatePropagation();
             if (event.key === 'Escape' || event.key === 'Enter') {
                 event.preventDefault();
-                if (event.key === 'Escape') finish(); else bubble.querySelector('.fv-guide-next').click();
+                if (event.key === 'Escape') finish();
+                else (showcase && document.activeElement === bubble.querySelector('.fv-showcase-close')
+                    ? document.activeElement : bubble.querySelector('.fv-guide-next')).click();
             } else if (event.key === 'Tab') {
                 event.preventDefault();
                 const buttons = [...bubble.querySelectorAll('button')], at = buttons.indexOf(document.activeElement);
@@ -298,38 +486,70 @@ export function createFirstRunGuide({dialog, api, cn, isBusy = () => false}) {
         if (event.type === 'keyup') heldKeys.delete(event.key);
     };
     const status = event => {
-        if (event.detail?.exec_info?.queue_remaining > 0) { serverBlocked = true; interrupt(); }
+        if (event.detail?.exec_info?.queue_remaining > 0) { serverBlocked = true; if (!editor || layer) interrupt(); }
         else if (layer) poll();
     };
-    const execution = () => { serverBlocked = true; interrupt(); };
+    const execution = () => { serverBlocked = true; if (!editor || layer) interrupt(); };
     const observer = new MutationObserver(rows => {
         if (disposed || stopped) return;
         if (rows.every(row => layer?.contains(row.target))) return;
-        if (blocked() || layer && [...document.querySelectorAll('.p-blockui-mask')].some(visible)) interrupt(); else follow();
+        if ((!editor || layer) && (blocked() || layer && [...document.querySelectorAll('.p-blockui-mask')].some(visible))) interrupt(); else follow();
     });
     observer.observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ['hidden', 'open', 'class', 'style', 'inert', 'role', 'aria-modal']});
     const resizeObserver = new ResizeObserver(follow);
     document.addEventListener('pointerdown', touch, true); document.addEventListener('click', touch, true);
+    document.addEventListener('dragstart', touch, true); document.addEventListener('dragenter', touch, true);
     document.addEventListener('input', touch, true); document.addEventListener('keydown', key, true);
     document.addEventListener('keypress', keyEnd, true); document.addEventListener('keyup', keyEnd, true);
     window.addEventListener('resize', follow); document.addEventListener('scroll', follow, true);
-    api.addEventListener('status', status); api.addEventListener('execution_start', execution);
-    const handle = {show, replay, dispose() {
+    // The editor can be opened with a bare request helper that has no events.
+    const events = api?.addEventListener && api.removeEventListener;
+    if (events) { api.addEventListener('status', status); api.addEventListener('execution_start', execution); }
+    const handle = {show, replay, tour, suspend() { cancelReplay(); interrupt(); },
+        handleKey(event) {
+            if (!['keydown', 'keypress', 'keyup'].includes(event.type)) return false;
+            const handled = !!layer || heldKeys.has(event.key);
+            if (event.type === 'keydown') key(event); else keyEnd(event);
+            return handled;
+        }, dispose() {
         disposed = true; clearTimeout(startTimer); clearTimeout(pollTimer); cancelAnimationFrame(frame);
         cancelReplay();
         hide(); observer.disconnect(); resizeObserver.disconnect();
         document.removeEventListener('pointerdown', touch, true); document.removeEventListener('click', touch, true);
+        document.removeEventListener('dragstart', touch, true); document.removeEventListener('dragenter', touch, true);
         document.removeEventListener('input', touch, true); document.removeEventListener('keydown', key, true);
         document.removeEventListener('keypress', keyEnd, true); document.removeEventListener('keyup', keyEnd, true);
         window.removeEventListener('resize', follow); document.removeEventListener('scroll', follow, true);
-        api.removeEventListener('status', status); api.removeEventListener('execution_start', execution);
-        if (current === handle) current = null;
+        if (events) { api.removeEventListener('status', status); api.removeEventListener('execution_start', execution); }
+        guides.delete(dialog);
+        if (current === handle) current = [...guides.values()].at(-1) || null;
     }};
-    current = handle;
-    const startTimer = setTimeout(() => {
-        if (!automatic || attempted || manual || layer) return;
-        attempted = true;
-        show().then(shown => { if (!shown) stopped = true; });
-    }, 1000);
+    guides.set(dialog, handle);
+    const foreground = [...document.querySelectorAll('dialog[open]')].at(-1);
+    if (!foreground || foreground === dialog) { current?.suspend(); current = handle; }
+    // Steps are fixed when the guide starts, so give an anchor that is still waiting for its data up to 5 s.
+    // The Agent tab is not waited for: its discovery has already finished when the guide is created.
+    const pending = () => chapters.some(c => c.id !== 'agent' && target(c) && !visible(target(c)));
+    function begin(waited = 0) {
+        startTimer = setTimeout(() => {
+            if (!automatic || attempted.has(group) || manual || layer || disposed || touched) return;
+            if (editor) {
+                if (!dialog.open || !dialog.isConnected) return;
+                serverBlocked = false;
+                if (blocked() || pending()) { begin(250); return; }
+                show().then(shown => {
+                    if (disposed || touched) return;
+                    if (!shown && (serverBlocked || blocked())) begin(250);
+                    else { attempted.add(group); if (!shown) stopped = true; }
+                });
+                return;
+            }
+            if (pending() && waited < 5000) { begin(waited + 250); return; }
+            attempted.add(group);
+            show().then(shown => { if (!shown) stopped = true; });
+        }, waited ? 250 : 1000);
+    }
+    let startTimer = null;
+    begin();
     return handle;
 }

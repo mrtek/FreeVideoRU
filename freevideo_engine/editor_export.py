@@ -44,7 +44,7 @@ _RECORD_BYTES = 8 * 1024 * 1024
 class ExportError(Exception):
     """A public reason code; never retain a decoder's path-bearing message."""
     def __init__(self, reason='failed'):
-        self.reason = reason if reason in ('source_missing', 'unreadable', 'disk_full', 'failed') else 'failed'
+        self.reason = reason if reason in ('source_missing', 'unreadable', 'disk_full', 'not_writable', 'failed') else 'failed'
         super().__init__(self.reason)
 
 
@@ -77,6 +77,8 @@ def _reason(error):
         return error.reason
     if isinstance(error, OSError) and error.errno == errno.ENOSPC:
         return 'disk_full'
+    if isinstance(error, PermissionError) or isinstance(error, OSError) and error.errno in (errno.EACCES, errno.EROFS):
+        return 'not_writable'
     return 'failed'
 
 

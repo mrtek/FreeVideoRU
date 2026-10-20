@@ -19,7 +19,7 @@ export function createAdjustPicture({state, sources, t, player, notes = null}) {
         const submit = event => {
             if (control.input.dataset.editClip === clip?.id && (control.input.value === '' || !Number.isFinite(Number(control.input.value))
                 || Number(control.input.value) < min || Number(control.input.value) > max)) {
-                inputError.textContent = t(`${label}: enter a number from ${min} to ${max}${suffix}.`, `${label}：请输入 ${min} 到 ${max}${suffix} 之间的数值。`);
+                inputError.textContent = t(`${label}: enter a number from ${min} to ${max}${suffix}.`, `${label}：请输入 ${min} 至 ${max}${suffix}。`);
                 inputError.hidden = false; invalidClip = clip?.id; control.input.setAttribute('aria-invalid', 'true'); return;
             }
             clearError();

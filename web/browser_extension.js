@@ -47,6 +47,9 @@ export function isNetworkTypeError(error) {
     return (type === 'TypeError' || /^TypeError:\s*/i.test(text))
         && /Failed to fetch|fetch failed|NetworkError(?: when attempting to fetch resource)?|network request failed|Load failed/i.test(text);
 }
+// One sentence for a dropped connection (engine closed, network lost); the raw
+// browser wording stays in the technical details.
+export function connectionLostText(t) { return t('Lost the connection to FreeVideo. Try again once it is back.', '与 FreeVideo 的连接已断开，恢复后请重试。'); }
 export function nativeFetch(fetchFunction = globalThis.fetch) {
     try { return typeof fetchFunction === 'function' && /\[native code\]/.test(Function.prototype.toString.call(fetchFunction)); }
     catch { return false; }
@@ -121,12 +124,12 @@ export function detectBrowserExtension(error, {kind = 'unknown', known = null, b
 export const EXTENSION_COPY = Object.freeze({
     title: ['A browser extension is interfering with FreeVideo', '浏览器扩展干扰了 FreeVideo'],
     // English uses straight quotes: curly ones widen in the CJK font stack.
-    both: ['The user script "{script}" in the browser extension "{extension}" interfered with this page, so FreeVideo could not complete this action.',
-        '浏览器扩展“{extension}”中的用户脚本“{script}”干扰了这个页面，FreeVideo 未能完成这次操作。'],
-    extension: ['The browser extension "{extension}" interfered with this page, so FreeVideo could not complete this action.',
-        '浏览器扩展“{extension}”干扰了这个页面，FreeVideo 未能完成这次操作。'],
-    unknown: ['An extension in this browser interfered with this page, so FreeVideo could not complete this action.',
-        '浏览器里的某个扩展干扰了这个页面，FreeVideo 未能完成这次操作。'],
+    both: ['The script "{script}" in the browser extension "{extension}" interfered with this page, so this action did not finish.',
+        '浏览器扩展“{extension}”里的脚本“{script}”干扰了页面，这次操作没有完成。'],
+    extension: ['The browser extension "{extension}" interfered with this page, so this action did not finish.',
+        '浏览器扩展“{extension}”干扰了页面，这次操作没有完成。'],
+    unknown: ['A browser extension interfered with this page, so this action did not finish.',
+        '浏览器里的某个扩展干扰了页面，这次操作没有完成。'],
     // The browser says a client blocked the file: an ad-blocking extension, though not which one.
     blocked: ['An ad-blocking extension in this browser, such as uBlock Origin, AdGuard or Adblock Plus, blocked one of FreeVideo\'s page files, so the page cannot work properly.',
         '浏览器里的广告拦截类扩展（例如 uBlock Origin、AdGuard、Adblock Plus）拦下了 FreeVideo 的页面文件，页面无法正常运行。'],

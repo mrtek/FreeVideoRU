@@ -13,6 +13,7 @@ from inspect import isawaitable
 import logging
 import math
 import os
+import re
 from pathlib import Path
 import secrets
 import stat
@@ -24,11 +25,35 @@ from . import API_VERSION, enabled
 from . import assets
 from . import private_file
 from . import spec as specs
+from .. import tiers as quality_tiers
 from . import schema as contract, errors, access
 from .jobs import ACTIVE, DONE, JobError, Jobs, chain_error, library_view
 
 PREFIX = '/freevideo/agent/v1'
+from .whitebox import MAX_VIDEO_BYTES as MAX_WHITEBOX_VIDEO
+from .whitebox_presets import PRESETS, preset as whitebox_preset
+# What an empty wait tells the agent: the conversation is open for as long as the user keeps the page.
+KEEP_WAITING = ('Nothing new yet. The user is still in FreeVideo and may speak at any moment: call this wait '
+                'again now. An empty wait never ends the conversation; do not end your turn or write a summary.')
+# The user may open another conversation while the agent waits; its words go where the user now is.
+MOVED = ('The user is now in another conversation, session %s. Post your words to that session from now on; '
+         'the user no longer sees the earlier one.')
+MOVED_NEW = ' It starts afresh: do not carry requests over from the earlier conversation unless the user refers to them.'
+MOVED_BACK = (' It is one the user was in before, and the user means what was said there, not the conversation you just '
+              'left. Its last lines are in "before"; all of it: GET /sessions/%s/events.')
+# An agent that connects again finds the conversation where the user left it, and has greeted there once already.
+RESUMED = ('This conversation is already under way; its last lines are in "before". Do not introduce yourself again: '
+           'say nothing until the user speaks, then carry on from there.')
+BEFORE_LINES, BEFORE_TEXT = 8, 600
+# The user started a white-model scene and then spoke: the words may be about it, not a new request.
+WHITEBOX_PENDING = ('The user started a white-model scene in this conversation ("whitebox" lists it). If the words ask about '
+                    'it or about progress, answer from its status in one sentence (waiting or rendering: still being made; '
+                    'failed: say it was not made, and why) and start nothing. A question is never a prompt.')
 
+
+
+def _activity_cursor(row):
+    return '%r:%s' % (row['created_at'], row['id'])
 
 def local_address(request):
     """The backend's bound port, independent of page origins and forwarding headers."""
@@ -148,15 +173,24 @@ def features(continuation, vlm):
     from .editor_runtime import available
     rules = available()
     return {'capabilities': True, 'plan': True, 'jobs.cancel': True, 'jobs.resume': True, 'takes': True,
-            'library.read': True, 'library.download': True, 'errors.validation': True, 'errors.missing_media': True,
+            'library.read': True, 'library.download': True, 'imports.create': True, 'imports.read': True,
+            'errors.validation': True, 'errors.missing_media': True,
             'generate.text': True, 'generate.size': True, 'generate.first_frame': True, 'generate.seed': True,
             'queue.shared': True, 'queue.busy': True, 'chain.auto': bool(continuation),
             'enhance': bool(vlm.get('ready')), 'drama.film': True, 'images.edit': rules,
             'images.layers': rules, 'images.heal': rules, 'images.render': rules, 'projects.read': True,
-            **{'projects.' + name: rules for name in ('insert', 'split', 'move', 'trim', 'remove', 'export', 'generate')}}
+            **{'projects.' + name: rules for name in ('insert', 'split', 'move', 'trim', 'remove', 'export', 'generate', 'listen')}}
+
+
+def whitebox_support(jobs):
+    """White-model guidance needs the user's open page to render, and the Mac engine cannot use it yet."""
+    if quality_tiers.on_mac():
+        return dict(available=False, needs_page=True, note='Mac 暂不支持白模。')
+    return dict(available=True, needs_page=True, page_open=jobs.whitebox.page_open(), note='白模预览在 FreeVideo 页面中显示，需保持页面打开。')
 
 
 def capabilities(port, jobs):
+    from ..lora_triggers import list_triggers
     from .. import __version__
     from ..desktop_runtime import source_release
     from ..comfy_assets import EXTENSIONS
@@ -171,7 +205,7 @@ def capabilities(port, jobs):
     service = getattr(port.server, '_freevideo_prompt_vlm', None)
     if service is not None:
         try:
-            vlm = {k: v for k, v in service.info().items() if k in ('ready', 'model', 'license', 'bytes', 'busy')}
+            vlm = {k: v for k, v in service.info(wait=False).items() if k in ('ready', 'model', 'license', 'bytes', 'busy')}
         except (OSError, ValueError):
             vlm = dict(ready=False)
     running, pending = port.snapshot()
@@ -184,23 +218,29 @@ def capabilities(port, jobs):
         api_version=API_VERSION, freevideo_version=release or __version__, build=__version__, ready=ready, problem=problem,
         continuation=continuation,
         features=features(continuation, vlm),
+        whitebox=whitebox_support(jobs),
         device=dict(backend=machine.get('device_backend', 'cuda') if machine else None,
                     vram_limit_gib=machine.get('vram_gib'), ram_limit_gib=machine.get('ram_gib')),
         kinds={'generate': 'Video from a prompt and optional keyframes or references',
                'assemble': 'Join finished clips into one video (cut or crossfade)',
                'vlm': 'Ask the local vision-language model about images or sampled video frames',
+               'image': 'Generate a picture from text or change input pictures with the local image model',
                'enhance': 'Rewrite a rough idea into a full H3 prompt with the local VLM',
                'export': 'Render a saved revision of an editing project to a video',
+               'listen': 'Listen to the sound of an editing project for subtitle lines and times',
                'image_edit': 'Render a saved revision of an image session to a picture'},
         limits=dict(width=[256, 4096, 32], height=[256, 4096, 32], seconds=[1.625, 60 if continuation else BLOCK_SECONDS],
                     seconds_tested=[4, 15],
                     fps=24, base_steps=[1, 32], refine_steps=[1, 31], references=32, loras=32, lora_strength=[-4, 4],
                     upload_bytes=2 * 1024 ** 3, vlm_images=24, takes=8, batch_jobs=64),
-        quality={name: dict(two_pass=plan[0], base_steps=plan[1], refine_steps=plan[2])
+        quality={name: dict(two_pass=plan[0], base_steps=plan[1], refine_steps=plan[2],
+                            step_cache=quality_tiers.step_cache(name, quality_tiers.on_mac()),
+                            upscale_factor=quality_tiers.upscale_factor(name, quality_tiers.on_mac()))
                  for name, plan in specs.QUALITY.items()},
         aspects=sorted(specs.ASPECTS), native_megapixels=.98,
         tasks=GUIDE['tasks'], media_extensions={k: sorted(v) for k, v in EXTENSIONS.items()},
         loras=sorted(n for n in port.folders.get_filename_list('loras') if n.lower().endswith('.safetensors')),
+        lora_trigger_words=list_triggers(port.folders),
         vlm=vlm, queue=dict(running=len(running), pending=len(pending),
                             agent_active=len(jobs.active())),
         docs=dict(guide=PREFIX + '/guide', schema=PREFIX + '/schema', openapi=PREFIX + '/openapi.json'))
@@ -209,19 +249,21 @@ def capabilities(port, jobs):
 def plan(port, value, jobs=None):
     from ..two_pass import plan as sampling_plan
     from ..geometry import geometry
-    spec = specs.normalize(value)
+    spec = specs.normalize(value, port=port)
     result = dict(spec={k: v for k, v in spec.items() if k != 'depends_on'}, warnings=[])
     if spec['kind'] != 'generate' or spec.get('refine_from'):
         return result
-    from .jobs import continuation_problems, cut_problems, parts_problems
-    problems = continuation_problems(spec) + cut_problems(spec, spec['seconds'])
+    from .jobs import continuation_problems, cut_problems, part_prompt_problems, parts_problems
+    problems = continuation_problems(spec) + cut_problems(spec, spec['seconds']) + part_prompt_problems(spec)
     if jobs is not None:
         problems += parts_problems(spec, jobs.port.chain_runner(), work=jobs.continued_work(spec),
                                    planned=jobs.planned_parts(spec))
+    else:
+        problems += parts_problems(spec, None)
     if problems:
         raise specs.SpecError(problems)
     if jobs is not None:
-        jobs.require_continuation(spec['seconds'])
+        jobs.require_continuation(spec)
         if spec.get('continue_from') and not jobs.continuation_ready():
             from .jobs import continuation_unavailable
             raise continuation_unavailable()
@@ -231,6 +273,8 @@ def plan(port, value, jobs=None):
     result['geometry'] = {k: canvas[k] for k in ('width', 'height', 'frames', 'seconds', 'fps', 'latent_frames')}
     result['sampling'] = dict(two_pass=passes['enabled'], total_steps=passes['total_steps'],
                               first_pass=passes.get('first'), second_pass=passes.get('second') if passes['enabled'] else None)
+    if spec.get('sampling_note'):
+        result['warnings'].append(spec['sampling_note'])
     if spec['seconds'] > 15:
         result['warnings'].append('Longer than 15 s is experimental')
     if spec['task'] == 'ref2va':
@@ -238,10 +282,17 @@ def plan(port, value, jobs=None):
     if spec['width'] * spec['height'] > 2 * 1024 ** 2:
         result['warnings'].append('Above 2 MP takes much longer and needs more memory')
     from ..chain_plan import plan as chain_plan
-    result['chain_plan'] = chain_plan(spec['seconds'], continued=bool(spec.get('continue_from')))
+    from .length import single_frame_limit
+    result['chain_plan'] = chain_plan(spec['seconds'], max_frames=single_frame_limit(spec),
+                                     continued=bool(spec.get('continue_from')))
     from .forecast import generation_estimate
     result['estimate'], result['capabilities_revision'] = generation_estimate(port, spec, result['chain_plan'])
     return result
+
+
+def job_answer(view):
+    """One job answers the way a submission does: the job is also under 'job'."""
+    return dict(view, job=view)
 
 
 async def wait_for_job(jobs, row, seconds, *, clock=time.monotonic, sleep=asyncio.sleep):
@@ -333,6 +384,7 @@ def register():
         # Operations an agent runs only after the user approves them; the page changes the policy.
         confirmations = Confirmations(port.output_root / 'FreeVideo' / '.agent' / 'confirm.json', sessions)
         jobs.productions.gate = confirmations.gate
+        jobs.session_open = sessions.require_open
     except Exception as error:
         # Optional agent state must never prevent the studio or other routes from loading.
         logging.getLogger(__name__).warning('[FreeVideo] Agent startup unavailable: %s', error)
@@ -344,6 +396,7 @@ def register():
     token_failures = set()
     thumbnails = asyncio.Semaphore(1)
     upload_decoders = asyncio.Semaphore(1)
+    import_lock = asyncio.Lock()
 
     def expected(root=None):
         from ..comfy_bridge import installation_root
@@ -378,6 +431,8 @@ def register():
     contracts = contract.contracts()
     page_sessions = {}
     connection = dict(connected=False, client=None, via=None, last_seen_at=None)
+    # The conversation in the Autopilot view: the page and the connected agent talk in the agent's latest session.
+    chat = dict(client=None, waiting=0, folds={}, told={})
     server._freevideo_agent_connection = connection
 
     def problem(code, message=None, status=None, **details):
@@ -412,12 +467,13 @@ def register():
                 definition = contracts.get((method, suffix))
                 if definition is None:
                     raise JobError('method_not_allowed' if any(p == suffix for _, p in contracts) else 'not_found', 'No contract')
-                access.check(request, local=definition.get('local', False))
+                access.check(request, local=definition.get('local', False), lan=definition.get('lan', False))
                 if definition.get('auth') is False and definition.get('local') and method not in ('GET', 'HEAD'):
-                    session = page_sessions.get(request.cookies.get('freevideo_agent_page', ''))
-                    csrf = request.headers.get('X-FreeVideo-CSRF', '')
-                    if (session is None or session[1] < time.monotonic() or not csrf
-                            or not secrets.compare_digest(csrf.encode(), session[0].encode())):
+                    if proxy_identity.HEADER in request.headers:
+                        valid = definition.get('lan') and proxy_identity.check_csrf(request)
+                    else:
+                        valid = valid_page_session(request)
+                    if not valid:
                         raise JobError('page_session_required', 'Page session required')
                 header = request.headers.get('Authorization', '')
                 given = header[7:].strip() if header[:7].lower() == 'bearer ' else request.headers.get('X-FreeVideo-Agent', '')
@@ -432,6 +488,7 @@ def register():
                     connection['client'] = connection['client'] or request.headers.get('X-FreeVideo-Client', 'HTTP client')[:80]
                     connection['via'] = connection['via'] or 'http'
                     request['agent_client'] = request.headers.get('X-FreeVideo-Client', '')[:80] or 'HTTP client'
+                    chat['client'] = request['agent_client']
                 if definition.get('path'):
                     contract.validate(definition['path'], dict(request.match_info))
                 for key in request.query:
@@ -446,7 +503,7 @@ def register():
                     if definition.get('multipart') and request.content_type == 'multipart/form-data':
                         pass
                     else:
-                        limit = contract.MAX_JSON_UPLOAD_BYTES if suffix == '/media' else contract.MAX_BODY_BYTES
+                        limit = contract.MAX_JSON_UPLOAD_BYTES if suffix in ('/media', '/imports') else contract.MAX_BODY_BYTES
                         value = await read_body(request, limit, definition.get('optional_body', False))
                         try:
                             contract.validate(definition['body'], value)
@@ -472,8 +529,10 @@ def register():
                     value['next'] = value['next'].replace('{id}', request.match_info['id'])
                 if error.code == 'too_large':
                     limit = error.details.get('limit_bytes', contract.MAX_UPLOAD_BYTES)
+                    location = ({'path': '/file' if request.content_type == 'multipart/form-data' else '/data_base64'}
+                                if suffix == '/imports' else {})
                     value.update(message='The upload must be at most %d bytes; a larger payload was received.' % limit,
-                                 details=[dict(limit_bytes=limit)], next='Reduce the payload to at most %d bytes and retry.' % limit)
+                                 details=[dict(limit_bytes=limit, **location)], next='Reduce the payload to at most %d bytes and retry.' % limit)
                 if error.code == 'busy':
                     entries = (await asyncio.to_thread(jobs.queue_view))['entries']
                     value = errors.build('busy', owner=entries[0]['owner'] if entries else 'ui')
@@ -514,7 +573,11 @@ def register():
             if sid:
                 store.get(sid)  # not_found for an unknown session
             else:
-                sid = store.latest_for(client) or (store.create(client=client)['id'] if write else None)
+                # Work belongs to the conversation the agent last heard from; until its next wait it has
+                # not learned that the user opened another one.
+                told = chat['told'].get(client)
+                sid = told if told is not None and store.has(client, told) else (
+                    store.current_for(client) or (store.create(client=client)['id'] if write else None))
             if sid is None:
                 return None
             request['agent_session'] = sid
@@ -551,6 +614,12 @@ def register():
         for key in ('drama', 'project', 'image'):
             if isinstance(value.get(key), str):
                 refs[key] = value[key]
+        identity = value.get('id')
+        if isinstance(identity, str):
+            if identity.startswith('d') and 'shots' in value:
+                refs['drama'] = identity
+            elif identity.startswith('c') and value.get('kind') in ('character', 'setting'):
+                refs['cast'] = identity
         return refs
 
     async def session_after(request, response):
@@ -591,10 +660,29 @@ def register():
             data.extend(chunk)
             if len(data) > limit:
                 raise JobError('too_large', 'Body exceeds limit', limit_bytes=limit)
-        return json.loads(data.decode('utf-8'), parse_constant=lambda _: (_ for _ in ()).throw(json.JSONDecodeError('Nonfinite JSON', '', 0)))
+        text = data.decode('utf-8')
+        value = json.loads(text, parse_constant=lambda _: (_ for _ in ()).throw(json.JSONDecodeError('Nonfinite JSON', '', 0)))
+        if '\\u' in text:
+            # An escape may spell half of a character pair. No file or page can hold that text, and the
+            # script runtime behind the editing rules ends the whole program on it.
+            try:
+                json.dumps(value, ensure_ascii=False).encode('utf-8')
+            except UnicodeEncodeError:
+                row = contract.diagnostic('/', 'text made of whole characters', None)
+                row.update(got='half of a character pair', next='Send whole characters and retry.',
+                           message='The body holds half of a character pair (a lone \\ud800 to \\udfff escape); '
+                                   'no text can be stored that way.')
+                raise specs.SpecError(row) from None
+        return value
 
     async def body(request, **ignored):
         return request[body_key]
+
+    def valid_page_session(request):
+        page = page_sessions.get(request.cookies.get('freevideo_agent_page', ''))
+        csrf = request.headers.get('X-FreeVideo-CSRF', '')
+        return (page is not None and page[1] >= time.monotonic() and bool(csrf)
+                and secrets.compare_digest(csrf.encode(), page[0].encode()))
 
     def session_caller(request):
         """guarded verifies supplied tokens; otherwise require a local page and CSRF."""
@@ -602,10 +690,7 @@ def register():
         given = header[7:].strip() if header[:7].lower() == 'bearer ' else request.headers.get('X-FreeVideo-Agent', '')
         if given:
             return 'agent'
-        page = page_sessions.get(request.cookies.get('freevideo_agent_page', ''))
-        csrf = request.headers.get('X-FreeVideo-CSRF', '')
-        if (page is not None and page[1] >= time.monotonic() and csrf
-                and secrets.compare_digest(csrf.encode(), page[0].encode())):
+        if valid_page_session(request):
             access.check(request, local=True)
             return 'user'
         raise JobError('unauthorized', 'Token or valid page session required')
@@ -618,7 +703,7 @@ def register():
         return path == '/freevideo/agent' or path.startswith('/freevideo/agent/')
 
     async def no_cross_site_headers(request, response):
-        if agent_path(request.path):
+        if agent_path(request.path) or request.path in ('/freevideo/lan', '/api/freevideo/lan'):
             for key in list(response.headers):
                 if key.lower().startswith('access-control-'):
                     del response.headers[key]
@@ -664,8 +749,423 @@ def register():
         response = reply(dict(csrf=page_sessions[current][0]))
         # The cookie follows the copy the page asked: its later calls go to the same one.
         response.set_cookie('freevideo_agent_page', current, httponly=True, samesite='Strict', secure=request.secure,
-                            path=('/api' if request.path.startswith('/api/') else '') + '/freevideo/agent', max_age=12 * 3600)
+                            path=('/api' if request.path.startswith('/api/') else '') + '/freevideo', max_age=12 * 3600)
         return response
+
+    # Page controls stay outside the Agent contract and never use its bearer token.
+    # ComfyUI mirrors these routes under /api along with the other page routes.
+    @routes.get('/freevideo/lan')
+    @routes.post('/freevideo/lan')
+    async def lan_settings(request):
+        from .. import lan_page
+        from ..comfy_bridge import installation_root
+        identity = errors.REQUEST_ID.set('r-' + uuid.uuid4().hex)
+        try:
+            access.check(request, local=True)
+            root = installation_root()
+            if request.method == 'POST':
+                if not valid_page_session(request):
+                    raise JobError('page_session_required', 'Page session required')
+                value = await read_body(request, contract.MAX_BODY_BYTES)
+                return reply(await asyncio.to_thread(lan_page.apply, root, value))
+            return reply(await asyncio.to_thread(lan_page.read, root))
+        except lan_page.InvalidRequest as error:
+            field = error.field if error.field in ('enabled', 'password', '') else '<unknown>'
+            row = contract.diagnostic('/' + field, error.allowed, error.got)
+            if field == 'password' and not isinstance(error.got, str):
+                row = contract.diagnostic('/password', error.allowed, None)
+                row.update(got='<redacted>', message='/password must be %s.' % error.allowed)
+            value = errors.validation([row])
+            return reply({'error': value}, 422)
+        except lan_page.LanUnavailable:
+            return problem('lan_unavailable')
+        except JobError as error:
+            return reply({'error': error.view()}, errors.ERRORS[error.code][0])
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            return problem('invalid_json')
+        except specs.SpecError as error:
+            return reply({'error': errors.validation(error.errors)}, 422)
+        except web.HTTPException as error:
+            return problem('too_large' if error.status == 413 else 'invalid_request')
+        except OSError:
+            return problem('storage_unavailable')
+        except Exception:
+            # Do not log exception text or request bodies from password controls.
+            return problem('internal_error')
+        finally:
+            errors.REQUEST_ID.reset(identity)
+
+    def activity_item(row, *, card=False):
+        view = jobs.view(row, detail=False)
+        value = {k: view.get(k) for k in ('id', 'kind', 'status', 'label', 'project', 'client', 'take',
+                                          'created_at', 'finished_at')}
+        progress = view.get('progress') or {}
+        value['progress'] = {k: progress[k] for k in ('phase', 'step', 'fraction', 'remaining_seconds',
+                             'queue_position') + (('block',) if card else ()) if progress.get(k) is not None}
+        if view.get('waiting_for'):
+            value['waiting_for'] = len(view['waiting_for'])
+        if view.get('error'):
+            value['error'] = view['error']
+        report_id = (view.get('error') or {}).get('report_id') or (view.get('result') or {}).get('report_id')
+        if isinstance(report_id, str) and re.fullmatch(r'[a-f0-9]{32}', report_id):
+            value['report_id'] = report_id
+        video = (view.get('result') or {}).get('video') or {}
+        if video.get('url'):
+            value['video'] = video['url']
+        if (view.get('result') or {}).get('library_id'):
+            # The work this video became, for the page to show it in My works.
+            value['work'] = view['result']['library_id']
+        from urllib.parse import quote
+        work = value.get('work')
+        # The saved work the page can play and picture without the agent's token.
+        value['play'] = '/freevideo/agent/chat/video?id=' + quote(work, safe='') if work else None
+        value['thumbnail'] = '/freevideo/library/thumbnail?id=' + quote(work, safe='') if work else None
+        picture = view.get('result') or {}
+        if row['kind'] == 'image' and picture.get('file'):
+            # ComfyUI's own view of the input file, which the page can show without the agent's token.
+            folder, _, leaf = picture['file'].rpartition('/')
+            value['thumbnail'] = '/view?filename=%s&subfolder=%s&type=input' % (quote(leaf, safe=''), quote(folder, safe=''))
+        if card:
+            # A conversation card: the page plays and pictures the saved work itself.
+            value.pop('client')
+            value.setdefault('work', None)
+            seconds = row['spec'].get('seconds')
+            size = [row['spec'].get(k) if type(row['spec'].get(k)) is int else None for k in ('width', 'height')]
+            value.update(seconds=seconds if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else None,
+                         width=size[0], height=size[1])
+            if row['kind'] == 'image' and picture.get('file'):
+                value.update(width=picture.get('width'), height=picture.get('height'))
+        return value
+
+    def agent_state():
+        seen, now = connection['last_seen_at'], time.time()
+        connected = seen is not None and 0 <= now - seen < 600
+        name = (connection['client'] or '').strip()
+        # Programs report their own identifiers; the page shows the name a person knows.
+        shown = ('Claude Code' if name.lower() in ('claude-code', 'claude code', 'claude') else
+                 'Codex' if name.lower().startswith('codex') else name or None)
+        # Every answer to the agent carries the user's unread words, so a recent call will hear them too.
+        return dict(connected=connected, name=shown, listening=connected and (chat['waiting'] > 0 or now - seen < 90))
+
+    def chat_name(said):
+        """A job the agent left unnamed is called by what the user asked for: the first words after a colon."""
+        text = re.split(r'[:：]', said or '', maxsplit=1)[-1].strip()
+        text = re.split(r'[，。！？；、,.!?;\n]', text, maxsplit=1)[0].strip() or text
+        if not text:
+            return None
+        if text.isascii():
+            return text if len(text) <= 24 else text[:25].rsplit(' ', 1)[0][:24]
+        return text[:8]
+
+    wide = str.maketrans(',:;!?', '，：；！？')
+
+    def chat_text(text):
+        """Chinese an agent writes keeps Chinese punctuation: a mark right after a Chinese character is the wide one."""
+        return re.sub(r'(?<=[\u3400-\u4dbf\u4e00-\u9fff])[,:;!?]', lambda found: found.group().translate(wide), text)
+
+    def chat_card(row, fold):
+        card = activity_item(row, card=True)
+        if not card.get('label') and fold is not None:
+            card['label'] = fold['names'].get(row['id'])
+        estimate = jobs.estimate(row)
+        if estimate:
+            card['progress']['estimate'] = estimate
+        return card
+
+    def chat_fold(store, sid):
+        """The session as the page shows it: sentences, the jobs made along the way, and questions."""
+        fold = chat['folds'].get(sid)
+        if fold is None:
+            while len(chat['folds']) >= 8:
+                chat['folds'].pop(next(iter(chat['folds'])))
+            # Message IDs persist in session events and rebuild deduplication when a fold is evicted.
+            fold = chat['folds'][sid] = dict(seq=0, items=[], jobs={}, entities={}, asked={}, sent={}, ids={}, names={}, said=None)
+        while store.get(sid)['last_seq'] > fold['seq']:
+            rows = store.events(sid, after=fold['seq'], limit=500)
+            if not rows:
+                break
+            for row in rows:
+                fold['seq'] = row['seq']
+                base = dict(seq=row['seq'], at=row['at'], type=row['type'])
+                if row['type'] == 'message':
+                    fold['items'].append(dict(base, role='user' if row['by'] == 'user' else 'agent', text=row['text']))
+                    if row['by'] == 'user':
+                        fold['said'] = row['text']
+                        if row.get('mid'):
+                            fold['sent'][row['mid']] = row['seq']
+                            fold['ids'][row['seq']] = row['mid']
+                            while len(fold['sent']) > 500:
+                                fold['ids'].pop(fold['sent'].pop(next(iter(fold['sent']))), None)
+                elif row['type'] == 'step' and row['state'] == 'done':
+                    refs = row.get('refs') or {}
+                    job = refs.get('job')
+                    entity = next(((refs[key], kind) for key, kind in (('drama', 'production'), ('cast', 'cast')) if refs.get(key)), None)
+                    new_entity = entity and entity[0] not in fold['entities']
+                    if new_entity:
+                        fold['entities'][entity[0]] = entity[1]
+                    if job and job not in fold['jobs']:
+                        fold['jobs'][job] = row['seq']
+                        fold['names'][job] = chat_name(fold['said'])
+                        fold['items'].append(dict(base, type='job', job=job, **({'entity': entity[0]} if new_entity else {})))
+                    elif new_entity:
+                        fold['items'].append(dict(base, type=entity[1], entity=entity[0]))
+                elif row['type'] == 'confirm':
+                    if row['state'] == 'asked':
+                        item = dict(base, id=row['id'], question=row.get('question'),
+                                    estimate_seconds=row.get('estimate_seconds'), state='asked')
+                        fold['asked'][row['id']] = item
+                        fold['items'].append(item)
+                    elif row['id'] in fold['asked']:
+                        fold['asked'][row['id']]['state'] = row['state']
+        return fold
+
+    def chat_current(rows, sid, fold):
+        mine = [r for r in rows if r.get('session') == sid or (fold is not None and r['id'] in fold['jobs'])]
+        active = sorted((r for r in mine if r['status'] in ACTIVE),
+                        key=lambda r: (r['status'] in ('running', 'cancelling'), r['created_at']))
+        return mine, active[-1] if active else None
+
+    def chat_session(store, sid=None):
+        # The conversation the user is in, or an earlier one of the connected agent that the page names.
+        if store is None or chat['client'] is None:
+            return None
+        if sid is None:
+            return store.current_for(chat['client'])
+        if not store.has(chat['client'], sid):
+            raise JobError('not_found', 'No such conversation')
+        return sid
+
+    def chat_moved(store, before):
+        # The agent waits in the conversation the user was in; let that wait look again.
+        if store.current_for(chat['client']) != before:
+            store.wake(chat['client'])
+
+    @routes.get('/freevideo/agent/chat')
+    @guarded
+    async def chat_read(request):
+        after, wanted = request[query_key].get('after'), request[query_key].get('session')
+        def read():
+            store = work_sessions()
+            sid = chat_session(store, wanted)
+            rows = jobs.rows()
+            value = dict(agent=agent_state(), session=sid, here=chat_session(store), last_seq=0, read_seq=0, items=[], jobs={}, failures={}, confirms={}, current=None,
+                         active=sum(1 for r in rows if r['status'] in ACTIVE))
+            if sid is None:
+                return value
+            fold = chat_fold(store, sid)
+            known = {r['id']: r for r in rows}
+            items = [i for i in fold['items'] if i['type'] != 'job' or i['job'] in known]
+            if after is None:
+                items, more = items[-200:], False
+            else:
+                items = [i for i in items if i['seq'] > after]
+                items, more = items[:200], len(items) > 200
+            mark = store.read_until(sid, chat['client'])
+            for item in items:
+                item = dict(item)
+                if item['type'] == 'message' and item['role'] == 'user':
+                    item['read'] = item['seq'] <= mark
+                    if item['seq'] in fold['ids']:
+                        item['id'] = fold['ids'][item['seq']]
+                value['items'].append(item)
+            value['last_seq'] = items[-1]['seq'] if more else fold['seq']
+            # For what the page already holds: how far the agent has read, and how each question stands now.
+            value['read_seq'] = mark
+            value['confirms'] = {identity: item['state'] for identity, item in list(fold['asked'].items())[-50:]}
+            mine, current = chat_current(rows, sid, fold)
+            now = time.time()
+            shown = {r['id']: r for r in mine if r['status'] in ACTIVE or (r.get('finished_at') or 0) > now - 1800}
+            shown.update((i['job'], known[i['job']]) for i in items if i['type'] == 'job')
+            value['jobs'] = {identity: chat_card(row, fold) for identity, row in shown.items()}
+            for identity, kind in fold['entities'].items():
+                try:
+                    entity = jobs.productions.get(identity, compact=False) if kind == 'production' else jobs.cast.get(identity)
+                except JobError:
+                    continue  # A deleted card is no longer part of this conversation.
+                error, task = None, None
+                if kind == 'cast':
+                    error = entity.get('generate_error')
+                    task = (error or {}).get('job')
+                else:
+                    from .productions import failure
+                    error, task = failure(entity)
+                if error:
+                    task_view = jobs.view(known[task], detail=False) if task in known else {}
+                    report_id = ((task_view.get('error') or {}).get('report_id')
+                                 or (task_view.get('result') or {}).get('report_id'))
+                    value['failures'][identity] = dict(id=identity, kind=kind, status='failed',
+                        label=entity.get('title') or entity.get('name'), error=errors.with_reason(error), report_id=report_id)
+            value['current'] = current['id'] if current else None
+            if current and current['id'] not in value['jobs']:
+                value['jobs'][current['id']] = chat_card(current, fold)
+            return value
+        return reply(await asyncio.to_thread(read))
+
+    @routes.get('/freevideo/agent/chat/now')
+    @guarded
+    async def chat_now(request):
+        def read():
+            store = work_sessions()
+            sid = chat_session(store)
+            rows = jobs.rows()
+            fold = chat_fold(store, sid) if sid else None
+            current = chat_current(rows, sid, fold)[1] if sid else None
+            return dict(agent=agent_state(), current=chat_card(current, fold) if current else None,
+                        active=sum(1 for r in rows if r['status'] in ACTIVE))
+        return reply(await asyncio.to_thread(read))
+
+    @routes.post('/freevideo/agent/chat')
+    @guarded
+    async def chat_say(request):
+        value = await body(request)
+        def write():
+            store, client = work_sessions(), chat['client']
+            if store is None or client is None:
+                return None
+            before = store.current_for(client)
+            sid = chat_session(store, value.get('session')) or store.create(client=client, by='user')['id']
+            fold = chat_fold(store, sid)
+            if value['id'] in fold['sent']:
+                seq = fold['sent'][value['id']]
+                first = next(i for i in fold['items'] if i['seq'] == seq)
+                return 200, dict(seq=seq, id=value['id'], at=first['at'], session=sid,
+                                 read=seq <= store.read_until(sid, client), agent=agent_state())
+            if store.stopped(sid):
+                # Speaking again continues a conversation the user stopped earlier.
+                store.append(sid, dict(type='control', action='resumed'), by='user')
+            message = dict(type='message', text=value['text'], mid=value['id'])
+            if value.get('whitebox'):
+                message['whitebox'] = True
+            row = store.append(sid, message, by='user')
+            fold['sent'][value['id']] = row['seq']
+            fold['ids'][row['seq']] = value['id']
+            while len(fold['sent']) > 500:
+                fold['ids'].pop(fold['sent'].pop(next(iter(fold['sent']))), None)
+            chat_moved(store, before)
+            return 201, dict(seq=row['seq'], id=value['id'], at=row['at'], session=sid, read=False, agent=agent_state())
+        done = await asyncio.to_thread(write)
+        if done is None:
+            # Nothing is kept: no agent has connected since FreeVideo started, so nobody would read it.
+            return reply({'error': dict(code='not_connected', message='No agent is connected.', retryable=True,
+                                        details=[], next='Connect an agent in the Autopilot view, then say it again.',
+                                        request_id=errors.request_id())}, 409)
+        return reply(done[1], done[0])
+
+    @routes.post('/freevideo/agent/chat/confirm')
+    @guarded
+    async def chat_confirm(request):
+        value = await body(request)
+        def write():
+            store = work_sessions()
+            before = chat_session(store)
+            sid = chat_session(store, value.get('session'))
+            if sid is None:
+                raise JobError('not_found', 'No conversation')
+            row = store.append(sid, dict(type='confirm', id=value['id'],
+                                         state='approved' if value['approve'] else 'declined'), by='user')
+            chat_moved(store, before)
+            return dict(id=row['id'], state=row['state'])
+        return reply(await asyncio.to_thread(write))
+
+    @routes.get('/freevideo/agent/chat/list')
+    @guarded
+    async def chat_list(request):
+        def read():
+            from urllib.parse import quote
+            store = work_sessions()
+            here = chat_session(store)
+            rows = store.history(chat['client']) if here else []
+            listed = {row['id'] for row in rows}
+            running, covers = {}, {}
+            # One job snapshot supplies both counts and the first completed video, without reading session logs or files.
+            for job in jobs.rows():
+                sid = job.get('session')
+                if sid not in listed:
+                    continue
+                if job['status'] in ACTIVE:
+                    running[sid] = running.get(sid, 0) + 1
+                if job['status'] != 'succeeded' or job['kind'] == 'image':
+                    continue
+                work = (job.get('result') or {}).get('library_id')
+                if not isinstance(work, str) or not work:
+                    continue
+                finished = job.get('finished_at')
+                order = (finished if finished is not None else job['created_at'], job['created_at'], job['id'])
+                if sid not in covers or order < covers[sid][0]:
+                    covers[sid] = (order, work)
+            return dict(agent=agent_state(), here=here,
+                        conversations=[dict(row, running=running.get(row['id'], 0),
+                                            cover='/freevideo/library/thumbnail?id=' + quote(covers[row['id']][1], safe='')
+                                            if row['id'] in covers else None) for row in rows])
+        return reply(await asyncio.to_thread(read))
+
+    @routes.post('/freevideo/agent/chat/new')
+    @guarded
+    async def chat_new(request):
+        def write():
+            store, client = work_sessions(), chat['client']
+            if store is None or client is None:
+                return None
+            before = store.current_for(client)
+            # A conversation the user has not spoken in yet is the new one already.
+            if before is not None and not store.spoken(before):
+                return 200, dict(session=before, agent=agent_state())
+            sid = store.create(client=client, by='user')['id']
+            chat_moved(store, before)
+            return 201, dict(session=sid, agent=agent_state())
+        done = await asyncio.to_thread(write)
+        if done is None:
+            return reply({'error': dict(code='not_connected', message='No agent is connected.', retryable=True,
+                                        details=[], next='Connect an agent in the Autopilot view, then try again.',
+                                        request_id=errors.request_id())}, 409)
+        return reply(done[1], done[0])
+
+    @routes.post('/freevideo/agent/chat/delete')
+    @guarded
+    async def chat_delete(request):
+        value = await body(request)
+        def write():
+            store = work_sessions()
+            before = chat_session(store)
+            sid = chat_session(store, value['session'])
+            if sid is None:
+                raise JobError('not_found', 'No conversation')
+            # Work in progress still writes into its conversation; finished videos stay in the library.
+            # New work is refused first, so what is counted below cannot grow before the file goes.
+            def busy(leaving=()):
+                return (any(r.get('session') == sid and r['status'] in ACTIVE and r['status'] not in leaving for r in jobs.rows())
+                        or any(f['session'] == sid and not f['paused']
+                               for f in jobs.productions.list(status='active', limit=None)))
+            stop = value.get('stop') is True
+            if stop:  # The user confirmed: stop its jobs and pause its films first, as the stop button does.
+                jobs.stop_session(sid)
+                for _ in range(20):  # A running job takes a moment to reach its cancelled state.
+                    with jobs.lock:
+                        if not busy():
+                            break
+                    time.sleep(0.25)
+            store.begin_delete(sid)
+            try:
+                with jobs.lock:  # Productions share it.
+                    # After the user's stop, a job still winding down no longer holds the conversation: its
+                    # writes are refused once deletion begins, so a stuck one cannot block deleting forever.
+                    if busy(('cancelling',) if stop else ()):
+                        raise JobError('conflict', 'Work is in progress in this conversation')
+                    store.delete(sid)
+            except BaseException:
+                store.end_delete(sid)
+                raise
+            chat['folds'].pop(sid, None)  # The page cache held its whole text.
+            chat_moved(store, before)
+            return dict(deleted=sid, here=chat_session(store), agent=agent_state())
+        return reply(await asyncio.to_thread(write))
+
+    @routes.get('/freevideo/agent/chat/video')
+    @guarded
+    async def chat_video(request):
+        # The finished video of a work, for the local page to play in the conversation.
+        path = await asyncio.to_thread(port.library_video, request[query_key]['id'])
+        return web.FileResponse(path, headers={'Content-Type': 'video/mp4', 'Cache-Control': 'private, no-store'})
 
     @routes.get('/freevideo/agent/activity')
     @guarded
@@ -673,25 +1173,30 @@ def register():
         def read():
             # For the studio: what agents are doing, as ComfyUI's own queue and history already show.
             now = time.time()
-            rows = sorted(jobs.rows(), key=lambda r: r['created_at'], reverse=True)
-            shown = [r for r in rows if r['status'] in ACTIVE or (r.get('finished_at') or 0) > now - 1800][:12]
-            def item(row):
-                view = jobs.view(row, detail=False)
-                value = {k: view.get(k) for k in ('id', 'kind', 'status', 'label', 'project', 'client', 'take',
-                                                  'created_at', 'finished_at')}
-                progress = view.get('progress') or {}
-                value['progress'] = {k: progress[k] for k in ('phase', 'step', 'fraction', 'remaining_seconds',
-                                                              'queue_position') if progress.get(k) is not None}
-                if view.get('waiting_for'):
-                    value['waiting_for'] = len(view['waiting_for'])
-                if view.get('error'):
-                    value['error'] = view['error']
-                video = (view.get('result') or {}).get('video') or {}
-                if video.get('url'):
-                    value['video'] = video['url']
-                return value
-            return dict(active=sum(1 for r in rows if r['status'] in ACTIVE), jobs=[item(r) for r in shown])
-        return reply(await asyncio.to_thread(read))
+            rows = sorted(jobs.rows(), key=lambda r: (r['created_at'], r['id']), reverse=True)
+            active = sum(1 for r in rows if r['status'] in ACTIVE)
+            cursor = request.query.get('cursor')
+            if cursor is None:
+                shown = [r for r in rows if r['status'] in ACTIVE or (r.get('finished_at') or 0) > now - 1800][:12]
+                after = shown[-1] if shown else None
+                older = [r for r in rows if after is None or (r['created_at'], r['id']) < (after['created_at'], after['id'])]
+                if after is None and older:
+                    # Nothing recent: history starts from the newest job.
+                    return dict(active=active, jobs=[], next_cursor=_activity_cursor({'created_at': older[0]['created_at'] + 1, 'id': ''}))
+            else:
+                try:
+                    stamp, _, ident = cursor.partition(':')
+                    key = (float(stamp), ident)
+                    if not math.isfinite(key[0]) or len(cursor) > 80:
+                        raise ValueError
+                except ValueError:
+                    return None
+                page = [r for r in rows if (r['created_at'], r['id']) < key]
+                shown, older = page[:30], page[30:]
+            return dict(active=active, jobs=[activity_item(r) for r in shown],
+                        next_cursor=_activity_cursor(shown[-1]) if shown and older else None)
+        value = await asyncio.to_thread(read)
+        return problem('invalid_request', 'Invalid cursor') if value is None else reply(value)
 
     @routes.post('/freevideo/agent/activity/cancel')
     @guarded
@@ -701,7 +1206,7 @@ def register():
             return problem('unsupported_media_type', 'Send JSON', 415)
         value = await body(request)
         try:
-            row = await asyncio.to_thread(jobs.cancel, value.get('id') if isinstance(value, dict) else None)
+            row = await asyncio.to_thread(jobs.cancel, value.get('id') if isinstance(value, dict) else None, by='user')
         except KeyError:
             return problem('not_found', 'No such job', 404)
         return reply(dict(id=row['id'], status=row['status']))
@@ -709,7 +1214,7 @@ def register():
     @routes.get('/freevideo/agent/connect')
     @guarded
     async def connect(request):
-        # For Settings: how to connect an agent on this computer. The token itself stays in its file.
+        # For the Autopilot view: how to connect an agent on this computer. The token itself stays in its file.
         from ..comfy_bridge import installation_root, source_root
         from .guide import page_language
         from .mcp import client_config, linux_wrapper_supported, python_shell_command, shell_quote
@@ -758,8 +1263,13 @@ def register():
         root = installation_root()
         prepare_token(root)
         from .editor_runtime import available
+        store = work_sessions()
+        def begun():
+            here = store.current_for(chat['client']) if store is not None and chat['client'] else None
+            return bool(here and store.get(here)['last_seq'])
         value = connection_guide(root, request.scheme + '://' + request.host, request[query_key].get('lang'),
-                                 dict(continuation=await asyncio.to_thread(jobs.continuation_ready), editing=available()))
+                                 dict(continuation=await asyncio.to_thread(jobs.continuation_ready), editing=available()),
+                                 resumed=await asyncio.to_thread(begun))
         if request[query_key].get('format') == 'json':
             return reply(value)
         return web.Response(text=connection_text(value), content_type='text/plain', headers={'Cache-Control': 'no-store'})
@@ -769,6 +1279,7 @@ def register():
     async def hello(request):
         value = await body(request)
         connection.update(connected=True, client=value['client'], via=value['via'], last_seen_at=time.time())
+        chat['told'].pop(request['agent_client'], None)   # a newly connected agent has heard from no conversation yet
         unfinished = await asyncio.to_thread(jobs.productions.list, status='active', limit=5)
         return reply(dict(connection, unfinished=unfinished))
 
@@ -848,14 +1359,14 @@ def register():
     @guarded
     async def get_job(request):
         row = await asyncio.to_thread(jobs.get, request.match_info['id'])
-        return reply(await wait_for_job(jobs, row, float(request[query_key].get('wait', '0') or 0)))
+        return reply(job_answer(await wait_for_job(jobs, row, float(request[query_key].get('wait', '0') or 0))))
 
     @routes.post(PREFIX + '/jobs/{id}/cancel')
     @guarded
     async def cancel(request):
         def work():
             return jobs.view(jobs.cancel(request.match_info['id']))
-        return reply(await asyncio.to_thread(work))
+        return reply(job_answer(await asyncio.to_thread(work)))
 
     @routes.post(PREFIX + '/jobs/{id}/resume')
     @guarded
@@ -864,7 +1375,7 @@ def register():
             key=request.headers.get('Idempotency-Key'), value=await body(request), replay_result=True,
             client=request.headers.get('X-FreeVideo-Client', '')[:80] or None)
         await jobs.tick()
-        return reply(await asyncio.to_thread(jobs.view, row))
+        return reply(job_answer(await asyncio.to_thread(jobs.view, row)))
 
     @routes.get(PREFIX + '/jobs/{id}/events')
     @guarded
@@ -951,6 +1462,9 @@ def register():
                     after = row['seq']
         except (ConnectionError, asyncio.CancelledError):
             pass
+        except JobError as error:
+            if error.code != 'not_found':
+                raise  # A deleted conversation ends its stream; the next request for it says it is gone.
         finally:
             tasks = [task for task in (disconnect, pending) if task is not None]
             for task in tasks:
@@ -979,8 +1493,17 @@ def register():
                 raise JobError('forbidden', 'Only the page user may stop or continue')
             if value['action'] == 'stopped':
                 return reply(await stop_session(sid), 201)
-        return reply(await asyncio.to_thread(sessions.append, sid, value,
-            by=by, client=session_client(request, by)), 201)
+        if by == 'agent' and value['type'] == 'message' and isinstance(value.get('text'), str):
+            value['text'] = chat_text(value['text'])
+        client = session_client(request, by)
+        def write():
+            row = sessions.append(sid, value, by=by, client=client)
+            here = sessions.current_for(client) if client and value['type'] == 'message' else None
+            if here not in (None, sid):
+                # Said where the user no longer looks: the answer itself tells the agent where to say it.
+                row['next'] = MOVED % here
+            return row
+        return reply(await asyncio.to_thread(write), 201)
 
     @routes.get(PREFIX + '/confirmations')
     @guarded
@@ -1036,6 +1559,26 @@ def register():
             info.pop('path', None)
             made.pop('path', None)
             return assets.public(dict(made, **info, file=relative, view=assets.view(relative)))
+
+    @routes.post(PREFIX + '/imports')
+    @guarded
+    async def import_media(request):
+        from . import imports
+        value = None if request.content_type == 'multipart/form-data' else await body(request)
+        try:
+            result, status = await imports.upload(request, value, port.output_root,
+                getattr(server, '_freevideo_editor', None), import_lock, upload_decoders)
+        except specs.SpecError:
+            raise
+        except (ValueError, AssertionError):
+            imports.invalid('/file', 'a well-formed multipart upload with video or audio content')
+        return reply(result, status)
+
+    @routes.get(PREFIX + '/imports')
+    @guarded
+    async def list_imports(request):
+        from . import imports
+        return reply(await asyncio.to_thread(imports.listing, port.output_root))
 
     @routes.post(PREFIX + '/media')
     @guarded
@@ -1263,23 +1806,60 @@ def register():
     async def inbox(request):
         # The hook already attached this request to the caller's session; answer with its unread user words.
         store, sid = work_sessions(), request.get('agent_session')
-        deadline = time.monotonic() + min(25., float(request[query_key].get('wait', '0') or 0))
-        while True:
-            if store is not None and sid is not None:
-                # Mark before reading so words arriving in between wake the wait below.
-                def read():
-                    mark = store.get(sid)['last_seq']
-                    return mark, store.unread(sid, request['agent_client'])
-                mark, pending = await asyncio.to_thread(read)
-                if pending:
-                    return reply(dict(session=sid, inbox=pending[-20:]))
-            left = deadline - time.monotonic()
-            if left <= 0:
-                return reply(dict(session=sid, inbox=[]))
-            if store is None or sid is None:
-                await asyncio.sleep(min(left, 1.))
-            else:
-                await store.wait(sid, after=mark, seconds=left, by='user')
+        client = request['agent_client']
+        if store is not None and sid is None:
+            # An agent that only listens has no session yet: give it one, so the page can speak into it.
+            sid = await asyncio.to_thread(lambda: store.current_for(client) or store.create(client=client)['id'])
+            request['agent_session'] = sid
+        # Without a session of its own choosing, the agent listens wherever its user is.
+        follow = store is not None and not request.headers.get('X-FreeVideo-Session', '').strip()
+        def answer(value):
+            told, chat['told'][client] = chat['told'].get(client), value['session']
+            scenes = jobs.whitebox.open_for(value['session']) if value['inbox'] else []
+            if scenes:
+                value['whitebox'] = scenes
+                value['next'] = (WHITEBOX_PENDING + ' ' + value.get('next', '')).strip()
+            if follow and told != value['session']:
+                first = value['inbox'][0]['seq'] if value['inbox'] else store.get(value['session'])['last_seq'] + 1
+                if first > 1:
+                    # What the user sees above these words. An agent that has to fetch it answers from the conversation it left.
+                    value['before'] = [dict(e, text=e['text'][:BEFORE_TEXT]) if isinstance(e.get('text'), str) else e
+                                       for e in store.events(value['session'], after=max(0, first - 1 - BEFORE_LINES),
+                                                             limit=BEFORE_LINES) if e['seq'] < first]
+                said = (RESUMED if first > 1 else '') if told is None else (
+                    MOVED % value['session'] + (MOVED_BACK % value['session'] if first > 1 else MOVED_NEW))
+                value['next'] = (said + ' ' + value.get('next', '')).strip()
+            return reply(value)
+        deadline = time.monotonic() + min(50., float(request[query_key].get('wait', '0') or 0))
+        chat['waiting'] += 1
+        try:
+            while True:
+                if follow:
+                    # The user may delete the conversation the agent waits in; with none left, it listens in a new one.
+                    sid = request['agent_session'] = await asyncio.to_thread(
+                        lambda: store.current_for(client) or (sid if store.has(client, sid) else store.create(client=client)['id']))
+                if store is not None and sid is not None:
+                    # Mark before reading so words arriving in between wake the wait below.
+                    def read():
+                        mark = store.get(sid)['last_seq']
+                        return mark, store.unread(sid, client)
+                    mark, pending = await asyncio.to_thread(read)
+                    if pending:
+                        return answer(dict(session=sid, inbox=pending[-20:]))
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    # again: nothing new this time; the caller simply waits once more. An agent decides what to
+                    # do next from the last answer it read, so the empty one says it in words as well.
+                    return answer(dict(session=sid, inbox=[], again=True, next=KEEP_WAITING))
+                if store is None or sid is None:
+                    await asyncio.sleep(min(left, 1.))
+                else:
+                    await store.wait(sid, after=mark, seconds=min(left, 25.), by='user',
+                                     leave=(lambda here=sid: store.current_for(client) != here) if follow else None)
+        finally:
+            chat['waiting'] -= 1
+            # The agent was here for the whole wait, not only when it began.
+            connection['last_seen_at'] = time.time()
 
     @routes.get(PREFIX + '/queue')
     @guarded
@@ -1408,7 +1988,7 @@ def register():
                 raise JobError('idempotency_conflict', 'Conflicting keys')
             args = [] if operation == 'create' else [identity]
             extra = dict(client=request.headers.get('X-FreeVideo-Client', '')[:80] or None)
-            if operation in ('generate', 'export'):
+            if operation in ('generate', 'export', 'listen'):
                 extra['jobs'] = jobs
             if operation == 'generate':
                 def capability(size):
@@ -1418,9 +1998,9 @@ def register():
                         return None
                 extra['capability'] = capability
             result = await asyncio.to_thread(getattr(projects, operation), *args, value, ref=key or ref, **extra)
-            if operation in ('generate', 'export'):
+            if operation in ('generate', 'export', 'listen'):
                 await jobs.tick()
-            return reply(result, 201 if operation in ('create', 'generate', 'export') else 200)
+            return reply(result, 201 if operation in ('create', 'generate', 'export', 'listen') else 200)
         return guarded(handler)
 
     for operation, (method, suffix, _) in contract.PROJECT_OPERATIONS.items():
@@ -1451,6 +2031,97 @@ def register():
 
     for operation, (method, suffix, _) in contract.IMAGE_OPERATIONS.items():
         getattr(routes, method.lower())(PREFIX + suffix)(image_handler(operation))
+
+    def whitebox_handler(operation):
+        async def handler(request):
+            scenes = jobs.whitebox
+            if operation == 'get':
+                deadline = time.monotonic() + request[query_key].get('wait', 0)
+                while True:
+                    view = await asyncio.to_thread(scenes.read, request.match_info['id'])
+                    if view['status'] in ('ready', 'failed') or time.monotonic() >= deadline:
+                        return reply(view)
+                    await asyncio.sleep(.5)
+            value = await body(request)
+            if not scenes.page_open():
+                raise JobError('page_required', 'No FreeVideo page is open to render the scene')
+            return reply(await asyncio.to_thread(scenes.create, value['code'], value.get('summary'),
+                                                 request.get('agent_session')), 201)
+        return guarded(handler)
+
+    for operation, (method, suffix, _) in contract.WHITEBOX_OPERATIONS.items():
+        getattr(routes, method.lower())(PREFIX + suffix)(whitebox_handler(operation))
+
+    # The page renders scenes: it asks for work, then sends back the video or the reason it failed.
+    def whitebox_confirm(notice):
+        store = work_sessions()
+        if not notice or store is None:
+            return
+        try:
+            store.append(notice['session'], dict(type='confirm', id='cf' + secrets.token_hex(5), state='asked',
+                         question=notice['question'], whitebox=dict(work=notice['work'], seconds=notice['seconds'],
+                                                                      summary=notice['summary'])), by='builtin')
+        except Exception:
+            logging.getLogger(__name__).warning('White-model confirmation failed', exc_info=True)
+
+    @routes.get('/freevideo/agent/whitebox/next')
+    @guarded
+    async def whitebox_next(request):
+        return reply(dict(scene=await asyncio.to_thread(jobs.whitebox.claim)))
+
+    @routes.get('/freevideo/agent/whitebox/presets')
+    @guarded
+    async def whitebox_presets(request):
+        return reply(dict(presets=[{k: row[k] for k in ('id', 'name', 'shot', 'prompt')} for row in PRESETS]))
+
+    @routes.post('/freevideo/agent/whitebox/try')
+    @guarded
+    async def whitebox_try(request):
+        if request.content_type != 'application/json':
+            return problem('unsupported_media_type', 'Send JSON', 415)
+        value = await body(request)
+        row = whitebox_preset(value.get('preset') if isinstance(value, dict) else None)
+        if row is None:
+            raise JobError('not_found', 'No such ready-made scene')
+        sid = value.get('session')
+        notice = None
+        if sid is not None:
+            store = work_sessions()
+            if store is None or not isinstance(sid, str) or not store.has(chat['client'], sid):
+                raise JobError('not_found', 'No such conversation')
+            # The conversation gets the confirmation card once the page has rendered the scene.
+            notice = dict(question=row['prompt'], summary=row['name'])
+        scene = await asyncio.to_thread(jobs.whitebox.create, row['code'], row['shot'], sid, notice)
+        return reply(dict(scene, preset=row['id'], name=row['name'], prompt=row['prompt']), 201)
+
+    @routes.post('/freevideo/agent/whitebox/{id}/video')
+    @guarded
+    async def whitebox_video(request):
+        scenes = jobs.whitebox
+        with tempfile.TemporaryDirectory(prefix='.whitebox-', dir=port.input_root) as temporary:
+            target = Path(temporary) / 'scene.mp4'
+            size = 0
+            with target.open('xb') as output:
+                async for chunk in request.content.iter_chunked(256 * 1024):
+                    size += len(chunk)
+                    if size > MAX_WHITEBOX_VIDEO:
+                        raise JobError('too_large', 'Upload exceeds limit', limit_bytes=MAX_WHITEBOX_VIDEO)
+                    output.write(chunk)
+            if not size:
+                raise JobError('invalid_media', 'Supply the rendered video')
+            async with upload_decoders:
+                scene = await asyncio.to_thread(scenes.finish, request.match_info['id'], target)
+            await asyncio.to_thread(whitebox_confirm, scenes.take_notice(scene['id']))
+            return reply(scene)
+
+    @routes.post('/freevideo/agent/whitebox/{id}/failed')
+    @guarded
+    async def whitebox_failed(request):
+        if request.content_type != 'application/json':
+            return problem('unsupported_media_type', 'Send JSON', 415)
+        value = await body(request)
+        message = value.get('message') if isinstance(value, dict) else None
+        return reply(await asyncio.to_thread(jobs.whitebox.fail, request.match_info['id'], message))
 
     @routes.get(PREFIX + '/editor/sources/content')
     @guarded

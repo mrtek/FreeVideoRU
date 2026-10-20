@@ -1,4 +1,4 @@
-"""The running ComfyUI server as seen by agent jobs: its queue, history, folders and the local VLM."""
+"""The running ComfyUI server as seen by agent jobs: queue, history, folders and local services."""
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -169,6 +169,10 @@ class ComfyPort:
         """The editor page's export queue (editor_export.register), shared so exports take turns."""
         return getattr(self.server, '_freevideo_editor_export', None)
 
+    def editor_ears(self):
+        """The auto-subtitle ears queue (subtitle_ears.register): time lines against the sound or write down speech."""
+        return getattr(self.server, '_freevideo_subtitle_ears', None)
+
     def queue_busy(self):
         running, pending = self.snapshot()
         return bool(running or pending)
@@ -188,7 +192,10 @@ class ComfyPort:
         from ..comfy_progress import STATE
         with STATE.lock:
             row = STATE.rows.get(str(node))
-            return json.loads(json.dumps(row['message'])) if row else None
+            if not row:
+                return None
+            # How old the message is, as a reopened page gets it, so a bar can go on from where the engine is now.
+            return dict(json.loads(json.dumps(row['message'])), age_seconds=max(0., STATE.clock() - row['measured']))
 
     async def submit(self, graph, extra):
         if self.handler is None:
@@ -294,6 +301,48 @@ class ComfyPort:
     def vlm_cancel(self, key):
         try:
             self.vlm.cancel(key)
+        except ValueError:
+            pass
+
+    # Local image generation ----------------------------------------------------------------------------
+    def _image(self):
+        from ..image_gen.service import get_service
+        return get_service(self.server)
+
+    @property
+    def image(self):
+        service = self._image()
+        if service is None:
+            raise JobError('image_unavailable', 'The image service is not loaded')
+        return service
+
+    def image_busy(self):
+        service = self._image()
+        return service is not None and service.busy()
+
+    def image_ready(self):
+        try:
+            service = self._image()
+            return service is not None and bool(service.info()['ready'])
+        except Exception:  # noqa: BLE001 - an optional service must not prevent video generation
+            return False
+
+    def image_start(self, action, value):
+        try:
+            return self.image.start(action, value)['job']
+        except ValueError as error:
+            from .jobs import IMAGE_ERRORS, IMAGE_WAIT_ERRORS
+            code = getattr(error, 'code', str(error))
+            code = code if code in IMAGE_ERRORS else 'invalid_request'
+            raise JobError(code, IMAGE_ERRORS[code], retryable=code in IMAGE_WAIT_ERRORS,
+                           kind='image', report_id=getattr(error, 'report_id', None)) from None
+
+    def image_status(self, key):
+        return self.image.status(key)
+
+    def image_cancel(self, key):
+        try:
+            self.image.cancel(key)
         except ValueError:
             pass
 

@@ -138,13 +138,14 @@ export function splitSpeed(record, id, frame, by = 'user') {
     const clips = selected(record, id), primary = clips[0], left = frame - primary.start;
     check(left >= 0 && left <= primary.frames, 'range');
     if (left === 0 || left === primary.frames) return record;
-    const {copy, finish, detachAttempt, trackOf, freshId} = operations();
+    const {copy, finish, detachAttempt, trackOf, freshId, splitAudioFields} = operations();
     const next = copy(record); detachAttempt(next, clips.map(clip => clip.id)); const rights = [];
     for (const old of clips) {
         const clip = model.find(next, old.id); if (by === 'user') delete clip.text_by;
         const right = structuredClone(clip);
         replaceSlice(clip, 0, left); replaceSlice(right, left, old.frames - left);
         right.id = freshId(next); right.start = frame;
+        splitAudioFields(clip, right);
         trackOf(next, clip.id).clips.push(right); rights.push(right);
     }
     if (rights.length === 2) { rights[0].link = rights[1].id; rights[1].link = rights[0].id; }

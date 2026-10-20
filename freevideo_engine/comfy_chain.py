@@ -1,13 +1,15 @@
 """Local ComfyUI queue adapter and optional background-chain routes."""
+import asyncio
 import json
 import logging
 import math
 import os
 from pathlib import Path, PurePosixPath
 import ssl
+import time
 from urllib import error, request
 
-from .chain_runner import ChainBusy, ChainRunner, ChainTooLong
+from .chain_runner import ChainBusy, ChainPartTooShort, ChainRunner, ChainTooLong
 from . import chain_plan, chain_store
 
 RUNNER = None
@@ -38,10 +40,27 @@ def seconds_for_frames(frames, minimum=1.625, maximum=60., step=.1):
 
 
 class ComfyHost:
-    continuation_inputs = tuple(CONTINUE_INPUTS.values())
+    continuation_inputs = (*CONTINUE_INPUTS.values(), 'voice_reference', 'hide_tail')
+    # Inputs a continued part drops. The media panel and references stay: the Generate node keeps their pictures.
+    media_inputs = ('first', 'last', 'conditioning')
 
     def __init__(self, server):
         self.server = server
+
+    def continued(self, prompt, node):
+        """A continued part's media panel keeps only the pictures it uses (prompt is this submission's copy)."""
+        link = prompt[node]['inputs'].get('media')
+        if not (isinstance(link, list) and len(link) == 2 and link[0] in prompt):
+            return
+        media = prompt[link[0]]
+        if not isinstance(media, dict) or media.get('class_type') != 'FreeVideoMedia':
+            return
+        inputs = media.setdefault('inputs', {})
+        for name in ('first', 'last', 'reference_audio'):
+            inputs.pop(name, None)
+        if isinstance(inputs.get('assets'), str):
+            from .comfy_assets import continued_assets
+            inputs['assets'] = continued_assets(inputs['assets'])
 
     def inputs(self, block_inputs):
         schema = _generate_inputs()
@@ -57,6 +76,12 @@ class ComfyHost:
             # Each direction is filled once the node offers its input.
             if name in schema:
                 values[name] = '' if independent else block_inputs[key]
+        if 'voice_reference' in schema and values.get('continue_from'):
+            values['voice_reference'] = True
+        if ('hide_tail' in schema and not independent and block_inputs.get('index', 0) < block_inputs.get('count', 0) - 1
+                and continuation_supported()):
+            # Only a backend that continues videos makes the extra tail frames; others ignore the option.
+            values['hide_tail'] = True
         return values
 
     def work_exists(self, path):
@@ -152,8 +177,59 @@ class ComfyHost:
         frames = planned['frames'] if planned and not planned['single'] and len(blocks) == len(record['blocks']) else None
         kept = {'leads': record['lead_reader'], 'expected_seams': record.get('expected_seams')} \
             if record.get('lead_reader') is not None else {}
+        from .chain_level import voiced
+        # Parts with spoken lines keep their voice level and fullness to the first part's.
+        speaking = [voiced(block.get('inputs', {}).get('text')) for block in blocks]
         return join_outputs([block['output'] for block in blocks], record['id'], cancelled,
-                            frames=frames, replace=record.get('output'), **kept)
+                            frames=frames, replace=record.get('output'), speaking=speaking, **kept)
+
+    def split_texts(self, value, cancelled):
+        """One description per part from the local prompt model: (parts, None) or (None, reason)."""
+        service = getattr(self.server, '_freevideo_prompt_vlm', None)
+        if service is None:
+            return None, 'unavailable'
+        # A rewrite or a single video the user started a moment ago finishes first; busy is said only after
+        # ten minutes of waiting. Up to ten minutes waiting plus fifteen splitting hold the runner thread; there
+        # is one active chain, so nothing else waits behind it.
+        waiting = time.monotonic() + 600
+        while True:
+            try:
+                job = service.start('split', value)['job']
+            except ValueError as failure:
+                if str(failure) != 'busy' or time.monotonic() > waiting or cancelled():
+                    return None, {'model_missing': 'model_missing', 'busy': 'busy'}.get(str(failure), 'failed')
+                time.sleep(2)
+                continue
+            parts, reason = self._split_job(service, job, cancelled)
+            if reason != 'busy' or time.monotonic() > waiting or cancelled():
+                return parts, reason
+            time.sleep(2)
+
+    def _split_job(self, service, job, cancelled):
+        deadline = time.monotonic() + 900
+        while True:
+            try:
+                row = service.status(job)
+            except ValueError:
+                return None, 'failed'
+            phase = row.get('phase')
+            if phase == 'complete':
+                return row.get('parts'), None
+            if phase in ('failed', 'cancelled'):
+                error = row.get('error')
+                return None, ('memory' if error in ('ram_space', 'disk_space') else 'busy' if error == 'busy'
+                              else 'unusable' if error == 'split_failed' else 'failed')
+            if cancelled() or time.monotonic() > deadline:
+                service.cancel(job)
+                stopping = time.monotonic() + 30
+                try:
+                    while (time.monotonic() < stopping
+                           and service.status(job).get('phase') not in ('complete', 'failed', 'cancelled')):
+                        time.sleep(.2)
+                except ValueError:
+                    pass
+                return None, 'failed'
+            time.sleep(.5)
 
     def lead(self, output, previous):
         """A finished block's seam sound, read while its record is still in the shared store."""
@@ -167,8 +243,13 @@ def continuation_directions():
     return {key for key, name in CONTINUE_INPUTS.items() if name in schema}
 
 
+def continuation_supported():
+    from .continuation import supported
+    return supported()[0]
+
+
 def continuation_available():
-    return 'after' in continuation_directions()
+    return 'after' in continuation_directions() and continuation_supported()
 
 
 def report_fields(chain):
@@ -225,9 +306,10 @@ def register(host_factory=None):
     host = host_factory(server) if fake else ComfyHost(server)
     if fake:
         logging.warning('[FreeVideo] Test background chain host is enabled')
-    # Only the test host may lift the limit on parts, never the package.
+    # Only the test host may lift the limits on parts, never the package.
     runner = ChainRunner(Path(root) / 'chains', host, estimate=None,
-                         max_parts=getattr(host, 'max_parts', None) if fake else None)
+                         max_parts=getattr(host, 'max_parts', None) if fake else None,
+                         min_part_frames=getattr(host, 'min_part_frames', None) if fake else None)
     if fake:
         host.runner = runner
     RUNNER = runner
@@ -249,9 +331,13 @@ def register(host_factory=None):
     async def plan(request):
         try:
             value = await body(request)
-            return response({'plan': chain_plan.plan(
+            result = chain_plan.plan(
                 value.get('seconds'), value.get('single', False), value.get('max_frames'),
-                value.get('single_limit_seconds'), value.get('block_seconds'))})
+                value.get('single_limit_seconds'), value.get('block_seconds'))
+            if not result['single'] and not continuation_supported():
+                # A device that cannot continue a video has one block to give: never a plan in parts.
+                raise chain_plan.PlanError('device_limit', 'This device cannot generate this length at this size')
+            return response({'plan': result})
         except chain_plan.PlanError as failure:
             return response({'error': str(failure), 'code': failure.code}, 400)
         except ValueError as failure:
@@ -269,12 +355,15 @@ def register(host_factory=None):
                     return response({'error': 'Continuing a video is not available in this version'}, 409)
                 if missing:
                     return response({'error': 'Extending backwards or filling a gap is not available in this version'}, 409)
-            return response({'chain': runner.create(value)})
+            return response({'chain': await asyncio.to_thread(runner.create, value)})
         except ChainBusy as failure:
             return response({'error': str(failure)}, 409)
         except ChainTooLong as failure:
             return response({'error': str(failure), 'error_zh': failure.message_zh, 'code': failure.code,
                              'parts': failure.parts, 'max_parts': failure.limit}, 400)
+        except ChainPartTooShort as failure:
+            return response({'error': str(failure), 'error_zh': failure.message_zh, 'code': failure.code,
+                             'min_seconds': failure.limit}, 400)
         except chain_plan.PlanError as failure:
             return response({'error': str(failure), 'code': failure.code}, 400)
         except ValueError as failure:
@@ -305,6 +394,45 @@ def register(host_factory=None):
             return response({'chain': runner.cancel(request.match_info['id'])})
         except KeyError:
             return response({'error': 'Unknown chain'}, 404)
+
+    @server.routes.post('/freevideo/chain/{id}/blocks/{block}/text')
+    async def text(request):
+        try:
+            value = await body(request)
+            return response({'chain': runner.set_text(request.match_info['id'], request.match_info['block'],
+                                                      value.get('text') if isinstance(value, dict) else None)})
+        except KeyError:
+            return response({'error': 'Unknown chain or part'}, 404)
+        except ChainBusy as failure:
+            return response({'error': str(failure)}, 409)
+        except ValueError as failure:
+            return response({'error': str(failure)}, 400)
+
+    @server.routes.post('/freevideo/chain/{id}/blocks/{block}/redo')
+    async def redo(request):
+        # A new chain from this part on; the original chain and its video are kept.
+        try:
+            value = await body(request) if request.can_read_body else {}
+            identity, block = request.match_info['id'], request.match_info['block']
+            if not fake and os.environ.get('FREEVIDEO_CHAIN_INDEPENDENT') != '1':
+                missing = {key for row in runner.get(identity)['blocks'] for key in CONTINUE_INPUTS
+                           if row[key] is not None} - continuation_directions()
+                if missing:
+                    return response({'error': 'Continuing a video is not available in this version'}, 409)
+            return response({'chain': await asyncio.to_thread(runner.redo, identity, block,
+                                                              value.get('text'), value.get('client_id'))})
+        except KeyError:
+            return response({'error': 'Unknown chain or part'}, 404)
+        except ChainBusy as failure:
+            return response({'error': str(failure)}, 409)
+        except ChainTooLong as failure:
+            return response({'error': str(failure), 'error_zh': failure.message_zh, 'code': failure.code,
+                             'parts': failure.parts, 'max_parts': failure.limit}, 400)
+        except ChainPartTooShort as failure:
+            return response({'error': str(failure), 'error_zh': failure.message_zh, 'code': failure.code,
+                             'min_seconds': failure.limit}, 400)
+        except ValueError as failure:
+            return response({'error': str(failure)}, 400)
 
     @server.routes.post('/freevideo/chain/{id}/resume')
     async def resume(request):

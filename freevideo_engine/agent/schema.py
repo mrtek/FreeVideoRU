@@ -9,12 +9,18 @@ import math
 import re
 
 from . import API_VERSION
+from .. import tiers
 
 S = 'https://json-schema.org/draft/2020-12/schema'
 PREFIX = '/freevideo/agent/v1'
-QUALITY = {'light': (True, 8, 3), 'medium': (False, 12, 3), 'high': (False, 16, 3), 'max': (False, 20, 3)}
+# (two_pass, base_steps, refine_steps) of each level on this platform; the step
+# cache a level adds is tiers.step_cache(name, mac) (high and max use easycache-av),
+# its two-pass upscale factor tiers.upscale_factor(name, mac) (medium samples a larger first pass).
+QUALITY = {name: tiers.plan(name, mac=tiers.on_mac()) for name in tiers.TIERS}
 ASPECTS = {'16:9': (16, 9), '9:16': (9, 16), '1:1': (1, 1), '4:3': (4, 3), '3:4': (3, 4),
            '21:9': (21, 9), '2:3': (2, 3), '3:2': (3, 2)}
+IMAGE_ASPECTS = {'1:1': (1024, 1024), '16:9': (1344, 768), '9:16': (768, 1344),
+                 '4:3': (1152, 896), '3:4': (896, 1152)}
 MAX_UPLOAD_BYTES = 2 * 1024 ** 3
 MAX_JSON_UPLOAD_BYTES = 96 * 1024 ** 2
 MAX_BODY_BYTES = 1024 * 1024
@@ -55,9 +61,12 @@ SLUG = string(64, pattern=r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 REF = string(128, pattern=r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$',
              description='Idempotency key; reuse only with the same request content. Batch row refs also name dependencies.')
 FILE = string(1024, pattern=r'^(?!/)(?!.*(?:\\|:))(?!.*(?:^|/)\.\.(?:/|$)).+$')
-FRAME = {'oneOf': [enum(('first', 'last')), number(0)]}
+FRAME = {'oneOf': [enum(('first', 'last')), number(0, 86400)]}  # Seconds into the video; the bound keeps it a float.
 WAIT = number(0, default=0, description='x-clamp caps accepted wait values at 25 seconds without rejecting larger values.', **{'x-clamp': 25})
 CLIENT_WAIT = number(0, 25, default=25)
+# Waiting for the user's words is longer: a person types slowly, and each wait is one tool call.
+INBOX_WAIT = number(0, default=0, description='x-clamp caps accepted wait values at 50 seconds without rejecting larger values.', **{'x-clamp': 50})
+CHAT_ID = string(64, pattern=r'^[A-Za-z0-9_-]{1,64}$')
 EMPTY = obj()
 
 
@@ -99,11 +108,15 @@ def edit_document():
             'x-editor-document': True}
 
 
-def media(image=False, *, local=False, clip=False, video=False):
+def media(image=False, *, local=False, clip=False, video=False, early=False):
     properties = dict(file=FILE, from_job=JOB, library=SAVED, frame=FRAME,
                       edit={'oneOf': [edit_recipe(), edit_document()]}, label=string(80))
     if local:
         properties['path'] = string(4096)
+    if early:
+        properties['early_steps'] = number(1, 32, integer=True, description=
+            'A reference video only: it guides the first pass for this many steps and is dropped afterwards, '
+            'including from the second pass. Omitted: the video guides every step.')
     if clip:
         properties.pop('frame')
         properties.pop('edit')
@@ -131,7 +144,7 @@ def common():
 
 def generation_media(*, local=False, enhance=False):
     return obj({'first': nullable(media(True, local=local)), 'last': nullable(media(True, local=local)),
-                'references': nullable(array(media(enhance, local=local), high=8 if enhance else 32))},
+                'references': nullable(array(media(enhance, local=local, early=not enhance), high=8 if enhance else 32))},
                allOf=[{'if': {'required': ['references'], 'properties': {'references': {'type': 'array', 'minItems': 1}}},
                        'then': {'properties': {'first': {'type': 'null'}, 'last': {'type': 'null'}}}}])
 
@@ -157,18 +170,37 @@ def generate(*, local=False):
         first_frame_reference={'type': 'boolean', 'default': False, 'description':
             'Reduces drift over a continued video: every continuing part also sees the first frame of the whole '
             'video. It holds framing and motion close to that frame.'},
+        part_prompts=array(string(20000), 1, 5, description='One description per part of a video made in several '
+            'parts, in order, so each part plays its own share of the story. The count must equal the '
+            'chain_plan.blocks POST /plan gives for this length. Omitted: FreeVideo splits prompt into parts before the first part.'),
         takes=number(1, 8, integer=True, default=1), **common()),
         allOf=[{'if': {'required': ['refine_from'], 'properties': {'refine_from': {'type': 'string'}}},
                 'then': {'properties': {k: False for k in ('prompt', 'width', 'height', 'aspect', 'megapixels',
                     'seconds', 'seed', 'quality', 'sampling', 'media', 'loras', 'preview', 'continue_from',
-                    'first_frame_reference')}},
+                    'first_frame_reference', 'part_prompts')}},
                 'else': {'required': ['prompt']}},
                {'if': {'anyOf': [{'required': [k]} for k in ('aspect', 'megapixels')]},
                 'then': {'not': {'anyOf': [{'required': [k]} for k in ('width', 'height')]}}},
                {'if': {'if': {'required': ['sampling'], 'properties': {'sampling': {'required': ['two_pass']}}},
                        'then': {'properties': {'sampling': {'properties': {'two_pass': {'const': False}}}}},
-                       'else': {'required': ['quality'], 'properties': {'quality': {'not': {'const': 'light'}}}}},
-                'then': {'properties': {'preview': {'const': False}}}}],
+                       'else': {'required': ['quality'], 'properties': {'quality': {'not': {'enum': [
+                           name for name, plan in QUALITY.items() if plan[0]]}}}}},
+                'then': {'properties': {'preview': {'const': False}}}},
+               # A preview is two-pass, which runs only with 8 first-pass steps: refused when the effective
+               # first-pass count is another number, given in sampling or inherited from the quality.
+               {'if': {'properties': {'preview': {'const': True}}, 'required': ['preview']},
+                # x-derived: issues() names this case at /sampling with the derived sampling checks.
+                'then': {'x-derived': True, 'not': {'anyOf': [
+                    {'required': ['sampling'], 'properties': {'sampling': {'required': ['two_pass', 'base_steps'],
+                        'properties': {'two_pass': {'const': True}, 'base_steps': {'not': {'const': 8}}}}}},
+                    {'required': ['sampling'], 'properties': {
+                        'sampling': {'required': ['base_steps'], 'not': {'required': ['two_pass']},
+                                     'properties': {'base_steps': {'not': {'const': 8}}}},
+                        'quality': {'enum': [name for name, plan in QUALITY.items() if plan[0]]}}},
+                    {'required': ['sampling', 'quality'], 'properties': {
+                        'sampling': {'required': ['two_pass'], 'not': {'required': ['base_steps']},
+                                     'properties': {'two_pass': {'const': True}}},
+                        'quality': {'enum': [name for name, plan in QUALITY.items() if plan[1] != 8]}}}]}}}],
         description='x-job-kind selects normalization and checks derived geometry and sampling step comparisons; these calculations are not JSON Schema constraints.',
         **{'x-job-kind': 'generate'})
 
@@ -191,6 +223,34 @@ def vlm(*, local=False):
         ('kind', 'questions'), description='x-job-kind also checks the sum of images and sampled video frames across questions (at most 24).', **{'x-job-kind': 'vlm'})
 
 
+def image(*, local=False):
+    return obj(dict(kind={'const': 'image', 'type': 'string'},
+        prompt=dict(type='string', minLength=1, maxLength=2000),
+        width=number(256, 2048, integer=True), height=number(256, 2048, integer=True),
+        aspect=enum(IMAGE_ASPECTS, description='Instead of width and height; 1:1 when all three are omitted.'),
+        seed=nullable(number(-2**63, 2**64 - 1, integer=True)),
+        images=array({'oneOf': [FILE, obj(dict(file=FILE), ('file',))]}, high=4, description='Pictures to change '
+            'or combine: input files, such as result.file of an earlier picture job. The prompt calls them image 1, image 2.'),
+        people=array(obj(dict(image=FILE, name=string(40), x=number(0, 1), height=number(.05, 1), feet=number(0, 1)),
+                         ('image',)), 1, 3, description='Makes a first frame with people standing where you say. image is '
+            "a full-body picture on a plain backdrop, such as a cast card's front picture. From 0 to 1: x is the person's "
+            'centre across the width (default 0.5), height their size (0.62) and feet where they stand down the height '
+            '(0.9). The prompt describes the scene, or scene_image shows it. Not together with images.'),
+        scene_image=FILE,
+        **common()),
+        ('kind', 'prompt'), allOf=[{'if': {'required': ['width']}, 'then': {'required': ['height']}},
+               {'if': {'required': ['height']}, 'then': {'required': ['width']}},
+               {'if': {'required': ['aspect']},
+                'then': {'not': {'anyOf': [{'required': ['width']}, {'required': ['height']}]}}}],
+        **{'x-job-kind': 'image'})
+
+
+def image_result():
+    return obj(dict(file=FILE, url=string(), width=number(256, 2048, integer=True),
+        height=number(256, 2048, integer=True), seed=number(-2**63, 2**64 - 1, integer=True),
+        thumbnail=string()), ('file', 'url', 'width', 'height', 'thumbnail'))
+
+
 def enhance(*, local=False):
     return obj(dict(kind={'const': 'enhance', 'type': 'string'}, text=string(12000),
         seconds=number(1, 60, default=10), media=nullable(generation_media(local=local, enhance=True)), **common()),
@@ -206,6 +266,23 @@ def export(*, local=False):
         **{'x-job-kind': 'export'})
 
 
+LISTEN_FIELDS = dict(
+    mode=enum(('align', 'transcribe'), description='align: time the lines you give against the sound; transcribe: write down what is said.'),
+    language=string(8, pattern=r'^(auto|[a-z]{2,3})$', default='auto', description='Spoken language, e.g. zh or en; auto detects it.'),
+    lines=array(string(2000), 1, 1000, description='align only: the lines to time, in order.'),
+    range=obj(dict(start=EDITOR_FRAME, frames=number(1, 10**7, integer=True)), ('start', 'frames'),
+              description='Timeline frames to listen to; omit for the whole timeline.'))
+
+
+def listen(*, local=False):
+    return obj(dict(kind={'const': 'listen', 'type': 'string'},
+        editor_project=string(34, pattern=r'^e-[0-9a-f]{32}$', description='The editing project whose sound to listen to (GET /projects).'),
+        revision=number(1, 2**53 - 1, integer=True, description='The saved revision you read; a later save fails the job with project_changed.'),
+        **LISTEN_FIELDS, **common()), ('kind', 'editor_project', 'revision', 'mode'),
+        description='Listen to the timeline sound with the local speech model. The result lists each line with its start and end frame; nothing is saved.',
+        **{'x-job-kind': 'listen'})
+
+
 def image_edit(*, local=False):
     return obj(dict(kind={'const': 'image_edit', 'type': 'string'},
         image=dict(IMAGE, description='The image session to render (POST /images).'),
@@ -215,7 +292,8 @@ def image_edit(*, local=False):
         **{'x-job-kind': 'image_edit'})
 
 
-KINDS = dict(generate=generate, assemble=assemble, vlm=vlm, enhance=enhance, export=export, image_edit=image_edit)
+KINDS = dict(generate=generate, assemble=assemble, vlm=vlm, enhance=enhance, image=image,
+             export=export, listen=listen, image_edit=image_edit)
 
 
 def job_schema(*, local=False, refs=False):
@@ -236,6 +314,20 @@ def batch_references(value):
 
 def batch_schema(*, local=False):
     return obj(dict(jobs=array(job_schema(local=local, refs=True), 1, 64), ref=REF), ('jobs',), description='x-batch additionally checks earlier-row references and at most 64 jobs after takes expansion.', **{'x-batch': True})
+
+
+def import_upload():
+    return obj(dict(name=string(255, pattern=r'^[^/\\:\x00-\x1f]+$'),
+                    data_base64=string(MAX_JSON_UPLOAD_BYTES), ref=REF), ('name', 'data_base64'))
+
+
+def import_view():
+    return obj(dict(id=string(80), source=EDITOR_SOURCE, name=string(255), kind=enum(('video', 'audio')),
+        state=enum(('preparing', 'ready', 'failed')), fraction=number(0, 1), reason=nullable(string()),
+        frames=nullable(number(1, integer=True)), fps=number(1), width=nullable(number(0, integer=True)),
+        height=nullable(number(0, integer=True)), preview_width=nullable(number(0, integer=True)),
+        preview_height=nullable(number(0, integer=True)), has_audio=nullable({'type': 'boolean'}),
+        preview=nullable(string()), thumbnail=nullable(string())), ('id', 'source', 'name', 'kind', 'state', 'fraction'))
 
 
 def contracts(*, local=False):
@@ -268,6 +360,9 @@ def contracts(*, local=False):
         ('POST', '/media'): route('Upload image, video or audio content',
             body=obj(dict(name=string(255, pattern=r'^[^/\\:\x00]+$'), data_base64=string(MAX_JSON_UPLOAD_BYTES)),
                      ('name', 'data_base64')), status=201, multipart=True),
+        ('POST', '/imports'): route('Import video or audio into the editing timeline; poll GET /imports until ready',
+            body=import_upload(), status=201, multipart=True, idempotent=True),
+        ('GET', '/imports'): route('List editor imports and preparation progress'),
         ('GET', '/media/{kind}/{file}/file'): route('Download uploaded or derived media'),
         ('POST', '/media/inspect'): route('Inspect media', body=obj(source, ('source',))),
         ('POST', '/media/frame'): route('Extract a video frame', body=obj(dict(source, at=dict(FRAME, default='last')), ('source',)), status=201),
@@ -291,8 +386,8 @@ def contracts(*, local=False):
         ('POST', '/connect/hello'): route('Report a connected client', body=obj(dict(client=string(80),
             via=enum(('mcp', 'http'))), ('client', 'via'))),
         ('GET', '/connect/status'): route('Read recent connection status', auth=False, local=True),
-        ('GET', '/inbox'): route("Wait at most 25 seconds for the user's words or answers in this session",
-            query=obj({'wait': WAIT})),
+        ('GET', '/inbox'): route("Wait at most 50 seconds for the user's words or answers in this session; "
+            "again=true means nothing new yet, call it again", query=obj({'wait': INBOX_WAIT})),
     }
     for name, (method, suffix, summary) in DRAMA_OPERATIONS.items():
         shape = drama_schema(name)
@@ -317,7 +412,14 @@ def contracts(*, local=False):
         if method == 'GET':
             extra['query'] = shape
         else:
-            extra.update(body=shape, idempotent=True, **({'status': 201} if name in ('create', 'generate', 'export') else {}))
+            extra.update(body=shape, idempotent=True, **({'status': 201} if name in ('create', 'generate', 'export', 'listen') else {}))
+        routes[method, suffix] = route(summary, **extra)
+    for name, (method, suffix, summary) in WHITEBOX_OPERATIONS.items():
+        extra = dict(path=obj({'id': WHITEBOX}, ('id',))) if '{id}' in suffix else {}
+        if method == 'GET':
+            extra['query'] = whitebox_schema(name)
+        else:
+            extra.update(body=whitebox_schema(name), status=201)
         routes[method, suffix] = route(summary, **extra)
     for name, (method, suffix, summary) in IMAGE_OPERATIONS.items():
         shape = image_schema(name)
@@ -333,8 +435,34 @@ def contracts(*, local=False):
             body=obj({'ref': REF}), path=obj({'id': PRODUCTION}, ('id',)), auth=False, local=True, idempotent=True)
     for suffix, method, body in (('', 'GET', None), ('/session', 'GET', None), ('/activity', 'GET', None),
             ('/activity/cancel', 'POST', obj({'id': JOB}, ('id',))), ('/connect', 'GET', None),
-            ('/connect/reset', 'POST', EMPTY)):
-        routes[(method, '/freevideo/agent' + suffix)] = route('Studio Agent controls', body=body, auth=False, local=True)
+            ('/connect/reset', 'POST', EMPTY), ('/chat', 'GET', None), ('/chat/now', 'GET', None),
+            ('/chat/video', 'GET', None), ('/chat/list', 'GET', None), ('/chat/new', 'POST', EMPTY),
+            ('/chat/delete', 'POST', obj({'session': SESSION, 'stop': {'type': 'boolean'}}, ('session',))),
+            ('/chat', 'POST', obj({'text': string(8000), 'id': CHAT_ID, 'session': SESSION, 'whitebox': {'type': 'boolean'}}, ('text', 'id'))),
+            ('/chat/confirm', 'POST', obj({'id': string(12, pattern=r'^cf[0-9a-f]{10}$'), 'approve': {'type': 'boolean'},
+                                           'session': SESSION}, ('id', 'approve')))):
+        routes[(method, '/freevideo/agent' + suffix)] = route('Studio Agent controls', body=body, auth=False, local=True,
+            lan=suffix in ('/chat', '/chat/now', '/chat/confirm', '/chat/list', '/chat/new', '/chat/video',
+                           '/activity', '/activity/cancel'))
+    # These existing ComfyUI handlers are registered outside the Agent dispatcher.
+    # /chain is a creation POST; monitoring reads /chains and /chain/{id}.
+    for suffix in ('/freevideo/progress', '/freevideo/chains', '/freevideo/chain/{id}'):
+        routes['GET', suffix] = route('Read generation monitoring', auth=False, lan=True, external=True,
+            query=obj({'client_id': string()}) if suffix != '/freevideo/progress' else EMPTY,
+            **({'path': obj({'id': string()}, ('id',))} if '{id}' in suffix else {}))
+    routes['GET', '/freevideo/agent/activity']['query'] = obj({'cursor': string(80)})
+    routes['GET', '/freevideo/agent/chat']['query'] = obj({'after': number(0, integer=True), 'session': SESSION})
+    routes['GET', '/freevideo/agent/chat/video']['query'] = obj({'id': string(43, pattern=r'^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9a-f]{32}$')}, ('id',))
+    for method, suffix, summary, extra in (
+            ('GET', '/next', 'The page asks for a white-model scene to render', {}),
+            ('GET', '/presets', 'The ready-made white-model scenes the page can try', {}),
+            ('POST', '/try', 'The page renders one ready-made white-model scene (no model writes code)',
+             dict(body=obj(dict(preset=string(32, pattern=r'^[a-z0-9-]{1,32}$'), session=SESSION), ('preset',)))),
+            ('POST', '/{id}/video', 'The page sends the rendered white-model video (the raw mp4 body)',
+             dict(path=obj({'id': WHITEBOX}, ('id',)))),
+            ('POST', '/{id}/failed', 'The page reports that a white-model scene could not be rendered',
+             dict(path=obj({'id': WHITEBOX}, ('id',)), body=obj(dict(message=string(500)), ('message',))))):
+        routes[method, '/freevideo/agent/whitebox' + suffix] = route(summary, auth=False, local=True, **extra)
     for suffix in ('', '/connect'):
         routes['GET', '/freevideo/agent' + suffix]['query'] = obj({'lang': enum(('zh', 'en'))})
     for name, (method, suffix, summary) in SESSION_OPERATIONS.items():
@@ -369,16 +497,24 @@ DRAMA_OPERATIONS = {
 }
 
 
+# The fields are checked when planning; the shape is told here so an agent does not guess it.
+SCREENPLAY = {'type': 'object', 'description': (
+    'characters: {key: {card: cast card ID, or name, look, voice, language}}; '
+    'shots: [{id, seconds, action or prompt, camera, framing, sound, takes, seed, '
+    'cast: [character keys], lines: [{who: character key, line, how}], '
+    'continue: true to carry on from the previous shot}]; also title, style, aspect, quality, music.')}
+
+
 def drama_schema(name):
     if name in ('plan', 'start'):
-        return obj(dict(screenplay={'type': 'object'}, takes_per_shot=number(1, 8, integer=True, default=1),
+        return obj(dict(screenplay=SCREENPLAY, takes_per_shot=number(1, 8, integer=True, default=1),
                         director=enum(('agent', 'builtin'), default='agent'), ref=REF), ('screenplay',))
     if name == 'list':
         return obj(dict(status=enum(('active', 'all'), default='all'), limit=number(1, 200, integer=True, default=50)))
     if name == 'get':
         return obj(dict(since=number(1, integer=True), wait=WAIT))
     if name == 'sheet':
-        return obj(dict(frames=number(2, 24, integer=True, default=6)))
+        return obj(dict(frames=number(2, 24, integer=True, description='Frames per take; default one per second of the take (6 to 24)')))
     if name == 'choose':
         return obj(dict(take=number(1, integer=True), reason=string(20000), cascade={'type': 'boolean'}, ref=REF), ('take',))
     if name == 'reshoot':
@@ -414,11 +550,13 @@ def cast_schema(name, *, local=False):
     if name == 'create':
         return obj(dict(kind=enum(('character', 'setting'), default='character'), **fields, ref=REF), ('name',))
     if name == 'update':
+        fields['images']['items']['properties']['label'] = {'type': 'string'}
         return obj(dict(fields, revision=number(1, integer=True), ref=REF))
     if name == 'delete':
         return obj(dict(revision=number(1, integer=True), ref=REF))
     if name == 'generate':
-        return obj(dict(face=dict(type='boolean', default=False, description='Also make one face close-up.'),
+        return obj(dict(face=dict(type='boolean', default=False, description='Also make one face close-up (video; the image model always does).'),
+                        source=enum(('image', 'video'), description='Defaults to image when the local image model is ready, otherwise video.'),
                         replace=dict(type='boolean', default=False,
                                      description='Replace pictures the user did not add; default fills empty slots.'),
                         revision=number(1, integer=True), ref=REF))
@@ -428,10 +566,29 @@ def cast_schema(name, *, local=False):
     return EMPTY
 
 
+def cast_view():
+    picture = obj(dict(media=obj(dict(file=FILE, url=string(2048)), ('file', 'url')),
+                       by=enum(('user', 'agent', 'builtin')), from_job=JOB, generated={'type': 'boolean'},
+                       label={'type': 'string'}, label_guess={'type': 'boolean'}), ('media', 'by', 'label'))
+    generating = obj(dict(job=JOB, face_job=nullable(JOB), jobs=array(JOB, 1, 5),
+        source=enum(('image', 'video')), replace={'type': 'boolean'}, at=string(),
+        by=enum(('user', 'agent', 'builtin'))), ('job', 'face_job', 'replace', 'at', 'by'))
+    generated = obj(dict(job=JOB, face_job=nullable(JOB), source=enum(('image', 'video')),
+        seed=number(0, 2**53 - 1, integer=True), prompt_version=number(1, integer=True)),
+        ('job', 'face_job', 'seed', 'prompt_version'))
+    return dict(obj(dict(id=CAST, kind=enum(('character', 'setting')), name=string(120),
+        description=nullable(string(1000)), revision=number(1, integer=True),
+        images=array(picture, 0, 6), candidates=array(picture, 0, 6),
+        generating=nullable(generating), generated=nullable(generated),
+        generate_error=nullable(obj(dict(code=string(), job=JOB, message=string(), error_zh=string()), ('code', 'job', 'message')))),
+        ('id', 'kind', 'name', 'revision', 'images', 'candidates', 'generating')), additionalProperties=True)
+
+
 # Image editing sessions: the image editor's version 2 document (web/image_editor_engine.js),
 # changed with the page's commands (web/image_commands.js). Shapes follow the page's
 # own fields (lineHeight, shape width), not the /media/edit recipe's.
 IMAGE = string(34, pattern=r'^i-[0-9a-f]{32}$')
+WHITEBOX = string(12, pattern=r'^wb[0-9a-f]{10}$')
 LAYER_ID = string(128, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')
 COLOR = string(32, pattern=r'^(?:#[0-9A-Fa-f]{3,4}|#[0-9A-Fa-f]{6}|#[0-9A-Fa-f]{8}|transparent)$')
 IMAGE_SIDE = number(1, 8192, integer=True)
@@ -536,6 +693,20 @@ IMAGE_TOOLS = dict(create='freevideo_image_create', get='freevideo_image_read', 
                    operations='freevideo_image_operations', render='freevideo_image_render')
 
 
+WHITEBOX_OPERATIONS = {
+    'submit': ('POST', '/whitebox', 'Send the white-model scene code you wrote (build(THREE), see GET /guide). The user\'s open FreeVideo page renders it to a short video that joins the library.'),
+    'get': ('GET', '/whitebox/{id}', 'Read a white-model scene: waiting, rendering, ready (work = library ID for media.references with early_steps) or failed (error).'),
+}
+WHITEBOX_TOOLS = dict(submit='freevideo_whitebox_submit', get='freevideo_whitebox_read')
+
+
+def whitebox_schema(name):
+    if name == 'submit':
+        return obj(dict(code=string(65536, description='JavaScript that defines build(THREE) and returns {scene, camera, update(t)}.'),
+                        summary=string(500, description='One sentence on what the scene shows, for the confirm card.')), ('code',))
+    return obj({'wait': WAIT})
+
+
 def image_operation_fields():
     """The image commands (IDC): op -> (fields, required, description)."""
     layer_id = LAYER_ID
@@ -609,15 +780,17 @@ def image_schema(name):
 PROJECT_OPERATIONS = {
     'list': ('GET', '/projects', 'List editing projects shared with the editor page. Then get one to read its revision and clip IDs.'),
     'get': ('GET', '/projects/{id}', 'Read a timeline and authenticated source URLs. Read its revision and clip IDs before editing.'),
-    'create': ('POST', '/projects', 'Create an editor timeline. Send a valid editor project with id null and revision 0.'),
+    'create': ('POST', '/projects', 'Create an editor timeline. Send {"project": {"name": "..."}}; the rest of an empty timeline is filled in.'),
     'write': ('PUT', '/projects/{id}', 'Replace a timeline. First get the project and preserve its id and revision; recompute from error.project on project_changed.'),
     'operations': ('POST', '/projects/{id}/operations', 'Apply 1-64 timeline edits atomically and save once. First get revision and clip IDs; on project_changed recompute from error.project, and on clip_busy wait for generation to finish.'),
     'generate': ('POST', '/projects/{id}/generate', 'Make new picture and sound for selected clips or a frame range, as the page Generate does. First get revision and clip IDs; the parts are reserved at once and fill in as the returned job finishes.'),
     'export': ('POST', '/projects/{id}/export', 'Render one saved revision to an MP4 in the saved videos. First get the revision; wait for the returned job, then read its result video.'),
+    'listen': ('POST', '/projects/{id}/listen', 'Listen to the timeline sound for subtitles: mode align times lines you give, transcribe writes down what is said. First get the revision; wait for the returned job, then add the lines with the subtitles edit. Nothing is saved; with no speech model for the language the call fails with no_speech_model, so write the lines by hand.'),
 }
 PROJECT_TOOLS = dict(list='freevideo_projects', get='freevideo_project_read', create='freevideo_project_create',
                      write='freevideo_project_write', operations='freevideo_editor_operations',
-                     generate='freevideo_project_generate', export='freevideo_export')
+                     generate='freevideo_project_generate', export='freevideo_export',
+                     listen='freevideo_project_listen')
 
 SESSION_OPERATIONS = {
     'create': ('POST', '/sessions', 'Create a work conversation for messages and plans shared with the user.'),
@@ -663,6 +836,8 @@ def session_event(*, stored=False, agent_only=False):
         obj(dict(type={'const': 'plan'}, shots=array(obj(dict(text=text, seconds=number(0)), ('text',)),
             1, 20000), total_seconds=number(0)), ('type', 'shots'))]
     if not agent_only:
+        variants[0]['properties']['mid'] = CHAT_ID
+        variants[0]['properties']['whitebox'] = {'type': 'boolean', 'description': 'The user chose a white-model preview for this request.'}
         from .errors import ERRORS
         variants += [obj(dict(type={'const': 'step'}, id=string(12, pattern=r'^st[0-9a-f]{10}$'),
             tool=string(200), summary=text, state=enum(('started', 'done', 'failed')),
@@ -672,6 +847,8 @@ def session_event(*, stored=False, agent_only=False):
             obj(dict(type={'const': 'confirm'}, id=string(12, pattern=r'^cf[0-9a-f]{10}$'),
                 question=text, estimate_seconds=number(0), state=enum(('asked', 'approved', 'declined')),
                 action=enum(('start', 'reshoot')), refs=obj(dict(drama=PRODUCTION, shot=SLUG)),
+                whitebox=obj(dict(work=SAVED, seconds=number(0), summary=text), ('work',),
+                             description='The rendered white-model preview the user is asked to approve.'),
                 digest=string(64, pattern=r'^[0-9a-f]{64}$')),
                 ('type', 'id', 'state'), **{'if': {'properties': {'state': {'const': 'asked'}}},
                                         'then': {'required': ['question']}}),
@@ -702,7 +879,9 @@ def session_schema(name):
 
 def project_schema(name):
     if name in ('create', 'write'):
-        return obj(dict(project={'type': 'object', 'description': 'The editor page project record; validated by the shared editor save.'}, ref=REF), ('project',))
+        text = ('A new timeline: {"name": "..."} is enough (width and height if not 1344x768); the rest is filled in. Add clips with insert operations afterwards.'
+                if name == 'create' else 'The whole project record as you read it, with your changes; validated by the shared editor save.')
+        return obj(dict(project={'type': 'object', 'description': text}, ref=REF), ('project',))
     ids = array(CLIP, 1, 500)
     revision = number(1, integer=True, description='The saved revision you read; a later save returns project_changed.')
     if name == 'generate':
@@ -718,10 +897,12 @@ def project_schema(name):
                         settings=settings, ref=REF), ('revision', 'target'))
     if name == 'export':
         return obj(dict(revision=revision, ref=REF), ('revision',))
+    if name == 'listen':
+        return obj(dict(revision=revision, **LISTEN_FIELDS, ref=REF), ('revision', 'mode'))
     if name != 'operations':
         return EMPTY
     fields = {
-        'insert': (dict(source=EDITOR_SOURCE, at=EDITOR_FRAME), ('source',), 'Insert picture and sound from a source. Omit at to append at the timeline end.'),
+        'insert': (dict(source=EDITOR_SOURCE, at=EDITOR_FRAME), ('source',), 'Insert picture and sound from a source. Omit at to append at the timeline end. A work brings the description it was generated from. Then write the new picture clip\'s note.'),
         'split': (dict(clip_ids=ids, frame=EDITOR_FRAME), ('clip_ids', 'frame'), 'Cut selected clips and their linked partners. The frame must be inside a selected segment.'),
         'trim': (dict(clip_ids=ids, frame=EDITOR_FRAME, edge=enum(('start', 'end'))), ('clip_ids', 'frame', 'edge'), 'Trim a selected edge at the frame. The frame must be inside a selected segment.'),
         'remove': (dict(clip_ids=ids), ('clip_ids',), 'Remove selected clips and linked partners. Use clip IDs from this revision.'),
@@ -731,7 +912,11 @@ def project_schema(name):
         'move': (dict(clip_ids=ids, frames=number(-10**7, 10**7, integer=True)), ('clip_ids', 'frames'), 'Move selected clips by a signed relative frame offset. Use clip IDs from this revision; linked partners move together.'),
         'describe': (dict(clip_ids=ids, text=dict(type='string', maxLength=8000)), ('clip_ids', 'text'), 'Set the description of selected clips. Use clip IDs from this revision and one paragraph of text.'),
         'set_ref': (dict(clip_ids=ids, ref=dict(type='string', maxLength=128, pattern=r'^[A-Za-z0-9_-]{0,128}$')), ('clip_ids', 'ref'), 'Set an outside shot reference on selected clips. Use clip IDs from this revision; an empty ref removes it.'),
+        'note': (dict(clip_ids=ids, text=dict(type='string', maxLength=400)), ('clip_ids', 'text'), 'Write the one line the user sees under selected picture clips; without it they see the start of the generation text. Do it after you add, generate or change a clip: in the user\'s language, what is in the picture, subject first ("Train through morning mist"); a short clip shows only the first few characters. Not the clip\'s position (opening, part 2) and not its progress. Up to 120 characters on one line; an empty text removes it. It never changes the description used for generation.'),
         'use_version': (dict(clip_id=CLIP, index=number(0, 49, integer=True)), ('clip_id', 'index'), 'Restore a stored clip version. First get the clip ID and its versions array; index is zero based.'),
+        'subtitles': (dict(cues=array(obj(dict(start=EDITOR_FRAME, frames=number(1, 10**7, integer=True), text=dict(type='string', minLength=1, maxLength=400)),
+                                         ('start', 'frames', 'text')), 1, 500), replace=dict(type='boolean')), ('cues',),
+                      'Add subtitle lines as one undo step on the subtitle track (created if missing). Each cue is a start frame, a length in frames and one or two lines of text; cues may not overlap each other or lines already there. replace: true swaps the whole track.'),
     }
     operations = [obj(dict(op={'const': op}, **props), ('op', *required), description=description)
                   for op, (props, required, description) in fields.items()]
@@ -759,8 +944,8 @@ def drama_route_table():
 CAST_REFERENCE = {'enum': [None, 'cards', 'partial', 'missing', 'inherited', 'own'],
                   'description': 'How the shot carries cast cards: cards; partial (cast_omitted did not fit at all, or '
                                  'cast_voice_omitted came without their voice); missing '
-                                 '(a card was deleted, cast_missing shoot from text); inherited (continues the '
-                                 'previous shot); own (the shot names its own first frame or references); null.'}
+                                 '(a card was deleted, cast_missing shoot from text); inherited (a film made before continuing '
+                                 'shots carried cards); own (the shot names its own first frame or references); null.'}
 
 
 def production_response():
@@ -792,6 +977,7 @@ def production_response():
             cast_reference=CAST_REFERENCE, cast_omitted=dict(type='array', items=string()),
             cast_voice_omitted=dict(type='array', items=string()),
             cast_missing=dict(type='array', items=string()),
+            cast_pictures_each=dict(type=['integer', 'null'], description='Most pictures one person carries in this shot: two (the sheet of every view and the face close-up), or one each when a continuing shot has several people.'),
             takes=dict(type='array', items=dict(type='object', properties=dict(take=number(1, integer=True), job=REF,
                 task={'oneOf': [JOB, {'type': 'null'}]}, generation=number(0, integer=True), seed=number(0, integer=True),
                 stale={'type': 'boolean'}, error={'type': ['object', 'null']},
@@ -874,7 +1060,7 @@ def issues(schema, value, path='', *, refs=False):
     if 'if' in schema:
         rule = schema.get('then', True) if not issues(schema['if'], value) else schema.get('else', True)
         errors += issues(rule, value, path)
-    if 'not' in schema and not issues(schema['not'], value):
+    if 'not' in schema and not schema.get('x-derived') and not issues(schema['not'], value):
         errors.append(diagnostic(path, 'a permitted field combination', value))
     if 'oneOf' in schema or 'anyOf' in schema:
         # Structural unions choose the most specific applicable branch, then
@@ -981,9 +1167,15 @@ def cross_issues(schema, value, path):
         if flags['clip'] and item.get('end') is not None and item['end'] <= item.get('start', 0):
             bad('end', 'later than start', item['end'])
     kind = schema.get('x-job-kind')
+    if kind == 'image':
+        if value.get('people') and value.get('images'):
+            bad('images', 'omitted when people is supplied', value['images'])
+        if value.get('scene_image') and not value.get('people'):
+            bad('scene_image', 'omitted unless people is supplied', value['scene_image'])
     if kind == 'generate':
-        if value.get('continue_from') and value.get('media'):
-            bad('media', 'omitted when continue_from is supplied', value['media'])
+        if value.get('continue_from') and isinstance(value.get('media'), dict) and any(
+                v is not None for k, v in value['media'].items() if k != 'references'):
+            bad('media', 'only references when continue_from is supplied', value['media'])
         if value.get('refine_from') is None:
             custom = value.get('sampling', {})
             two, base, refine = QUALITY[value.get('quality', 'light')]
@@ -993,6 +1185,8 @@ def cross_issues(schema, value, path):
                 validate_steps(base, refine, two)
             except ValueError:
                 bad('sampling', 'two-pass refine_steps=3 or refine_steps below base_steps', custom)
+            if value.get('preview') and two and base != 8:
+                bad('sampling', 'base_steps=8 for a preview, the only first-pass count that runs two-pass', custom)
     if kind == 'vlm':
         rows = value['questions'] if isinstance(value['questions'], list) else [value['questions']]
         count = sum(len(r.get('images', [])) + (r.get('video', {}).get('frames', 6) if isinstance(r.get('video'), dict)
@@ -1123,12 +1317,14 @@ def schemas():
     return dict(api_version=API_VERSION, job=dict(job_schema(), **{'$schema': S, '$defs': {
         k: f() for k, f in KINDS.items()}}), batch=batch_schema(), production=drama_schema('start'),
         drama={name: drama_schema(name) for name in DRAMA_OPERATIONS}, production_view=production_response(),
-        cast={name: cast_schema(name) for name in CAST_OPERATIONS},
+        cast={name: cast_schema(name) for name in CAST_OPERATIONS}, cast_view=cast_view(),
         projects={name: project_schema(name) for name in PROJECT_OPERATIONS},
+        imports=dict(upload=import_upload(), item=import_view()),
         images={name: image_schema(name) for name in IMAGE_OPERATIONS},
+        whitebox={name: whitebox_schema(name) for name in WHITEBOX_OPERATIONS},
         sessions=dict(event=session_event(stored=True), meta=session_view(),
                       **{name: session_schema(name) for name in SESSION_OPERATIONS}),
-        confirmations=confirm_settings())
+        confirmations=confirm_settings(), image_result=image_result())
 
 
 def openapi():
@@ -1147,6 +1343,8 @@ def openapi():
             content = {'application/json': {'schema': deepcopy(contract['body'])}}
             if contract.get('multipart'):
                 content['multipart/form-data'] = {'schema': obj({'file': {'type': 'string', 'format': 'binary'}}, ('file',))}
+                if suffix == '/imports':
+                    content['multipart/form-data']['schema']['properties']['ref'] = REF
             operation['requestBody'] = dict(required=not contract.get('optional_body', False), content=content)
         operation['parameters'] = [dict(name=k, **{'in': 'query'}, required=k in contract['query'].get('required', []), schema=v)
                                    for k, v in contract['query']['properties'].items()]
@@ -1167,11 +1365,17 @@ def openapi():
         elif suffix == '/jobs' and method == 'GET':
             response_schema = obj({'jobs': {'type': 'array', 'items': {'$ref': '#/components/schemas/Job'}}})
         elif suffix in ('/jobs/{id}', '/jobs/{id}/cancel', '/jobs/{id}/resume'):
-            response_schema = {'$ref': '#/components/schemas/Job'}
+            response_schema = {'$ref': '#/components/schemas/JobAnswer'}
         elif '/drama/{id}' in suffix and not suffix.endswith('/sheet') or suffix == '/drama' and method == 'POST':
             response_schema = production_response()
         elif suffix == '/confirmations':
             response_schema = obj(confirm_settings()['properties'], ('start', 'reshoot_seconds'))
+        elif suffix in ('/cast', '/freevideo/agent/cast') and method == 'POST' or (
+                suffix in ('/cast/{id}', '/freevideo/agent/cast/{id}') and method in ('GET', 'PATCH')):
+            response_schema = {'$ref': '#/components/schemas/CastCard'}
+        elif suffix in ('/cast/{id}/generate', '/freevideo/agent/cast/{id}/generate'):
+            response_schema = obj(dict(job=JOB, jobs=array(JOB, 1, 5),
+                                       card={'$ref': '#/components/schemas/CastCard'}), ('job', 'jobs', 'card'))
         elif suffix.startswith('/sessions'):
             response_schema = (obj(dict(events=array(session_event(stored=True), 0, 500),
                 last_seq=number(0, integer=True), stopped={'type': 'boolean'}), ('events', 'last_seq', 'stopped'))
@@ -1181,6 +1385,9 @@ def openapi():
                 if suffix == '/sessions' and method == 'GET' else session_view())
         elif suffix.endswith('/events'):
             content_type, response_schema = 'text/event-stream', {'type': 'string'}
+        elif suffix == '/imports':
+            response_schema = obj({'import': import_view()}, ('import',)) if method == 'POST' else obj(
+                {'items': array(import_view())}, ('items',))
         elif suffix == '/editor/sources/content':
             content_type, response_schema = 'application/octet-stream', {'type': 'string', 'format': 'binary'}
         elif suffix.endswith('/file') or suffix.endswith('/thumbnail'):
@@ -1197,22 +1404,35 @@ def openapi():
         if suffix == '/connect' and method == 'GET':
             success['content']['text/plain'] = {'schema': {'type': 'string'}}
         paths.setdefault(path, {})[method.lower()] = operation
+    job_view = {'type': 'object', 'properties': dict(id=JOB, kind=enum(KINDS),
+        status=enum(('waiting', 'queued', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled', 'interrupted')),
+        chain_id=string(), last_heartbeat_at={'type': ['string', 'null']}, poll_after_ms={'type': ['integer', 'null']},
+        cancelled_by=enum(('user',), description='Present when the user stopped this job on the page.'),
+        next=string(description='Instructions for the agent after a user stop.'),
+        spec={'type': 'object'}, progress={'type': 'object'}, result={'type': 'object'},
+        waiting_for=array(string()), notice=string(),
+        error={'$ref': '#/components/schemas/Error'})}
+    job_view['allOf'] = [{'if': {'required': ['kind'], 'properties': {'kind': {'const': 'image'}}},
+                         'then': {'properties': {'result': image_result()}}}]
     return dict(openapi='3.1.0', info=dict(title='FreeVideo Agent API', version=str(API_VERSION)), paths=paths,
         components=dict(securitySchemes={'bearer': {'type': 'http', 'scheme': 'bearer'},
             'page': {'type': 'apiKey', 'in': 'cookie', 'name': 'freevideo_agent_page'}}, schemas={
             'Session': session_view(), 'SessionEvent': session_event(stored=True),
-            'JobSpec': schemas()['job'], 'Batch': batch_schema(),
-            'Job': {'type': 'object', 'properties': dict(id=JOB, kind=enum(KINDS),
-                status=enum(('waiting', 'queued', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled', 'interrupted')),
-                chain_id=string(), last_heartbeat_at={'type': ['string', 'null']}, poll_after_ms={'type': ['integer', 'null']},
-                spec={'type': 'object'}, progress={'type': 'object'}, result={'type': 'object'},
-                error={'$ref': '#/components/schemas/Error'})},
+            'JobSpec': schemas()['job'], 'ImageResult': image_result(), 'CastCard': cast_view(),
+            'Batch': batch_schema(), 'Job': job_view,
+            # One job answers the way a submission does: the same job is also under 'job'.
+            'JobAnswer': dict(job_view, properties=dict(job_view['properties'], job={'$ref': '#/components/schemas/Job'})),
             'Submitted': obj(dict(job={'$ref': '#/components/schemas/Job'},
                 jobs={'type': 'array', 'items': {'$ref': '#/components/schemas/Job'}})),
             'Error': obj(dict(code=enum(ERRORS),
                 message=string(), details={'type': 'array'}, next=string(), retryable={'type': 'boolean'},
+                reason=obj(dict(en=string(), zh=string()), ('en', 'zh'),
+                           description='Fixed bilingual reason for an image failure.'),
+                report_id={'type': ['string', 'null'], 'pattern': '^[0-9a-f]{32}$',
+                           'description': 'Image diagnostic report ID, or null when no report exists.'},
                 request_id=string(), docs=string(), retry_after_seconds=number(0), card={'type': 'object'}, job=JOB,
-                project={'type': 'object'}, current_revision=number(1, integer=True)),
+                project={'type': 'object'}, current_revision=number(1, integer=True),
+                error_zh=string()),
                 ('code', 'message', 'details', 'retryable', 'request_id', 'docs'))}))
 
 
@@ -1223,6 +1443,7 @@ TOOL_ENDPOINTS = {
     'freevideo_job': ('GET', '/jobs/{id}'), 'freevideo_wait': ('GET', '/jobs/{id}'),
     'freevideo_jobs': ('GET', '/jobs'), 'freevideo_cancel': ('POST', '/jobs/{id}/cancel'),
     'freevideo_resume': ('POST', '/jobs/{id}/resume'), 'freevideo_add_media': ('POST', '/media'),
+    'freevideo_import_media': ('POST', '/imports'), 'freevideo_imports': ('GET', '/imports'),
     'freevideo_edit_image': ('POST', '/media/edit'), 'freevideo_library': ('GET', '/library'),
 }
 TOOL_ENDPOINTS.update({'freevideo_drama_' + name: (method, suffix)
@@ -1231,12 +1452,14 @@ TOOL_ENDPOINTS.update({'freevideo_cast_' + name: (method, suffix)
     for name, (method, suffix, _) in CAST_OPERATIONS.items()})
 TOOL_ENDPOINTS.update({PROJECT_TOOLS[name]: (method, suffix)
     for name, (method, suffix, _) in PROJECT_OPERATIONS.items()})
+TOOL_ENDPOINTS.update({WHITEBOX_TOOLS[name]: (method, suffix)
+    for name, (method, suffix, _) in WHITEBOX_OPERATIONS.items()})
 TOOL_ENDPOINTS.update({IMAGE_TOOLS[name]: (method, suffix)
     for name, (method, suffix, _) in IMAGE_OPERATIONS.items()})
 TOOL_ENDPOINTS.update({SESSION_TOOLS[name]: SESSION_OPERATIONS[name][:2]
                        for name in SESSION_TOOLS if name != 'post'})
 TOOL_KINDS = dict(freevideo_generate='generate', freevideo_assemble='assemble',
-                  freevideo_ask='vlm', freevideo_enhance_prompt='enhance')
+                  freevideo_ask='vlm', freevideo_enhance_prompt='enhance', freevideo_generate_image='image')
 
 
 SESSION_ARGUMENT = dict(type='string', pattern='^s[0-9a-f]{12}$',
@@ -1343,6 +1566,8 @@ def _tool_schema(name):
         kind = TOOL_KINDS.get(name, 'generate')
         value = KINDS[kind](local=True)
         value['properties'].pop('kind')
+        if kind == 'image':
+            value.pop('allOf')  # Said in the field descriptions instead; the job is still checked when submitted.
         value['required'] = [k for k in value.get('required', []) if k != 'kind']
         if name != 'freevideo_plan':
             value['properties']['wait'] = dict(CLIENT_WAIT, default=0 if kind == 'generate' else 25)
@@ -1355,6 +1580,8 @@ def _tool_schema(name):
             return batch_schema(local=True)
         if name == 'freevideo_add_media':
             return obj({'path': string(4096)}, ('path',))
+        if name == 'freevideo_import_media':
+            return obj(dict(path=string(4096), ref=REF), ('path',))
         if '{id}' in suffix:
             value['properties']['id'] = contract.get('path', {}).get('properties', {}).get('id', JOB)
             value['required'] = list(value.get('required', [])) + ['id']
@@ -1363,7 +1590,7 @@ def _tool_schema(name):
             value['required'].append('shot')
         if name == 'freevideo_wait':
             value['properties'].pop('wait')
-            value['properties']['timeout'] = CLIENT_WAIT
+            value['properties']['timeout'] = number(0, 50, default=25, description='With id at most 25 seconds; without id (the user) up to 50, default 50.')
             value['required'] = [k for k in value['required'] if k != 'id']
         return value
     if name == 'freevideo_asset':

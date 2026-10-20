@@ -44,6 +44,13 @@ def _scheduler_class():
                 sigmas = self._shift * base / (1 + (self._shift - 1) * base)
             super().set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
 
+        def step(self, model_output, timestep, sample, return_dict=True):
+            # Read-only: the frame preview looks at the prediction, then the
+            # upstream update runs exactly as before.
+            from .frame_preview import observe
+            observe(model_output, timestep, sample)
+            return super().step(model_output, timestep, sample, return_dict=return_dict)
+
     return Scheduler
 
 

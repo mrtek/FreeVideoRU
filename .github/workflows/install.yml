@@ -1,14 +1,8 @@
 name: Installation and launchers
-# Every merge to main publishes the rolling nightly (Windows unsigned, Mac not notarized, Linux AppImage).
-# Users get an update only from a stable vX.Y.Z release, published by running this
-# workflow with "release" checked; Windows signing then waits for the release environment.
+# Pull requests run the installation checks. The launchers are built and published only when this
+# workflow is run with "release" checked: main becomes the stable release vX.Y.Z and users get an
+# update notice; Windows signing then waits for the release environment. A merge to main builds nothing.
 on:
-  push:
-    branches: [main]
-    # A change to the workflows alone does not publish a new Windows build.
-    paths-ignore:
-      - '**/*.md'
-      - '.github/**'
   pull_request:
     paths-ignore:
       - '**/*.md'
@@ -69,8 +63,8 @@ jobs:
           fi
           echo "Publishing v$version"
   windows:
-    # Build once, after merging; pull requests run the installation checks only.
-    if: github.event_name != 'pull_request'
+    # Built only for a release; pull requests run the installation checks only.
+    if: github.event_name == 'workflow_dispatch' && inputs.release
     needs: [installation]
     runs-on: windows-2025
     timeout-minutes: 60
@@ -82,7 +76,7 @@ jobs:
     env:
       PYTHONUTF8: '1'
       PYTHONIOENCODING: utf-8
-      FREEVIDEO_RELEASE_TRACK: ${{ github.event_name == 'workflow_dispatch' && inputs.release && 'stable' || 'nightly' }}
+      FREEVIDEO_RELEASE_TRACK: stable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -197,14 +191,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
   macos:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' && inputs.release
     needs: [installation]
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
       contents: read
     env:
-      FREEVIDEO_RELEASE_TRACK: ${{ github.event_name == 'workflow_dispatch' && inputs.release && 'stable' || 'nightly' }}
+      FREEVIDEO_RELEASE_TRACK: stable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -250,7 +244,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
   linux:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'workflow_dispatch' && inputs.release
     needs: [installation]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -259,7 +253,7 @@ jobs:
     # glibc 2.34, the oldest PySide6 6.11 supports: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 9 and newer.
     container: quay.io/pypa/manylinux_2_34_x86_64:2026.10.03-1@sha256:e4ca528d41ab66b3654110295d7a2c7bfa599ddbb6efb269ec21f7f73b88f1b6
     env:
-      FREEVIDEO_RELEASE_TRACK: ${{ github.event_name == 'workflow_dispatch' && inputs.release && 'stable' || 'nightly' }}
+      FREEVIDEO_RELEASE_TRACK: stable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the libraries Qt loads, and those bundled for desktops that lack them
@@ -311,7 +305,7 @@ jobs:
           retention-days: 1
   publish:
     # Release assets use Releases storage, not the Actions artifact quota.
-    if: github.event_name != 'pull_request' && github.repository == 'FlashML-org/FreeVideo' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && inputs.release && github.repository == 'FlashML-org/FreeVideo' && github.ref == 'refs/heads/main'
     needs: [windows, macos, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -339,5 +333,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: >-
-          python scripts/publish_release.py --track ${{ github.event_name == 'workflow_dispatch' && inputs.release && 'stable' || 'nightly' }}
+          python scripts/publish_release.py --track stable
           --windows build/windows --macos build/macos --linux build/linux --sha ${{ github.sha }}

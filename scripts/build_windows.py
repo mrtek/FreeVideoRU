@@ -16,6 +16,8 @@ from freevideo_engine.desktop_runtime import check_launcher_dependencies, packag
 from freevideo_engine.launcher_update import REPOSITORY, CHANNEL, TRACKS
 from freevideo_engine.release_notes import catalog, markdown
 from scripts.build_launcher_notices import collect as collect_notices
+from scripts.prune_qt_bundle import prune_qt_bundle, write_prune_report
+from scripts.deduplicate_bundle_data import deduplicate_bundle_data, write_data_report
 
 
 def release_track():
@@ -96,6 +98,54 @@ VSVersionInfo(
     return path
 
 
+def build_pyinstaller(command, out, *, onefolder):
+    # Windows onefile has no tree to prune after EXE: use exactly the same
+    # globs on Analysis TOCs before PyInstaller writes its compressed archive.
+    # Generate the usual spec so all bootloader/version/manifest defaults stay
+    # those of the pinned PyInstaller, then insert only our build-time filter.
+    options, i = [], 3
+    while i < len(command):
+        option = command[i]
+        if option in ('--distpath', '--workpath'):
+            i += 2
+            continue
+        if option != '--noconfirm':
+            options.append(option)
+        i += 1
+    if not onefolder:
+        options += ['--runtime-hook', str(ROOT / 'scripts/pyi_rth_bundle_data.py')]
+    subprocess.run([sys.executable, '-m', 'PyInstaller.utils.cliutils.makespec', *options], cwd=ROOT, check=True)
+    spec = out / 'FreeVideo.spec'
+    from scripts.source_build import spec_hook
+    injection = spec_hook(ROOT, out / 'engine-source', out / 'launcher-build.json')
+    if not onefolder:
+        pruning = f'''
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+from scripts.prune_qt_bundle import prune_qt_toc, write_prune_report
+from scripts.deduplicate_bundle_data import deduplicate_toc, write_data_report
+a.binaries, removed_binaries = prune_qt_toc(a.binaries)
+a.datas, removed_data = prune_qt_toc(a.datas)
+write_prune_report({str(out)!r}, dict(files=removed_binaries['files'] + removed_data['files'],
+    bytes=removed_binaries['bytes'] + removed_data['bytes']))
+'''
+        injection = pruning + injection + f'''
+a.datas, deduplicated = deduplicate_toc(a.datas, {str(out)!r})
+write_data_report({str(out)!r}, deduplicated)
+'''
+    text = spec.read_text(encoding='utf-8')
+    if text.count('pyz = PYZ(') != 1:
+        raise ValueError('Unexpected PyInstaller spec layout')
+    spec.write_text(text.replace('pyz = PYZ(', injection + '\npyz = PYZ('), encoding='utf-8')
+    subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm',
+                    '--distpath', str(out / 'dist'), '--workpath', str(out / 'build'), str(spec)],
+                   cwd=ROOT, check=True)
+    if onefolder:
+        dist = out / 'dist/FreeVideo'
+        write_prune_report(out, prune_qt_bundle(dist))
+        write_data_report(out, deduplicate_bundle_data(dist))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
@@ -142,7 +192,7 @@ def main():
         '--exclude-module', 'torch', '--exclude-module', 'triton', '--exclude-module', 'numpy',
         '--exclude-module', 'transformers', '--exclude-module', 'tkinter',
         str(ROOT / 'scripts/windows_app.py')]
-    subprocess.run(command, cwd=ROOT, check=True)
+    build_pyinstaller(command, out, onefolder=args.onefolder)
     executable = out / 'dist' / ('FreeVideo/FreeVideo.exe' if args.onefolder else 'FreeVideo.exe')
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     (executable.parent / 'SHA256SUMS.txt').write_text(digest + '  FreeVideo.exe\n', encoding='utf-8')

@@ -5,6 +5,11 @@ const clockDefault = {now: () => Date.now(), setTimeout: (fn, ms) => setTimeout(
 const copy = value => structuredClone(value);
 const memoryProjects = new Map();
 const errorFor = response => Object.assign(new Error('editor_request'), {status: response.status});
+// A failed save keeps the server's reason so the page can say what went wrong.
+async function saveFailure(response) {
+    let body = null; try { body = await response.json(); } catch {}
+    return Object.assign(errorFor(response), body && typeof body === 'object' ? {reason: body.reason, response: body} : {});
+}
 const post = value => ({method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(value)});
 export const sourceKey = source => source ? `${source.kind}:${source.id}` : null;
 import {chainRoute, createPoller, interpolate, capabilityPoints} from './chain_support.js';
@@ -57,7 +62,7 @@ export function createSaveQueue({write, read, onSaved = () => {}, onConflict = (
     initial = null, getRecord = null, copySuffix = ' (copy)', session = null, create = null, attempt: resumedAttempt = null}) {
     const owner = session || holdSession();
     let pending = null, inFlight = null, timer = null, heartbeat = null, meta = null, retry = 0, disposed = false;
-    let memory = false, memoryNoticed = false, lastSaved = initial && copy(initial), failed = false, copied = false, retained = false;
+    let memory = false, memoryNoticed = false, lastSaved = initial && copy(initial), failed = false, failure = null, copied = false, retained = false;
     let createOperation = create || (initial?.id ? null : operationId());
     let attempt = resumedAttempt && copy(resumedAttempt);
     const localKey = owner.session;
@@ -108,7 +113,7 @@ export function createSaveQueue({write, read, onSaved = () => {}, onConflict = (
                     }
                     attempt = null; pending = {...latest, ...meta}; retain(pending); retry = 0; return;
                 }
-                if (!response.ok) throw errorFor(response);
+                if (!response.ok) throw await saveFailure(response);
                 const saved = (await response.json()).project;
                 if (disposed) return;
                 attempt = null;
@@ -119,7 +124,7 @@ export function createSaveQueue({write, read, onSaved = () => {}, onConflict = (
                 if (pending) retain({...pending, ...meta});
                 else { saveOutbox(localKey, null); retained = false; clock.clearTimeout(heartbeat); heartbeat = null; }
             } catch (error) {
-                failed = true;
+                failed = true; failure = error;
                 if (!disposed) {
                     retain({...(pending || sent), ...(meta || {})});
                     schedule(Math.min(30000, 1000 * 2 ** retry++)); onError(error);
@@ -154,6 +159,8 @@ export function createSaveQueue({write, read, onSaved = () => {}, onConflict = (
         get recovery() { return {project: copy({...(pending || attempt?.project), ...(meta || {})}), baseline: copy(lastSaved), create: createOperation, attempt: copy(attempt)}; },
         dispose({discard = false} = {}) { disposed = true; clock.clearTimeout(timer); timer = null; clock.clearTimeout(heartbeat); heartbeat = null; if (discard) saveOutbox(localKey, null); if (!session) owner.dispose(); },
         get dirty() { return !!pending || !!attempt || !!inFlight; },
+        // Why the last write failed, while that failure still stands.
+        get failure() { return failed ? failure : null; },
         get locallyRetained() { return retained; },
     };
 }
@@ -172,6 +179,24 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
     let generationAvailable = false, generationGone = false, generationProbe = null, generationRetry = null, generationAttempts = 0;
     let disposed = false; const uploads = new Set();
     const session = holdSession();
+    let activeProject = null, sessionTimer = null, sessionWrites = Promise.resolve();
+    // A stalled lease request is cut off so opening, switching and closing never wait on it.
+    async function lease(body, extra = {}) {
+        const controller = new AbortController(), timer = clock.setTimeout(() => controller.abort(), 8000);
+        try { await json('/freevideo/editor/project/session', {...post(body), ...extra, signal: controller.signal}); }
+        finally { clock.clearTimeout(timer); }
+    }
+    function activateProject(id) {
+        clock.clearTimeout(sessionTimer); sessionTimer = null;
+        const previous = activeProject; activeProject = id;
+        sessionWrites = sessionWrites.catch(() => {}).then(async () => {
+            // A failed release must not skip registering the edit that is already open.
+            if (previous && previous !== id) await lease({id: previous, session: session.session, release: true}, {keepalive: true}).catch(() => {});
+            if (id) await lease({id, session: session.session});
+        });
+        if (id && !disposed) sessionTimer = clock.setTimeout(() => { activateProject(activeProject).catch(() => {}); }, 20000);
+        return sessionWrites;
+    }
     const notice = (key, en, zh) => { if (!once.has(key)) { once.add(key); notify(t(en, zh)); } };
     const request = (path, options) => api.fetchApi(path, options);
     async function json(path, options, fallback = null) {
@@ -192,9 +217,14 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
         if (query.id) return copy(memoryProjects.get(query.id) || (query.id === 'memory' ? memoryProjects.get('memory') : null));
         return copy([...memoryProjects.values()].find(record => record.tracks[0].clips[0]?.source?.id === query.work) || null);
     }
-    function watch(read, deliver) {
-        const poller = createPoller(read, deliver, {clock, interval: pollMs}); pollers.add(poller);
-        return () => { poller.dispose(); pollers.delete(poller); };
+    // lost: called once after three reads in a row fail; the watch then stops.
+    function watch(read, deliver, lost = null) {
+        let failures = 0, poller = null;
+        const stop = () => { poller?.dispose(); pollers.delete(poller); };
+        poller = createPoller(async () => { const value = await read(); failures = 0; return value; }, deliver, {clock, interval: pollMs,
+            onError: error => { if (lost && ++failures >= 3) { stop(); lost(error); } }});
+        pollers.add(poller);
+        return stop;
     }
     function generationAbsent() {
         generationGone = true; generationRetry?.dispose();
@@ -209,14 +239,28 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
         pollers.add(retry);
     }
     // Optional adapter (or factory): startChain, owns, chain, chainAction, and
-    // optional restoreSources. Production callers provide none.
+    // optional restoreSources and generationAvailable/generationReady readiness
+    // hooks for a delayed test generator. Production callers provide none.
     const standIn = typeof injected === 'function'
         ? injected({clock, sources, request: json, mediaURL: value => mediaURL(api, value)}) : injected;
     const store = {
         sources, cache,
-        get generationAvailable() { return !!standIn || generationAvailable; },
+        activateProject,
+        get uploading() { return uploads.size > 0; },
+        async deleteProject(id) {
+            await sessionWrites;
+            const response = await request('/freevideo/editor/project/delete', post({id, session: session.session}));
+            if (!response.ok) throw await saveFailure(response);
+            memoryProjects.delete(id);
+            if (activeProject === id) { activeProject = null; clock.clearTimeout(sessionTimer); sessionTimer = null; }
+        },
+        get generationAvailable() { return standIn ? standIn.generationAvailable ?? true : generationAvailable; },
+        // The server said for certain it cannot generate (not just a missed answer that is asked again).
+        get generationGone() { return !standIn && generationGone; },
         generationReady() {
-            if (standIn) return Promise.resolve(true);
+            if (standIn) return standIn.generationReady
+                ? Promise.resolve(standIn.generationReady(ready => { if (!disposed) onGenerationReady(ready); }))
+                : Promise.resolve(true);
             if (generationAvailable || generationGone || disposed) return Promise.resolve(generationAvailable);
             // Generating stays off until the list of long videos answers in its
             // expected shape. One bounded request at a time, shared by concurrent
@@ -290,12 +334,13 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
                 onSaved: (record, memory, local) => {
                     memoryProjects.set(record.id || local, copy({...state.record, id: record.id, revision: record.revision}));
                     state.adopt({id: record.id, revision: record.revision});
+                    if (record.id && record.id !== activeProject) activateProject(record.id).catch(() => {});
                     try { localStorage.setItem('fv-editor-last', record.id || local); } catch {}
                     if (memory) memoryProjects.set(record.id || local, copy(state.record));
                 },
                 onConflict: (record, nameSuffix) => { state.adopt({id: null, revision: 0, nameSuffix}); },
                 onCopied: () => notice('conflict', 'This edit changed elsewhere. Your changes here were saved as a copy.', '这条剪辑在别处改过，这里的改动已存为副本'),
-                onMemory: () => notice('memory', 'Changes are kept in this page. Restart after updating to save them to disk.', '改动暂存在这个页面里，更新后重启即可保存到磁盘。'),
+                onMemory: () => notice('memory', 'Changes are kept in this page for now. Update and restart to save them.', '改动暂存在这个页面里，更新并重启后会保存。'),
                 // Automatic retries stay quiet; switching away while unsaved warns in editor.js.
                 onError: () => {}});
             const reset = queue.reset;
@@ -391,6 +436,18 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
             // these limits; only the callback publishes a measured capability.
             read(); return fallback;
         },
+        // The longest single part this computer makes at a size other than the edit's; null when it cannot be told.
+        async requestFrames(size, settings) {
+            try {
+                for (let tries = 0; tries < 5 && !disposed; tries++) {
+                    const reply = await json('/freevideo/capabilities?' + new URLSearchParams(size));
+                    if (reply?.status !== 'computing') return !reply || (reply.status && reply.status !== 'ready') ? null
+                        : capabilityPoints(reply, {...size, settings}).maxRequestFrames;
+                    await new Promise(done => clock.setTimeout(done, 1000));
+                }
+            } catch { /* not known */ }
+            return null;
+        },
         async startChain(payload) {
             if (standIn) return standIn.startChain(payload);
             if (!generationAvailable) return null;
@@ -400,12 +457,13 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
                 notice('generate', 'Restart FreeVideo to generate.', '请重新启动 FreeVideo 后再生成。');
                 return null;
             }
-            if (response.status === 400) {
-                // The server's own sentence for a video with too many parts is shown as it is.
+            if (!response.ok) {
+                // The server's own sentence for a video with too many parts, or a continued part too short, is shown as it is.
                 const body = await response.json().catch(() => null);
-                if (body?.code === 'chain_too_long') throw Object.assign(new Error(body.code), {code: body.code, said: [body.error, body.error_zh]});
+                if (['chain_too_long', 'chain_part_too_short'].includes(body?.code)) throw Object.assign(new Error(body.code), {code: body.code, said: [body.error, body.error_zh]});
+                throw Object.assign(new Error(typeof body?.error === 'string' ? body.error : body?.message || `HTTP ${response.status}`),
+                    {status: response.status, reason: body?.reason || body?.code, response: body});
             }
-            if (!response.ok) throw errorFor(response);
             return (await response.json())?.chain || null;
         },
         async chain(id) { return standIn?.owns(id) ? standIn.chain(id) : (await json(chainRoute(id)))?.chain || null; },
@@ -416,11 +474,14 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
             return (await json(chainRoute(id, action), post(payload)))?.chain || null;
         },
         async export(id, revision, options) {
-            const value = await json('/freevideo/editor/export', post({id, revision, ...(options && Object.keys(options).length ? {options} : {})}));
-            if (!value) notice('export', 'Export is unavailable until you restart after updating.', '更新后重启即可导出。');
+            const response = await request('/freevideo/editor/export', post({id, revision, ...(options && Object.keys(options).length ? {options} : {})}));
+            const value = await response.json().catch(() => null);
+            if (!response.ok && (response.status !== 404 || value?.reason || value?.code))
+                throw Object.assign(errorFor(response), {reason: value?.reason, code: value?.code, items: value?.items});
+            if (response.status === 404 || !value) { notice('export', 'To export, update FreeVideo and restart it.', '请更新 FreeVideo 并重新启动后再导出。'); return null; }
             return value?.export || null;
         },
-        watchExport(id, fn) { return watch(async () => (await json('/freevideo/editor/export?' + new URLSearchParams({id})))?.export || null, fn); },
+        watchExport(id, fn, lost) { return watch(async () => (await json('/freevideo/editor/export?' + new URLSearchParams({id})))?.export || null, fn, lost); },
         cancelExport: id => json('/freevideo/editor/export/cancel', post({id})),
         // Subtitles from speech. What this computer can recognise; null where it cannot or the server is older.
         async ears() { return (await json('/freevideo/editor/ears'))?.available || null; },
@@ -432,7 +493,7 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
         installEars: () => json('/freevideo/editor/subtitle-pack', post({action: 'install', language: true})),
         cancelEarsPack: () => json('/freevideo/editor/subtitle-pack', post({action: 'cancel'})),
         watchEarsPack(fn) { return watch(() => json('/freevideo/editor/subtitle-pack'), fn); },
-        dispose() { disposed = true; session.dispose(); for (const poller of pollers) poller.dispose(); pollers.clear(); watchers.clear();
+        dispose() { disposed = true; activateProject(null).catch(() => {}); session.dispose(); for (const poller of pollers) poller.dispose(); pollers.clear(); watchers.clear();
             for (const upload of [...uploads]) { upload.release(); upload.xhr.abort(); upload.reject(new Error('editor_closed')); } },
     };
     return store;

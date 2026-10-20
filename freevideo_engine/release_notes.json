@@ -1,38 +1,28 @@
 {
   "schema": 1,
-  "product_version": "0.4.0",
+  "product_version": "0.4.16",
   "en": {
-    "summary": "Adds an editing view, long videos generated one part after another, and AI agent connections, and makes generation faster.",
+    "summary": "Any part of a long video can be generated again as a new video, phones on the same network can follow chats and generations behind an optional password, and the Mac app now updates itself.",
     "changes": [
-      "New editing view: arrange generated clips on a timeline, add text and subtitles, change speed or reverse a clip, and choose the size and quality when exporting.",
-      "Long videos can be generated one part after another: select a range on the timeline in the editing view and press Generate, and each part continues from the one before.",
-      "Clips can be extended in the editing view: drag a new part out of the end of a clip and press Generate, and it continues from the clip.",
-      "A \"First-frame reference\" switch reduces drift when a clip is extended.",
-      "The editing view can create subtitles automatically: it recognizes Chinese, English, Japanese, Korean and Cantonese speech and gives each line its text and timing.",
-      "A step-by-step guide appears the first time FreeVideo opens, and can be viewed again from Settings.",
-      "Connect an AI agent and let it generate, edit and export videos.",
-      "LoRAs can be added directly in the creation panel.",
-      "A 30-second video is generated in two parts.",
-      "The FreeVideo · Media node accepts several reference images.",
-      "Faster generation: the wait before decoding is shorter; when generating several videos in a row, the models load faster for the later ones. On computers with less memory, background compiling after an update uses less memory.",
-      "Fixes: generating with several large reference images no longer runs out of memory; 16:9 videos can be saved as share videos; making the full video from a preview no longer stalls on a single step now and then; when setup cannot find a graphics driver, the error says so; when security software removes one of FreeVideo's files, the error says why and how to restore it."
+      "Long videos: the part list shows each part's length and what it follows, and marks failed parts. Any finished part can be generated again as a new video that keeps the parts before it, and the original video stays as it was. In the joined video, click a part's length to play two seconds either side of its seam. The list shows only each part's own events, and editing a part keeps the rest of its description unchanged.",
+      "Phone access: phones on the same network can open FreeVideo from the phone icon and QR code in the top bar, chat with AI Autopilot and follow generations. Phone access can be switched on or off and protected with a password that phones sign in with.",
+      "Mac: an update is downloaded in the background, and Restart & update replaces the app in place and opens the new version. Models and settings are kept, and if any step fails the previous version is restored.",
+      "Reference videos: a reference video can now be used without its own sound.",
+      "Editor: parts cut off when the engine stopped now show \"Interrupted\". A problem reported from a failure now includes the step that failed.",
+      "Linux: on graphics cards that can hold the whole video model, video generation no longer keeps a copy of the weights in system memory, which saves about 20 GB.",
+      "Reporting problems: memory readings in feedback record free physical memory and commit headroom separately."
     ]
   },
   "zh": {
-    "summary": "新增剪辑视图、一段接一段的长视频生成，并可以连接 AI Agent；生成也更快。",
+    "summary": "长视频的任何一段都可以重新生成为一条新视频；同一网络下的手机可以查看对话和生成进度，可设密码；Mac 版可以自动更新。",
     "changes": [
-      "新增剪辑视图：把生成的片段排在时间线上剪辑，可以加文字和字幕、变速和倒放；导出时可以选画面大小和画质。",
-      "长视频可以一段接一段生成：在剪辑视图的时间线上选好范围再点生成，每一段都接着前一段往下生成。",
-      "剪辑视图里可以延长片段：从片段尾巴拖出一段再点生成，接在原片段后面往下生成。",
-      "延长片段时可以打开“首帧参考”，减小画面漂移。",
-      "剪辑视图可以自动生成字幕：识别中文、英文、日文、韩文和粤语语音，得到每句的文字和时间。",
-      "第一次打开时有分步指引，设置里可以再看一遍。",
-      "可以连接 AI Agent，让它生成、剪辑和导出视频。",
-      "创作面板里可以直接添加 LoRA。",
-      "30 秒的视频分两段生成。",
-      "FreeVideo · Media 节点可以接多张参考图。",
-      "生成更快：解码前的等待更短；连续生成时，后面的视频加载模型更快。内存较小的电脑上，更新后的后台编译占用的内存更少。",
-      "修复：用多张较大的参考图生成时不再内存不足；16:9 的视频可以保存分享视频；先出预览再生成正式视频时，不再偶尔在某一步停留很久；安装时没有找到显卡驱动，会直接说明；FreeVideo 的文件被安全软件移走时，会说明原因和恢复的办法。"
+      "长视频：分段列表显示每段的时长和接在哪一段之后，并标出失败的段。任何已完成的段都可以从这里重新生成一条新视频，前面的段保持不变，原视频也不受影响。整条视频生成后，点某段的时长可播放它接缝前后各 2 秒。列表只显示每段自己的动作，编辑某一段时其余描述保持不变。",
+      "手机访问：同一网络下的手机可以通过顶栏的手机图标和二维码打开 FreeVideo，和 AI 全自动对话、查看生成进度。手机访问可以开关，也可以设置密码，手机登录后才能使用。",
+      "Mac：新版在后台下载，点“重启并更新”后原位替换应用并打开新版。模型和设置都会保留，任何一步失败都会还原旧版。",
+      "参考视频：参考视频可以只用画面、不使用它自己的声音。",
+      "剪辑视图：引擎中断而没做完的片段显示“上次中断”。从失败提示提交的问题会写明是哪一步出错。",
+      "Linux：显存放得下整个视频模型的显卡，生成视频时不再在系统内存里留一份权重副本，约省 20 GB 内存。",
+      "提交问题：反馈里的内存读数分开记录物理可用内存和提交余量。"
     ]
   },
   "ru": {
@@ -54,236 +44,260 @@
   },
   "history": [
     {
-      "product_version": "0.3.25",
+      "product_version": "0.4.15",
       "en": {
-        "summary": "Offline packages now work on Windows PCs where long-path support is off, and a generation interrupted once no longer slows down later ones.",
+        "summary": "Image generation keeps a history of every picture and needs less memory on both small and large graphics cards, error messages everywhere now come with a button to report the problem, and Windows updates download faster in mainland China.",
         "changes": [
-          "On Windows PCs where long-path support is off, which is the Windows default, offline packages now import, start and generate normally with no change to system settings, including in deeply nested folders with very long paths. A folder left half imported by the previous version needs no cleanup: import the package again after updating.",
-          "The Total pixels list in the creation panel no longer offers 1.00 MP, which gave the same size as 0.98 MP · Native. Workflows saved at 1.00 MP open at their original size.",
-          "On Windows PCs whose RAM cannot hold the whole video model, the part of the model that comes from the drive is now read ahead while the rest is computing, so a slow drive holds up each sampling step much less.",
-          "On Windows, the first video at the Max quality level, or at some custom step counts, no longer downloads about 26 GB of extra model files.",
-          "A generation interrupted once no longer slows down later generations. The compatibility level is raised automatically only after two interruptions in a row or a graphics card error, and goes back down after three generations complete normally.",
-          "Closing FreeVideo during a generation now cancels it instead of counting as an interruption. While the compatibility level is raised automatically, the progress says so and shows how many more completed generations are needed before it speeds up.",
-          "The creation panel has a new Available sizes and lengths row under Frame & duration. It opens a map of the picture sizes and lengths that can be generated; hovering shows the estimated time, and clicking fills in the size and length."
+          "Image generation: every image generated on this machine is kept in a history, newest first, and can be placed on the canvas, used as a reference, deleted, or opened in its folder. Blank canvases offer Standard and HD sizes.",
+          "Image generation: on 6-8 GB graphics cards, decoding uses less graphics memory and runs faster. On cards that can hold the whole model, the weights load straight to the card and no second copy stays in system memory, which cuts memory use after loading from about 15 GB to about 2 GB.",
+          "Reporting problems: wherever an error or failure message appears, including generation, editing and export, models and environment, image generation, the agent connection, the library, prompt enhancement, sharing, updates, and the launcher, a Report a problem button next to it opens the feedback form with the context filled in.",
+          "AI Autopilot: when a chat cannot be deleted, it now says why and offers Stop and delete; other failures are reported with a button to submit the problem.",
+          "White models: only the cat ready-made scene remains, and one click starts it. A white model that was not made now says why and what to do next, and the page shows rendering progress. A question about progress is answered instead of being started as a new request.",
+          "Character sheets: in the back view, the head now turns away together with the body.",
+          "Mac: long videos can now be generated in parts.",
+          "Launcher and updates: Windows updates download faster in mainland China. When GitHub is slow, the launcher can fetch the update from a domestic mirror, and every file from the mirror is checked against the release signature before use. The install confirmation page now fits narrow windows: the sidebar collapses to icons and the buttons stay visible.",
+          "Workflows: workflows saved by older versions run again. Options added in later versions that are empty or invalid in an old file are set back to their defaults.",
+          "Video generation: the High quality level generates faster. On 8 GB graphics cards, 1920x1088 videos that were refused for falling just short of graphics memory now run. Changing the early steps setting of a video reference now produces a new result instead of reusing the earlier one.",
+          "LoRA: a LoRA trained for Wan 2.x now says so when it is selected for the int8 model, instead of only saying it cannot be used.",
+          "Linux: on computers with less memory, generating again right after a generation no longer runs out of memory near the end of sampling. On 6 GB graphics cards, Max no longer takes hours to finish."
         ]
       },
       "zh": {
-        "summary": "离线包在没有开启长路径支持的 Windows 电脑上也能使用；生成被打断一次后，之后的生成不再变慢。",
+        "summary": "生图工具会保存所有生成过的图片，小显存和大显存的显卡生图都更省内存；所有错误提示旁都有“提交问题”按钮；Windows 版在中国大陆更新更快。",
         "changes": [
-          "在没有开启长路径支持的 Windows 电脑上（Windows 的默认设置），离线包现在可以正常导入、启动和生成，不需要更改系统设置；层级很深、路径很长的文件夹也可以。上一版没有导完的文件夹不需要清理，更新后可以直接重新导入。",
-          "创作面板“总像素”的选项里去掉了“1.00 MP”，它和“0.98 MP · 原生”是同一个尺寸；以前用 1.00 MP 保存的工作流打开后尺寸不变。",
-          "内存不足以容纳整个视频模型的 Windows 电脑上，需要从硬盘读取的那部分模型现在会在其余部分计算的同时提前读好，硬盘较慢时每个采样步等待的时间明显缩短。",
-          "在 Windows 上第一次用“极致”档（以及部分自定义步数）生成时，不再额外下载约 26 GB 的模型文件。",
-          "生成被意外中断一次后，之后的生成不再因此变慢：只有连续两次中断或显卡报错，才会自动提高兼容档位；之后连续三次正常完成，档位会自动调回。",
-          "生成过程中关掉 FreeVideo，现在会取消这次生成，不算作中断；兼容档位被自动提高时，生成进度上会说明这一点，并显示再完成几次后会加快。",
-          "创作面板“画幅与时长”下面新增“可生成范围”：展开是一张图，显示可以生成的画面大小和时长；鼠标移到图上会显示预计用时，点击图中的位置会填入对应的大小和时长。"
+          "生图：本机生成过的图片都保存在历史记录里，按时间从新到旧排列，可放到画布、用作参考图、删除或打开所在文件夹。空白画布可选“标准 / 高清”尺寸。",
+          "生图：6–8 GB 显存的显卡解码时占用的显存更少，速度更快。显存放得下整个模型的显卡，权重直接加载到显卡，不再在内存里留一份副本，加载后内存占用从约 15 GB 降到约 2 GB。",
+          "提交问题：生成、剪辑与导出、环境与模型、生图、智能体连接、作品库、提示词优化、分享、更新和启动器里，出现错误或失败提示的地方旁边都有“提交问题”按钮，点一下带上情况打开问题反馈。",
+          "AI 全自动：对话删不掉时会说明原因，并提供“停止并删除”；其他失败也会提示，并带“提交问题”按钮。",
+          "白模：现成场景只保留“橘猫跳上书架”，点一下直接开始。白模没做成时会说明原因和下一步，渲染中页面显示进度。问白模进度时会回答进度，不再当成新要求。",
+          "人物设定图：背面图里头和身体一起转向背后。",
+          "Mac：支持分段生成长视频。",
+          "启动器与更新：Windows 版在中国大陆更新更快。GitHub 慢时，启动器可以从国内镜像下载更新，镜像上的每个文件都先按发布签名校验。“确认安装”页适配窄窗口：侧栏收成图标，按钮始终可见。",
+          "工作流：旧版本存的工作流可以直接运行。旧文件里后加的选项为空或不合法时，改回默认值。",
+          "视频生成：“精细”档生成更快。8 GB 显存的显卡上，以前因显存差一点而被拒绝的 1920×1088 视频，现在可以生成。改动视频参考的前期步数设置后，会生成新的结果，不再沿用之前的结果。",
+          "LoRA：为 Wan 2.x 训练的 LoRA 选进 int8 模型时，会说明这是给 Wan 2.x 训练的 LoRA，不再只说无法使用。",
+          "Linux：内存较小的电脑接着再生成一次时，不再在采样快结束时内存不足。6 GB 显存的显卡选“极致”时，不再要等好几个小时。"
         ]
       }
     },
     {
-      "product_version": "0.3.24",
+      "product_version": "0.4.14",
       "en": {
-        "summary": "Compiling after an update now runs in the background while FreeVideo is idle, and Windows PCs with less RAM and 8 GB RTX 30 cards generate faster; Repair handles more cases and offline installations update their engine with the launcher.",
+        "summary": "Max is faster, a picture can now be changed only inside a region you select, agents can import their own clips into the timeline, and long videos can take more requests into the queue while they generate.",
         "changes": [
-          "After an update, an installation, a repair or a graphics driver update, FreeVideo compiles in the background while it is idle, which takes two to three minutes, and the first video after that no longer waits for compiling; the background work stops as soon as a video starts.",
-          "Clearing the system's temporary files no longer slows the next video: compiled results are now kept in the FreeVideo folder.",
-          "On Windows PCs with less RAM, each step reads less from the drive, and the second pass of a two-pass video starts sooner; 8 GB RTX 30-series cards also run the second pass of full-size videos faster.",
-          "With prompt enhancement on, a rewrite starts 3–4 seconds sooner. The background preparation uses about 0.7 GiB of RAM and no GPU memory, and it stops when a video starts generating.",
-          "Repair also restores ComfyUI packages whose files were deleted or changed, and replaces model files that differ from the tested version, keeping the original under a new name. When the text encoder folder holds a same-named file of a different size, generation uses the tested one.",
-          "FreeVideo installed from an offline package now updates its engine with the launcher without downloading; an older launcher no longer overwrites a newer FreeVideo, and both versions are shown when they differ.",
-          "When a browser extension interferes with FreeVideo, the error card names the extension and lists ways to fix it.",
-          "View licenses in the license step lists each license you accept, and each one opens; in installations from an offline package the full texts open from this computer, without a connection.",
-          "Fixes: after an engine update, commands run with the engine's own Python use the new FreeVideo; on Linux, Install / repair completes when the uv tool in the installation folder is a link to another location."
+          "Quality levels: Max now uses 20 steps with a guarded step cache and finishes sooner; High uses 16 steps with the step cache. The level names stay the same.",
+          "Picture editing: when changing a picture, drag a box, click an object, or draw a closed outline to select a region. Shift adds to the selection and Alt removes from it. Only the selected region changes, and everything outside it stays exactly the same. Click selection downloads a 184 MB model from ModelScope the first time it is used.",
+          "Studio: while a long or multi-part video is generating, the button stays available as \"Add to queue\". Up to five requests can wait, and each starts when the current video finishes or is stopped.",
+          "Agent: agents can import clips they rendered through HTTP, MCP and the command line, place them on the timeline by frame, and export. Before an agent is connected, the autopilot page says what connecting one is for.",
+          "Editing view: a reference picture that cannot be read is flagged right away so another one can be chosen.",
+          "Upgrade: when an old FreeVideo tab is replaced, two-pass sampling, first- and second-pass steps, the step cache and the upscale factor are carried over.",
+          "Prompt enhancement: after the model folder is copied, an offline package is unpacked, or antivirus software scans the files, FreeVideo no longer asks to download 8.9 GB again when the files are unchanged. It now also works on 6 GB graphics cards, finishing in under a minute instead of timing out.",
+          "Chinese interface: browser translation no longer changes FreeVideo's own labels, so the size menu keeps showing MP.",
+          "Feedback: feedback sent for a failed generation now includes the engine's error message.",
+          "Install: the Windows library checks also handle files in deeply nested folders."
         ]
       },
       "zh": {
-        "summary": "更新后的编译改在空闲时于后台完成，内存较小的 Windows 电脑和 8 GB 的 RTX 30 显卡生成更快；“修复”能处理更多情况，离线安装也能随启动器更新引擎。",
+        "summary": "极致档更快；改图时可以只改选中的区域；Agent 可以把自己渲染的片段导入时间线；长视频生成中可以继续加入队列。",
         "changes": [
-          "更新、安装、修复或更新显卡驱动后，FreeVideo 会在空闲时于后台完成编译，约两三分钟，之后的第一次生成不用再等编译；开始生成时后台编译会立即停止。",
-          "清理系统临时文件后，下一次生成不再变慢：编译结果改存在 FreeVideo 的目录里。",
-          "内存较小的 Windows 电脑上，生成时每一步从硬盘读取的数据更少，两遍生成的第二遍也开始得更快；8 GB 的 RTX 30 系列显卡上，全尺寸视频的第二遍更快。",
-          "开启提示词增强时，改写开始前少等 3–4 秒。为此 FreeVideo 会在后台提前做好准备，约占 0.7 GiB 内存，不占显存，开始生成视频时自动退出。",
-          "“修复”也会补回 ComfyUI 环境里被删除或改动的包，并把和测试版本不同的模型文件改名保留、换回测试过的版本。生成时如果文本编码器目录里有同名但大小不同的文件，会改用测试过的那份。",
-          "用离线整合包装的 FreeVideo 也会随启动器更新引擎，不用下载；旧启动器不再覆盖新版 FreeVideo，两者版本不同时会分别显示。",
-          "浏览器扩展干扰 FreeVideo 时，出错卡片会写出是哪个扩展，并给出解决办法。",
-          "许可确认里的“查看许可证”会列出要同意的每一项许可，每项都能打开；用离线整合包安装时打开的是本机全文，断网也能看。",
-          "修复：引擎更新后，用引擎自带 Python 运行的命令也会用新版 FreeVideo；Linux 上安装目录里的 uv 被换成链接时，“安装 / 修复”也能完成。"
+          "质量档位：极致档改为 20 步加带检查的步缓存，更快完成；精细档改为 16 步加步缓存。档位名称不变。",
+          "改图：改一张图时，可以拖框、点选物体或画闭合曲线来选区；按住 Shift 添加，按住 Alt 减去。只改选区里的内容，选区外完全不变。点选第一次使用时从魔搭下载 184 MB 的模型。",
+          "创作面板：长视频或分段视频生成中，按钮保持可用，显示“加入队列”。最多排 5 条，当前视频完成或停止后自动开始下一条。",
+          "Agent：Agent 可以通过 HTTP、MCP 和命令行导入自己渲染的片段，按帧放上时间线并导出。未连接时，自动页说明连上之后能做什么。",
+          "剪辑视图：参考图读不出来时会当场提示，可以换一张。",
+          "升级：替换旧版本的 FreeVideo 标签页时，二次采样、第一遍和第二遍步数、步缓存和放大倍数都会带过来。",
+          "提示词增强：复制模型文件夹、解压离线包或被杀毒软件扫描之后，只要文件内容没变，就不再要求重新下载 8.9 GB。6 GB 显卡上现在也能用，一分钟内完成，不再超时。",
+          "中文界面：浏览器翻译不再改动 FreeVideo 自己的文字，尺寸菜单保持显示 MP。",
+          "反馈：为失败的生成发送反馈时，会附上引擎给出的报错信息。",
+          "安装：Windows 上的库文件检查也支持层级很深的文件夹。"
         ]
       }
     },
     {
-      "product_version": "0.3.23",
+      "product_version": "0.4.13",
       "en": {
-        "summary": "Generation and installation progress show one overall percentage with the details that matter, such as the current step and how much has been downloaded; the workspace fills the window; RTX 50 GPUs no longer keep pausing when the driver cache is full, and the first video after a start waits less.",
+        "summary": "High is faster than Max again, videos at another size of the same shape can be continued, LoRAs on int8 models apply what they can, Settings adds step-by-step how-tos and an offline tutorial, and the installers are smaller.",
         "changes": [
-          "The first video after FreeVideo starts waits up to about 15 seconds less for the text encoder. On RTX 40 and RTX 50 cards under Windows, and on Linux, more of the video decoder stays on the graphics card while decoding (all of it on 12 GB cards), so decoding is faster.",
-          "On Windows with RTX 50 GPUs, generation no longer keeps pausing once the graphics driver's compile cache is full.",
-          "On Windows, when the video model fits neither in GPU memory nor in RAM, generation waits less for the drive. When another program takes GPU memory during generation, decoding no longer starts over because it ran out of memory.",
-          "Generation progress shows one overall percentage, the current step and the elapsed time, with a small bar under slow stages, and the remaining time appears after the first two steps; during installation, repair and updates, a download shows what is being downloaded, how much and how fast. Loading the video model no longer hangs when the graphics driver does not answer, and after a long time without progress the page says that generation is still running and offers the report.",
-          "Error cards now say in one sentence what happened and what to do, with the raw error under Technical details; cases such as a reference video that is too short or a LoRA that cannot be used with the int8 model yet each have their own message. The compatibility setting now describes what each level does.",
-          "The creative workspace and the Creations window now fill the browser window, so the video preview grows with it. On windows at least 1680 px wide, a Recent videos column appears on the right; clicking a video plays it in the preview, and a button in the preview header hides the column.",
-          "A custom step count now downloads only a sampling table the first time, up to 1.2 GB, instead of 26 GB of model weights. Any download still needed, as for some LoRAs on FP8, shows its progress, size and speed instead of an unchanging “Loading model”.",
-          "On NVIDIA graphics cards with 8 GB or more, prompt enhancement needs about 4 GiB of free RAM instead of 11 GiB, and on 8 GB and 10 GB cards a rewrite takes tens of seconds instead of several minutes. While it runs, the status line shows how long it has taken.",
-          "Each saved video now takes far less disk space, about 40 MB instead of about 790 MB for a 10-second 1344 × 768 video, because the uncompressed video and audio are no longer kept. The first start after updating deletes them from earlier videos as well, and previews can still continue with Run second pass.",
-          "A new Repair button in the launcher fixes an installation in one step and keeps models and videos; it appears on the error card when the launcher finds a problem it can repair, and in Settings › Environment. A repair that only adds a few packages no longer asks for as much free disk space as a new installation.",
-          "On a Mac, when unified memory runs short, the second pass switches to a computation that uses less memory; if it still runs short, the first pass is kept and only the second pass runs again. When less memory is available than a video needs, FreeVideo says so as soon as generation starts.",
-          "Fixes: on Linux, desktops without xdg-open can open FreeVideo in the browser, and the background service starts when the folder name contains %, $, quotes or backslashes; when port 8188 is in use, the launcher starts ComfyUI on a free port and shows the new address; and Captions only in the image editor no longer leaves white specks when it sweeps a caption in several strokes. With a self-installed ComfyUI updated to a recent version, each video appears once in Assets instead of twice, and paths with hidden folders no longer show <PATH><PATH> in the launcher terminal and diagnostic reports."
+          "High: the step cache is back with added checks, so High runs faster than Max again.",
+          "Long videos: parts of a long video and continued parts use 8 + 3 steps, so a second part is no longer refused.",
+          "Continue: a video at another size of the same shape now continues from its own ending. Videos that are too short or have too low a frame rate show a clear message.",
+          "LoRA: on int8 models, the parts of a LoRA that cannot be applied are skipped and the rest takes effect, instead of the whole LoRA being refused.",
+          "Help: \"User guide\" in Settings shows three how-tos on the real interface, and the new \"Tutorial\" opens an offline illustrated manual in English and Chinese.",
+          "Upgrade: a FreeVideo tab left open from an older version switches to the current workflow and keeps the prompt, size, length, seed, assets and LoRAs.",
+          "Agent: assembled videos are saved to \"Your creations\", and their task cards can be opened.",
+          "Install: the Windows and Linux installers are smaller, the prompt enhancement model can also download from ModelScope, and the GPU acceleration step shows one steady name and description while it builds."
         ]
       },
       "zh": {
-        "summary": "生成和安装的进度只显示一个总百分比，并给出在做什么、下了多少等必要的细节；创作面板铺满整个窗口；RTX 50 显卡不再因驱动缓存写满而反复停顿，启动后的第一个视频等待更短。",
+        "summary": "精细档重新比极致档快；同比例、不同尺寸的视频可以接着生成；int8 模型上的 LoRA 能用的部分照常生效；设置中新增分步演示和离线教程；安装包变小。",
         "changes": [
-          "启动后的第一个视频等文本编码器的时间更短，最多少等约 15 秒。在 Windows 上的 RTX 40、RTX 50 显卡以及 Linux 上，解码时更多的解码器留在显卡上（12 GB 显卡可以全部留下），解码更快。",
-          "在使用 RTX 50 系显卡的 Windows 电脑上，显卡驱动的编译缓存写满后，生成时不再反复停顿。",
-          "在 Windows 上，显存和内存都放不下整个视频模型时，生成时等硬盘的时间更短。生成期间其他程序占用了显存时，解码不再因显存不足而从头再来一遍。",
-          "生成进度只显示一个总百分比、正在做的那一步和已用时间，慢的阶段下面多一条小进度条，跑完两步后再显示预计剩余时间；安装、修复和更新时，下载会写明在下什么、下了多少和速度。加载视频模型时不再因显卡驱动没有响应而一直卡住；长时间没有新的进度时，页面会说明生成仍在进行，并可以下载报告。",
-          "出错时，卡片用一句话说明发生了什么、该怎么做，原始报错收进“技术详情”；参考视频太短、LoRA 暂时不能用于 int8 模型等情况各有自己的说明。兼容性设置也改成说明每一档的效果。",
-          "创作面板和作品窗口现在铺满浏览器窗口，视频预览随窗口一起变大。窗口宽 1680 像素以上时，右侧会多出“最近作品”一栏，点击其中的视频会在预览中播放，预览标题行的按钮可以收起这一栏。",
-          "选用自定义步数时，第一次只需下载一个采样表（最多 1.2 GB），不再先下载 26 GB 的模型权重。仍需下载时（例如 FP8 上的部分 LoRA），会显示进度、大小和速度，不再一直停在“加载模型”。",
-          "在 8 GB 及以上的 NVIDIA 显卡上，提示词增强只需约 4 GiB 可用内存（原来要 11 GiB），8 GB 和 10 GB 显卡上的改写从几分钟缩短到几十秒。改写时，状态栏会显示已用时间。",
-          "保存的视频占用的磁盘空间大幅减少：10 秒、1344 × 768 的视频从约 790 MB 降到约 40 MB，因为不再保留未压缩的画面和音频。更新后第一次启动时，也会删除之前视频里的这些文件；预览仍然可以点“继续二采”。",
-          "启动器新增“修复”按钮，一步修好安装，模型和视频都会保留；发现可以修复的问题时，出错卡片上会出现这个按钮，“设置 → 环境”里也有。只需补装几个包的修复，不再要求和全新安装一样多的空闲磁盘空间。",
-          "在 Mac 上，统一内存不足时，第二遍会改用占用内存更少的计算方式；仍然不足时，保留第一遍的结果，只重新运行第二遍。可用内存低于所需时，生成开始时就会给出提示。",
-          "修复：Linux 上，没有 xdg-open 的桌面也能在浏览器中打开 FreeVideo，文件夹名带 %、$、引号或反斜杠时后台服务也能启动；本机 8188 端口被占用时，启动器会改用空闲端口并说明新地址；图片编辑器的“只去字幕”分几笔扫过字幕时不再留下白点。自行将 ComfyUI 更新到较新版本后，每个视频在“资产”中不再出现两条记录；启动器终端和诊断报告里，隐去文件夹的路径不再显示为 <PATH><PATH>。"
+          "精细档：重新启用步缓存，并加上检查，精细档重新比极致档快。",
+          "长视频：长视频的分段和接着生成的分段统一使用 8 + 3 步，第二段不再被拒绝。",
+          "接着生成：同比例、不同尺寸的视频改为从它自己的结尾接着生成；太短或帧率太低的视频会给出明确提示。",
+          "LoRA：在 int8 模型上，LoRA 中无法应用的部分会跳过，其余照常生效，不再整个拒绝。",
+          "帮助：设置中的“使用说明”改为在真实界面上演示三项操作；新增“教程”，可打开中英文离线图文手册。",
+          "升级：旧版本留在标签页中的 FreeVideo 工作流会换成当前版本，并保留提示词、尺寸、时长、种子、素材和 LoRA。",
+          "Agent：拼接的成片保存到“我的作品”，任务卡可以打开。",
+          "安装：Windows 和 Linux 安装包变小；提示词增强模型也可以从魔搭下载；GPU 加速组件构建时，名称和说明保持不变。"
         ]
       }
     },
     {
-      "product_version": "0.3.22",
+      "product_version": "0.4.12",
       "en": {
-        "summary": "The image editor opens again after installing or updating with the launcher.",
+        "summary": "Preview white-model scenes for Autopilot, LoRA compatibility checks and drag-to-reorder, clearer failure messages, deleting edits, a faster start for a busy machine, and a Medium level that samples two passes.",
         "changes": [
-          "The image editor opens again. In 0.3.21 installed or updated with the launcher, clicking Edit only showed \"The image could not be opened for editing.\" because the fonts the editor uses were missing from the package."
+          "Autopilot: an optional white-model preview, with ready-made scenes, shows the scene before the video is made; the entry showcase has an example.",
+          "LoRA: a compatibility check before generating, and LoRAs can be reordered by dragging.",
+          "Failure messages: submission, queue and browser-extension failures share one layout and say what to do next; failed requests can be packaged with Export report or Submit to GitHub.",
+          "Editor: an edit can be deleted, an empty untouched edit is discarded, and reopening an edit restores its cover and shows its finishing stage; continuations are queued on the server.",
+          "Characters: each character carries a sheet of all views plus a face close-up; a picture that cannot be read is refused with a message on its own tile.",
+          "Medium: samples two passes from a larger first pass; Max runs all 20 steps without a cache.",
+          "Install: the GPU acceleration build has a visible share of the progress, the model line stays steady while groups download, and torch shows as Runtime components.",
+          "Downloads: before a download starts, the launcher, the page and the editor say what it is and how long it takes.",
+          "Guide: the first-run guide shows where to add reference images and first or last frames, the length field shows the part limit, and the Chinese interface links a user guide beside the guide in Settings.",
+          "Reusing reference pictures and clips when only the prompt changes skips encoding them again; on a busy machine the small CPU table work of loading runs on one thread.",
+          "Mac: a device that cannot continue a video refuses lengths over one block up front.",
+          "The feedback button opens the issue form."
         ]
       },
       "zh": {
-        "summary": "通过启动器安装或更新后，图片编辑器可以正常打开了。",
+        "summary": "AI 全自动新增白模预览场景，LoRA 兼容性检查和拖动排序，失败提示更清楚，可以删除剪辑，繁忙的机器上启动更快，标准档改为两遍采样。",
         "changes": [
-          "图片编辑器可以正常打开了。通过启动器安装或更新的 0.3.21 缺少编辑器用的字体，点“编辑”只会提示“这张图片无法打开编辑。”。"
+          "AI 全自动：可选的白模预览和现成场景，在生成视频前先看到场景；入口展示里有示例。",
+          "LoRA：生成前做兼容性检查，LoRA 可以拖动排序。",
+          "失败提示：提交、排队和浏览器扩展的失败用同一种版式，并说明下一步该做什么；失败的请求可以打包为导出报告或提交到 GitHub。",
+          "编辑器：可以删除剪辑，没改动的空剪辑自动丢弃；重新打开剪辑会恢复封面并显示收尾阶段；续接在服务端排队。",
+          "角色：每个角色带有全部视角的角色图和脸部特写；读不出来的图片会被拒绝，并在对应的格子上给出提示。",
+          "标准档：从更大的第一遍起采样两遍；极致档跑满 20 步且不使用缓存。",
+          "安装：GPU 加速组件的构建在进度中占有可见的份额，模型下载分组并行时进度行保持稳定，torch 显示为“运行组件”。",
+          "下载：开始下载前，启动器、页面和编辑器会说明这是什么下载、需要多久。",
+          "指引：首次指引新增一步，说明在哪里添加参考图和首帧、尾帧；时长栏直接显示分段上限；中文界面在设置里可以打开使用说明。",
+          "只改提示词时，参考图和片段不再重复编码；机器繁忙时，加载过程中的小型 CPU 表运算改为单线程。",
+          "Mac：不能续接视频的设备会在一开始就拒绝超过一个分段的长度。",
+          "反馈按钮直接打开问题表单。"
         ]
       }
     },
     {
-      "product_version": "0.3.21",
+      "product_version": "0.4.11",
       "en": {
-        "summary": "FreeVideo comes to Linux desktops as an AppImage, images in Media can be edited in place, and videos on Windows generate faster and more reliably when GPU memory or RAM is tight.",
+        "summary": "Fixes requests being rejected with a frame count error, and LoRAs with extra parts generating on the int8 build.",
         "changes": [
-          "FreeVideo comes to Linux desktops as an AppImage with the same launcher as Windows and macOS: it installs ComfyUI, the runtime and the models, adds FreeVideo to the application menu and updates itself. In a terminal, ./setup.sh now continues until FreeVideo is open, and freevideo opens it again later. On a GPU server, freevideo server keeps FreeVideo running for other computers to use.",
-          "Images in Media can now be edited without leaving FreeVideo: click Edit on a picture to crop it to the video's shape, add text and shapes, adjust light and color, and work with layers, masks and selections. Spot healing fills each stroke with texture from the surrounding picture, and Captions only removes burned-in captions. Text uses FreeVideo's built-in open-source fonts. The original file is kept, and opening the edit again brings back every layer.",
-          "The FreeVideo toolbar with the Create and Nodes switch can now be dragged anywhere on the page, like a window. It stays where you leave it after ComfyUI, FreeVideo or the browser restarts, and in other browsers too. Double-click an empty part of the toolbar to put it back at the top.",
-          "Prompt enhancement now keeps the lines written for characters to say as spoken dialogue, word for word, instead of turning them into on-screen text, and puts each section of the enhanced prompt on its own line.",
-          "On Windows, FreeVideo now leaves room for the GPU memory other applications are using, so videos no longer slow down or start over when the GPU fills up. On a test GPU limited to 8 GB, with 2.6 GB used by another application, a 5-second 960×544 video took 208 s instead of 290 s. On computers with little free RAM, the second pass also no longer loads the video model again.",
-          "On Windows, int8 videos sample faster on GPUs with 6 to 16 GB of memory. When memory allows, attention is computed in larger groups without using more video memory: on a Windows test GPU limited to 12 GB, a 1344×768 step took 58.2 s instead of 63.3 s, about 8% faster. 16 GB RTX 40 and 30 series cards with 13.5 to 14 GB free now copy the next model layer while the current one computes, as RTX 50 series cards already did. The same seed can give a slightly different video, as it already does between GPUs with different memory.",
-          "On Windows computers short of RAM, model layers read from the drive are now read ahead while the previous layer computes, without using more memory; in our tests this cut each sampling step by about 20%. While the last steps run, FreeVideo also reads ahead as much of the video decoder as free RAM allows, instead of skipping it when the whole decoder does not fit. The same seed gives the same video as before.",
-          "Videos spend less time getting ready. A new prompt or video size no longer makes FreeVideo compile its GPU kernels again, which took about 7 seconds per video on a Windows test machine, and a long ComfyUI session keeps them compiled instead of falling back to a much slower path. The second sampling step no longer compiles part of the model again, which on Windows could stop an attempt when the GPU was nearly full. The same seed gives the same video as before.",
-          "On Mac, the installer shows and checks free space the same way Finder does, including space macOS frees on its own, such as local Time Machine snapshots. Below the install location it names the disk and its free space, Choose another disk lists the other connected disks, and when space runs short it suggests one with enough room. A new installation needs about 73 GB instead of about 110 GB, and exFAT, FAT32, read-only and disconnected disks are explained before installation starts.",
-          "Installation is harder to interrupt and easier to follow: the overall progress moves with the model download, a small file whose download breaks off is fetched again, and the launcher reinstalls its loader when the FreeVideo folder in ComfyUI's custom nodes had its original files put back.",
-          "Offline-package installations take less disk space. Once the installation holds and has verified everything in the imported ZIP files, FreeVideo offers to delete them, so the packages no longer take the space twice; nothing is deleted without confirmation. The first start after installing or updating removes unpacked package folders and download leftovers that are no longer needed and shows how much space was freed, and models copied from another disk come with a note on how to avoid the copy.",
-          "Fixes: FreeVideo's page now loads with ad-block filter lists that blocked one of its scripts by name, and the page check names any FreeVideo file a browser extension blocks. Enlarging a video to full screen in the node view no longer shows the \"did not load completely\" message. Newer ComfyUI versions no longer print an asset registration warning after every video. Local optimization works when the second pass keeps part of its data in RAM, as on 8 GB Windows GPUs."
+          "Generating from a workflow or a restored tab where Total frames holds a number that is not a frame count is no longer rejected with a frame count error; the number is read as the duration.",
+          "int8: a LoRA that also contains modulation parts no longer stops the generation; those parts are skipped one by one and the number skipped appears in the report."
         ]
       },
       "zh": {
-        "summary": "FreeVideo 推出 Linux 桌面版 AppImage，素材图片可以直接编辑，Windows 上显存或内存紧张时生成更快、更稳定。",
+        "summary": "修复请求被帧数错误拒绝的问题，并让带额外部分的 LoRA 能在 int8 版本上正常生成。",
         "changes": [
-          "Linux 桌面可以使用 FreeVideo 的 AppImage，启动器与 Windows、macOS 相同：自动安装 ComfyUI、运行环境和模型，加入应用菜单，并能自动更新。在终端里，./setup.sh 现在会一直进行到打开 FreeVideo，之后输入 freevideo 会再次打开它。在 GPU 服务器上，freevideo server 会让 FreeVideo 保持运行，供其他电脑使用。",
-          "素材里的图片现在可以直接在 FreeVideo 中编辑：点击图片上的“编辑”，可以裁剪成视频比例、添加文字和形状、调整光线和颜色，并使用图层、蒙版和选区。污点修复会用周围画面的纹理填补，“只去字幕”可以去掉烧进画面的字幕。文字使用 FreeVideo 内置的开源字体。原图会保留，再次打开编辑时所有图层都在。",
-          "带“创作面板 / 节点视图”切换的 FreeVideo 工具栏现在可以像窗口一样拖到页面任意位置。重启 ComfyUI、FreeVideo 或浏览器后，它仍在原处，换一个浏览器也一样。双击工具栏空白处，可以让它回到顶部。",
-          "提示词增强现在会把写给角色说的台词原样保留为对白，不再变成画面里的文字；增强后的提示词每个部分各占一行。",
-          "在 Windows 上，FreeVideo 现在会给其他程序占用的显存留出空间，显卡被占满时生成不再变慢或中止重来。在一块限制为 8 GB、其中 2.6 GB 被其他程序占用的测试显卡上，生成 5 秒 960×544 视频从 290 秒缩短到 208 秒。在空闲内存较少的电脑上，第二遍也不再重新加载视频模型。",
-          "在 Windows 上，6–16 GB 显存的显卡生成 int8 视频更快。显存允许时，注意力以更大的分组计算，显存占用不增加：在一块限制为 12 GB 的 Windows 测试显卡上，1344×768 视频每步从 63.3 秒缩短到 58.2 秒，约快 8%。空闲显存为 13.5 到 14 GB 的 16 GB RTX 40 和 30 系列显卡，现在也会在当前层计算的同时复制下一层，与 RTX 50 系列此前的做法相同。同一个种子生成的视频可能略有不同，就像在显存不同的显卡上本来就会有差异一样。",
-          "在内存不足的 Windows 电脑上，需要从硬盘读取的模型层现在会在上一层计算时提前读取，而且不额外占用内存；在我们的测试中，每个采样步缩短约 20%。在最后几个采样步进行时，FreeVideo 还会在空闲内存允许的范围内预先读取尽可能多的视频解码器，不再因为放不下整个解码器就完全不读。同一个种子生成的视频与以前相同。",
-          "视频开始生成前的等待更短。换提示词或视频尺寸后，FreeVideo 不再重新编译显卡算子（在 Windows 测试机上每个视频约省 7 秒），在较长的 ComfyUI 会话中也不会退回慢得多的未编译方式。第二个采样步不再重新编译部分模型；在 Windows 上，这次编译曾在显卡快满时使尝试中止。同一个种子生成的视频与以前相同。",
-          "在 Mac 上，安装器显示和检查的可用空间现在与访达一致，包括 macOS 需要时会自动释放的空间，例如 Time Machine 本地快照。安装位置下方会显示所在硬盘和可用空间，点“换一块硬盘”可以选择其他已连接的硬盘，空间不够时会推荐一块够用的硬盘。全新安装所需的空间从约 110 GB 降到约 73 GB；exFAT、FAT32、只读或没有连接的硬盘，会在安装开始前说明原因。",
-          "安装更不容易中断，过程也更清楚：整体进度会随模型下载推进；小文件下载中断时会重新下载；ComfyUI 自定义节点里的 FreeVideo 文件夹被放回原始文件后，启动器会重新装上加载器。",
-          "用离线包安装后，占用的硬盘空间更少。安装已包含并校验完导入的压缩包里的全部内容后，FreeVideo 会提示删除这些压缩包，离线包不再占两份空间；删除前需要确认。安装或更新后第一次启动时，FreeVideo 会清理不再需要的离线包解压目录和下载残留，并显示释放了多少空间；从另一块硬盘复制来的模型，会附一句说明，讲清楚怎样避免这份复制。",
-          "修复：部分广告拦截列表会按文件名拦下 FreeVideo 的一个脚本，导致创作面板不显示，现在页面可以正常加载，页面检查也会指出被浏览器插件拦截的文件。在节点视图里把视频放大到全屏时，不再出现“没有完整加载”的提示。较新的 ComfyUI 不再在每个视频完成后打印资源登记警告。第二遍需要把部分数据放在内存里时（例如 8 GB Windows 显卡），本地优化可以正常运行。"
+          "用 Total frames 里填的不是帧数的工作流或恢复的标签页生成时，不再被帧数错误拒绝，这个数会按时长读取。",
+          "int8：带调制部分的 LoRA 不再让生成中断，这些部分会逐个跳过，跳过的数量写进报告。"
         ]
       }
     },
     {
-      "product_version": "0.3.20",
+      "product_version": "0.4.10",
       "en": {
-        "summary": "Offline installations now open FreeVideo in ComfyUI, and on Linux, GPUs with memory to spare generate faster.",
+        "summary": "High on Mac uses the step cache and finishes much sooner; in the editor, audio clips can move to another audio track, and several notices and narrow-window layouts are clearer; workflows saved by an earlier version generate again.",
         "changes": [
-          "Offline installations imported from the environment package now open FreeVideo in ComfyUI: the launcher installs the FreeVideo node that the package does not carry. Before, ComfyUI started without FreeVideo and the launch stopped at \"could not load FreeVideo\". A retry now also restarts the ComfyUI that an earlier attempt left running, and the message no longer suggests repairing the environment.",
-          "Offline installations in a longer folder path now also get their desktop and Start menu shortcuts. Windows cannot create a shortcut to a program whose path is 260 characters or longer, and the folders of an offline installation could make the launcher copy's path that long; the copy now goes to a shorter folder in that case.",
-          "On Linux, when the GPU has memory to spare, attention now runs 28 or all 56 heads at a time instead of 16; how many model layers stay on the GPU, and what is kept in system memory, does not change. On a 96 GB GPU, sampling a 10-second 1344×768 video took about 11% less time; with a 16–20 GB budget the gain is about 6–9%. Smaller GPUs and Windows keep their current settings. The same seed can give a slightly different video than before, as it already does between GPUs with different memory.",
-          "On Linux, video decoding now uses its FP16 cache on every GPU (it was on for some only). Decoding a 10-second 1344×768 video on a 96 GB GPU took 15.4 s instead of 19.2 s and 4.2 GB less memory, with identical output."
+          "Mac: High uses the step cache on the first pass and finishes much sooner, and the starting time estimate is based on the chip, so it is closer from the first step.",
+          "Editor: an audio clip dragged from the library onto the second audio track lands there, and a single audio clip on the timeline can be dragged to another audio track.",
+          "Editor: pressing split or trim while the playhead is outside the selected part, or asking for full screen where the browser refuses it, now says why in one line.",
+          "Character mentions written back to back, with no space between the names, are each recognised, and the character list opens again right after a name.",
+          "Autopilot: while a task is running, the Autopilot button in the header stays whole and clickable in narrow windows.",
+          "Chat: on phones and other narrow windows, button names quoted in notices stay on one line.",
+          "Diagnostic reports for failed image and video requests record the available memory when the request started and when the generation process ended, and whether the system appears to have ended the process.",
+          "Nodes: the English Width, Height and Seed labels are capitalised like the other fields.",
+          "Generating from a workflow saved by an earlier version, or from a restored tab, no longer fails with an invalid step cache setting."
         ]
       },
       "zh": {
-        "summary": "离线安装可以在 ComfyUI 中打开 FreeVideo；在 Linux 上，显存有富余的显卡生成更快。",
+        "summary": "Mac 精细档使用步间缓存，快得多；编辑器里音频片段可以拖到另一条音频轨；几处提示和窄窗口布局更清楚；旧版本保存的工作流又能正常生成。",
         "changes": [
-          "用环境包导入的离线安装现在可以在 ComfyUI 中打开 FreeVideo：启动器会安装环境包里没有带的 FreeVideo 节点。之前 ComfyUI 启动时没有加载 FreeVideo，启动停在“无法加载 FreeVideo”。重试时也会重启上一次留下的 ComfyUI，提示也不再让你去修复运行环境。",
-          "离线安装放在较长的文件夹路径下时，现在也能创建桌面和开始菜单快捷方式。Windows 无法为路径达到 260 个字符的程序创建快捷方式，而离线安装的目录层级可能让启动器副本的路径超过这个长度；这种情况下，副本会改放到路径较短的位置。",
-          "在 Linux 上，显存有富余时，注意力改为每次计算 28 个或全部 56 个头（原来每次 16 个）；留在显卡上的模型层数和放在内存里的内容都不变。在 96 GB 显卡上，生成 10 秒 1344×768 视频的采样时间缩短约 11%；显存预算在 16–20 GB 时约缩短 6–9%。显存较小的显卡和 Windows 保持现有设置。同一个种子生成的视频可能与以前略有不同，就像在显存不同的显卡上本来就会有差异一样。",
-          "在 Linux 上，所有显卡的视频解码都使用 FP16 缓存（以前只有部分显卡开启）。在 96 GB 显卡上解码 10 秒 1344×768 视频从 19.2 秒降到 15.4 秒，少占 4.2 GB 显存，输出完全一致。"
+          "Mac：精细档第一遍使用步间缓存，快得多；开始时的预计时间按芯片给出，从第一步起就更接近实际。",
+          "编辑器：从素材库把音频拖到第二条音频轨会放在该轨；时间线上单个音频片段可以拖到另一条音频轨。",
+          "编辑器：播放头不在所选片段上时按切分或修剪，或在浏览器不允许全屏的地方点全屏，会用一行字说明原因。",
+          "连着写、名字之间没有空格的角色提及都能被识别，写完一个名字后接着输入也会弹出角色列表。",
+          "AI 全自动：有任务在跑时，窄窗口里顶栏的“AI 全自动”按钮也始终完整可点。",
+          "对话：手机等窄窗口里，提示中引号内的按钮名不再被拆到两行。",
+          "图像和视频失败请求的诊断报告现在记录请求开始和生成进程结束时的可用内存，并标明进程是否疑似被系统结束。",
+          "节点：英文界面里 Width、Height、Seed 的大小写与其他项一致。",
+          "修复：用旧版本保存的工作流或恢复的标签页生成时提示步间缓存参数无效。"
         ]
       }
     },
     {
-      "product_version": "0.3.19",
+      "product_version": "0.4.9",
       "en": {
-        "summary": "On Windows, GPUs with 8 or 10 GB of memory sample the first pass a little faster when a video uses reference images, a first or last frame, or reference audio.",
+        "summary": "Quality levels are reworked: Medium is one pass of 8 steps, and High and Max use step caches to finish much sooner; decoding on Windows reads ahead earlier on slow drives, and the editor handles ranges, splits and text tracks more reliably.",
         "changes": [
-          "On Windows GPUs with 8 or 10 GB of memory, the first pass of a video up to 10 seconds long now runs attention 8 heads at a time when the video uses reference images, a first or last frame, or reference audio, as text-only videos already did, instead of 4. With one reference image, a 10-second 1344×768 video took about 8% less time per first-pass step on an 8 GB budget, staying within the same video memory budget. The same seed can give a slightly different video than before, as it already does between GPUs with different memory.",
-          "On Windows, the model layers kept on the GPU between first-pass steps no longer shrink from step to step, so fewer layers are transferred again on each step."
+          "Quality levels: Medium is one pass of 8 steps; High and Max run 20 steps with step caches and finish much sooner than plain 20 steps.",
+          "Decoding on Windows: read-ahead is sized by physical memory and starts earlier on slow drives, so the end of a run waits less for the disk.",
+          "When Windows runs out of virtual memory, in any system language, FreeVideo now retries the generation automatically in a fresh process and reports a memory shortage if it still fails.",
+          "The progress estimate counts reference images, so requests with reference images show a closer total time from the start.",
+          "Editor: dragging a range's left edge to the start of the timeline no longer pushes its right edge later; splitting a sped-up or reversed part keeps the fade-in only on the first half and the fade-out only on the second.",
+          "Editor: drag-selecting parts is smooth again on timelines with many parts.",
+          "Editor text: clicking the side Content box right after pressing T keeps the new text track, and dropping text onto a locked text track says the track is locked.",
+          "Long videos: each part's description can also be edited in a larger window.",
+          "Chat: when a conversation is full, the notice appears once under the message and its button starts a new chat instead of retrying.",
+          "Export: the sizes offered in the export dialog are rounded the same way as the saved work.",
+          "Diagnostic reports record how much of the graphics card other programs were using during each sampling step.",
+          "Launcher: when the browser cannot be opened automatically, the message says to click Copy address and open it in a browser, in Chinese as well. Canvas margin labels stay readable and aligned. Nodes: width, height, duration and seed have Chinese labels."
         ]
       },
       "zh": {
-        "summary": "在 Windows 上，8 GB 和 10 GB 显存的显卡生成带参考图、首尾帧或参考音频的视频时，第一遍采样稍快一些。",
+        "summary": "质量档位调整：标准为单遍 8 步，精细和极致用步间缓存，快得多；Windows 解码在慢硬盘上更早预读；编辑器的区间、切分和文字轨更可靠。",
         "changes": [
-          "在 8 GB 和 10 GB 显存的 Windows 显卡上，10 秒以内的视频如果带参考图、首帧或尾帧、参考音频，第一遍注意力改为每次计算 8 个头（原来是 4 个），与纯文本生成一致。带一张参考图生成 10 秒 1344×768 视频时，在 8 GB 显存预算下第一遍每步缩短约 8%，显存仍在原来的预算之内。同一个种子生成的视频可能与以前略有不同，就像在显存不同的显卡上本来就会有差异一样。",
-          "在 Windows 上，第一遍步与步之间保留在显卡上的模型层不再逐步减少，每步需要重新传输的层更少。"
+          "质量档位：标准为单遍 8 步；精细和极致为 20 步加步间缓存，比纯 20 步快得多。",
+          "Windows 解码：预读按物理内存决定大小，并在慢硬盘上更早开始，生成收尾时等硬盘的时间更短。",
+          "Windows 虚拟内存耗尽时，不论系统语言，FreeVideo 现在会在新进程中自动重试生成，仍失败时提示内存不足。",
+          "进度估计把参考图计入，带参考图的请求一开始就显示更接近实际的总时间。",
+          "编辑器：把区间左边拖到时间线开头，右边不再被往后推；切分加速或倒放的片段时，淡入只留在前半段，淡出只留在后半段。",
+          "编辑器：片段很多时，框选重新变得流畅。",
+          "编辑器文字：按 T 后马上点侧边“内容”框，新文字轨会保留；把文字拖到已锁定的文字轨上会提示该轨已锁定。",
+          "长视频：每段描述也能在放大窗口里编辑。",
+          "对话：对话已满时，提示只在消息下出现一次，按钮换成“新对话”。",
+          "导出：导出窗口里给出的尺寸和保存的作品用同样的方式取整。",
+          "诊断报告记录每一步采样时其他程序占用显卡的比例。",
+          "启动器：浏览器没能自动打开时，提示点“复制地址”到浏览器里打开，中文界面也显示中文。画布边距标签更清楚、对齐。节点：宽度、高度、时长和种子有中文标签。"
         ]
       }
     },
     {
-      "product_version": "0.3.18",
+      "product_version": "0.4.8",
       "en": {
-        "summary": "On Windows computers with little RAM, loading the video model reads much less from the disk.",
+        "summary": "Long videos keep a steadier voice from part to part, and continuing a video keeps your reference pictures and characters. LoRA strength can be typed up to 100, large downloads move to a faster source on their own, and the second-pass button uses the earlier wording again, with smaller fixes to uploads, your creations, the waiting queue, diagnostic reports and the interface.",
         "changes": [
-          "On Windows, when RAM cannot hold the whole video model, loading no longer reads the model layers that sampling streams from the disk anyway; each is read when sampling first needs it. With 16 GB of RAM, that is about 13 GB less to read every time the model loads: on an RTX 5060 Ti test machine limited to the RAM of a 16 GB computer, loading took 7 seconds instead of 11, and on a slower drive the saving is a few minutes. Videos are unchanged. Computers that keep the whole model in RAM, Linux and Mac load as before."
+          "Second pass: the result button, preview badge, library and delete messages use the 0.4.6 wording again (Run second pass, First-pass preview).",
+          "Long videos: the voice keeps the same loudness and fullness from part to part, and with dialogue a continued part no longer opens with a second or two of unclear speech. Continuing a video from the creative panel keeps your reference pictures and characters, so the person stays the same; up to 3 pictures are used.",
+          "Characters: two character names typed back to back after the @ key are both recognised, the list no longer reopens after a finished name, and Save in the character library says what is still missing. A character mentioned with @ in the editing view's generation bar now carries that character's description and pictures, as it does in the creation panel.",
+          "LoRA: you can type a strength beyond -4 to 4, up to 100, and a note marks values outside the usual range; the slider and default strength are unchanged. A trigger word that only appears inside a longer word (sks in asks) is now added.",
+          "Image generation: an out-of-memory failure says where memory ran out and at which size, and the progress line shows the smaller size while retrying; if the background process exits right after starting, it is retried once. Clicking Update while the image model is downloading pauses the download (what is already downloaded is kept and can be resumed) and starts the update at once. The option to install the image model as well checks free space on the drive that holds the models and is not offered when there is not enough room.",
+          "Downloads: large model downloads check the other sources while a transfer is slow and move to a clearly faster one, resuming the same file; a transfer that stops moving for 30 seconds changes source as well. The missing-model hint names each download and its size, and is checked again after a generation ends.",
+          "Media uploads: the upload buttons list only the file types FreeVideo can use, and unsupported files in a multiple selection are skipped. Files over 2 GiB are turned away in the page, a failed or interrupted upload no longer leaves a partial file, and upload errors appear in your language.",
+          "Your creations: an interrupted share or export no longer blocks deleting the creation, and its leftover working copy is removed at the next start. Adding the workflow to earlier videos no longer moves them to the top or changes their date.",
+          "Waiting queue: each task shows the start of its prompt, and Move to front highlights the moved task and confirms it.",
+          "Diagnostic report: the prompt-rewrite report no longer replaces the video's, the same file is saved and sent, and a large report is saved as a zip.",
+          "Wording: Agent chat, Settings, image generation and editor messages are shorter and say what to do next; the character library uses \"character\" throughout and its view labels are clearer.",
+          "Interface details: advanced node settings show Chinese names in the Chinese interface; generation cards in chat show a single progress figure; the Downloads card in Settings is tidier; Export in the editor keeps the primary colour and the Text and Subtitles tools use line icons; narrow windows lay out the preview, generate buttons, library title and notices better and keep Feedback in the header; long prompts no longer run under the @ button; library times follow the interface language; a result video that fails to load no longer offers actions that cannot work."
         ]
       },
       "zh": {
-        "summary": "在内存较小的 Windows 电脑上，加载视频模型时从硬盘读取的数据少了很多。",
+        "summary": "长视频各段人声更一致，接着生成时保留参考图和角色。LoRA 强度可以手动输入到 100，大文件下载会自动换到更快的下载源，二次采样按钮恢复此前的说法；上传、作品库、等待队列、诊断报告和界面细节也有多处改进。",
         "changes": [
-          "在 Windows 上，内存放不下整个视频模型时，加载阶段不再预先读取那些采样时本来就要从硬盘读取的模型层，改为采样第一次用到时再读。16 GB 内存的电脑每次加载模型可少读约 13 GB：在按 16 GB 电脑的内存条件运行的 RTX 5060 Ti 测试机上，加载从 11 秒缩短到 7 秒；硬盘较慢时可节省几分钟。生成的视频不变。内存能放下整个模型的电脑、Linux 和 Mac 的加载方式不变。"
-        ]
-      }
-    },
-    {
-      "product_version": "0.3.17",
-      "en": {
-        "summary": "On Windows, GPUs with 12 to 20 GB of memory sample a little faster: attention runs 16 heads at a time where memory allows.",
-        "changes": [
-          "On Windows, attention now runs 16 heads at a time instead of 8 whenever the GPU memory budget leaves room for it. This covers the first pass on 12 to 20 GB GPUs and the second pass on most 16 and 20 GB GPUs. On a 16 GB GPU, a 10-second 1344×768 video took about 6% less time per first-pass step and about 2% less per second-pass step, without using more video memory. FP8 models, requests with a LoRA, Linux and GPUs below 12 GB keep their current settings. The same seed can give a slightly different video than before, as it already does between GPUs with different memory."
-        ]
-      },
-      "zh": {
-        "summary": "在 Windows 上，12–20 GB 显存的显卡采样稍快一些：显存允许时，注意力每次计算 16 个头。",
-        "changes": [
-          "在 Windows 上，只要显存预算有余量，注意力改为每次计算 16 个头（原来每次 8 个）。12–20 GB 显卡的第一遍，以及大多数 16 GB 和 20 GB 显卡的第二遍都会用上。在 16 GB 显卡上生成 10 秒 1344×768 视频，第一遍每步缩短约 6%，第二遍每步缩短约 2%，显存占用没有增加。FP8 模型、使用 LoRA 的生成、Linux 和 12 GB 以下的显卡保持现有设置。同一个种子生成的视频可能与以前略有不同，就像在显存不同的显卡上本来就会有差异一样。"
-        ]
-      }
-    },
-    {
-      "product_version": "0.3.16",
-      "en": {
-        "summary": "On Windows, FreeVideo repairs its desktop shortcut each time the launcher opens, and keeps starting normally after it was once run as administrator.",
-        "changes": [
-          "On Windows, the launcher checks its desktop shortcut each time it opens and repairs it in place, and FreeVideo is now also added to the Start menu. A shortcut left by an earlier installation, or rewritten by Windows, is updated instead of a second \"FreeVideo (2)\" appearing next to it; a shortcut you renamed keeps its name, and one you gave another icon is left as it is. If Windows does not allow writing to the desktop (for example Controlled folder access in Windows Security), the launcher says so and how to allow FreeVideo, and FreeVideo is still in the Start menu.",
-          "After FreeVideo was once run as administrator, its desktop shortcut still opens it: the launcher copy behind the shortcut stays readable without administrator rights, and an unreadable copy left by an earlier version is replaced the next time the launcher opens.",
-          "Offline installations also keep starting after FreeVideo was once run as administrator. If Windows denies this account access to FreeVideo's program files, the launcher says so and how to fix it, instead of reporting a missing module."
-        ]
-      },
-      "zh": {
-        "summary": "在 Windows 上，每次打开启动器都会检查并修复桌面快捷方式；以管理员身份运行过一次之后，FreeVideo 也能正常启动。",
-        "changes": [
-          "在 Windows 上，启动器每次打开时都会检查桌面快捷方式并就地修复，开始菜单里现在也会有 FreeVideo。以前安装留下的、或被 Windows 改写过的快捷方式会直接更新，不会再在旁边多出一个“FreeVideo (2)”；改过名字的快捷方式保留原名，换过图标的保持不变。如果 Windows 不允许写入桌面（例如开启了“Windows 安全中心”的“受控文件夹访问”），启动器会说明原因和放行办法，开始菜单里仍然可以找到 FreeVideo。",
-          "以管理员身份运行过一次之后，桌面快捷方式仍能打开 FreeVideo：快捷方式指向的启动器副本不需要管理员权限也能读取；之前版本留下的读不了的副本，会在下次打开启动器时换掉。",
-          "以管理员身份运行过一次之后，离线安装也能正常启动；如果 Windows 不允许当前账户读取程序文件，启动器会说明原因和处理办法，不再只报缺少模块。"
+          "二次采样：结果卡按钮、预览角标、作品库和删除提示恢复 0.4.6 的说法（继续二采、一采预览）。",
+          "长视频：人声的音量和厚度在各段之间保持一致；有对话时，接续的段开头不再先冒出一两秒听不清的话。在创作面板接着生成视频时，会保留参考图和角色，人物前后保持一致，最多使用 3 张图片。",
+          "角色：紧挨着写的两个 @名字都能识别，写完名字后列表不再重新弹出，角色库保存按钮灰着时会说明还缺什么；剪辑视图的生成条里写 @角色，也会和创作面板一样带上该角色的描述和图片。",
+          "LoRA：强度可以手动输入超出 -4 到 4 的数，最大到 100，超出常用范围时有提示；滑块和默认强度不变。触发词只出现在更长的单词里（如 asks 里的 sks）时，现在也会自动加上。",
+          "图像生成：显存不够时写明在哪一步、哪个尺寸，自动缩小重试时显示新尺寸；后台进程刚启动就退出时自动重试一次。图像模型在后台下载时点“更新”，下载先停下（已下的部分保留，之后可以继续），更新马上开始；“同时安装图像模型”按模型所在的盘检查空间，空间不够时不再显示为可选。",
+          "下载：大文件下载变慢时会测试其他下载源，明显更快时自动换源并接着下载；停滞 30 秒也会换源。缺模型提示写明是哪几项、各多大，生成结束后重新检查。",
+          "素材上传：上传按钮只列出能用的文件格式，一次选多个时跳过不支持的；超过 2 GiB 的文件在页面上直接拦下；上传失败或中断不再留下残留文件，出错提示用当前界面语言。",
+          "作品库：分享或导出中断后留下的临时文件不再挡住删除，下次启动时清理；给早期视频添加工作流后，它们不再跳到最前，日期保持原样。",
+          "等待队列：每条任务显示提示词开头；“排到最前”后被移动的任务会高亮并提示。",
+          "诊断报告：提示词增强不再顶替视频的报告，保存和提交是同一份，较大的报告存成 zip。",
+          "文字：Agent 对话、设置、图像生成和编辑器里的提示更简短，并写明下一步该点哪个按钮；角色库统一称“角色”，视角标签更清楚。",
+          "界面细节：中文界面的生成节点高级参数显示中文名；对话里的生成卡只显示一个进度；设置“下载”卡更整齐；剪辑视图导出按钮保持主色，文字、字幕工具改用线性图标；窄窗口下预览、生成按钮、作品库标题和提示的排布更合理，顶栏仍保留“反馈”入口；长提示词不再被“@”按钮压住；作品卡片时间跟随界面语言；结果视频加载失败时不再显示无法使用的操作。"
         ]
       }
     }

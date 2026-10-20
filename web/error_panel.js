@@ -1,5 +1,8 @@
 // Shared by the Studio and graph view. Text only; never render exception HTML.
-import {detectBrowserExtension, browserExtensionAdvice, extensionSteps} from './browser_extension.js';
+import {repairAction} from './repair_hint.js';
+import {detectBrowserExtension, browserExtensionAdvice, extensionSteps, isNetworkTypeError, connectionLostText} from './browser_extension.js';
+import {SAMPLING_EFFORTS, STEP_CACHES, UPSCALE_FACTORS, tableLevel} from './sampling_effort.js';
+import {failureIssue, failureStage} from './failure_issue.js';
 const reports = new WeakSet();
 const captured = new WeakMap();
 const diagnosticReports = new WeakSet();
@@ -11,13 +14,31 @@ const record = value => value && typeof value === 'object' && !Array.isArray(val
 const PLAIN_ERRORS = [
     {key: 'continuation-missing', message: 'The previous video has no usable continuation data. Generate it again with this version of FreeVideo.',
         title: ['This video cannot be continued', '这个视频暂时不能接续'],
-        summary: ['Generate the previous video again with this version of FreeVideo. Older videos, replaced files and expired continuation data cannot be used.', '请用当前版本的 FreeVideo 重新生成上一段视频。旧版本的视频、被替换的文件或已清理接续数据的视频不能接续。']},
-    {key: 'continuation-size', message: 'Use the same width and height as the previous video.',
-        title: ['The video sizes differ', '两段视频的画面大小不一致'],
-        summary: ['Set the width and height to the previous video’s size.', '请把宽度和高度设为与上一段视频相同。']},
-    {key: 'continuation-route', message: 'Video continuation requires full two-pass text generation on an NVIDIA GPU, without first frames, last frames or reference media.',
-        title: ['This generation mode cannot continue a video', '当前生成方式不支持视频接续'],
-        summary: ['Use full two-pass text generation on an NVIDIA GPU and remove first frames, last frames and reference media. Mac and preview generation are not supported.', '请在 NVIDIA 显卡上使用完整的文字生成两遍流程，移除首帧、尾帧和参考素材。Mac 和预览生成暂不支持接续。']},
+        summary: ['Generate the previous video again, then continue it.', '请重新生成上一段视频，再接续。']},
+    {key: 'continuation-short', message: 'The previous video is too short to continue; it needs to be at least 1.7 s long.',
+        title: ['The previous video is too short', '上一段视频太短'],
+        summary: ['Choose a video that is at least 1.7 seconds long.', '请选择至少 1.7 秒的视频。']},
+    {key: 'continuation-unreadable', message: 'The previous video cannot be read.',
+        title: ['The previous video cannot be read', '无法读取上一段视频'],
+        summary: ['Choose an MP4 video that plays normally.', '请选择能正常播放的 MP4 视频。']},
+    {key: 'continuation-rate', message: "The previous video's frame rate is too low to continue; it needs at least 10 frames per second.",
+        title: ["The previous video's frame rate is too low", '上一段视频帧率太低'],
+        summary: ['Choose a video with at least 10 frames per second.', '请选择每秒至少 10 帧的视频。']},
+    {key: 'continuation-size', message: 'Use the same aspect ratio as the previous video.',
+        title: ['The two videos have different aspect ratios', '两段视频的画面比例不同'],
+        summary: ['Choose a video size with the same aspect ratio as the previous video.', '请选择与上一段视频比例相同的画面大小。']},
+    {key: 'continuation-route', message: 'Continue from video cannot be used with these settings. Continuing a video needs an NVIDIA GPU or a Mac. To make a new video, clear "Continue from video".',
+        title: ['This computer can\'t continue a video', '这台电脑无法接续视频'],
+        summary: ['Continuing a video needs an NVIDIA GPU or a Mac. To make a new video, clear "Continue from video".', '接续视频需要 NVIDIA 显卡或 Mac。要生成新视频，请清空“接着生成”。']},
+    {key: 'continuation-passes', message: 'Continue from video cannot be used with these settings. Turn on "Two-pass acceleration" and turn off the first-pass preview.',
+        title: ['Continuing needs two-pass acceleration', '接续需要二次采样加速'],
+        summary: ['Turn on "Two-pass acceleration" and turn off the first-pass preview.', '请打开“二次采样加速”，并关闭先出预览。']},
+    {key: 'continuation-refine', message: 'Continue from video cannot be used with these settings. Clear either "Second pass of preview" or "Continue from video".',
+        title: ['A continued part is made in full', '接续会完整生成这一段'],
+        summary: ['Clear either "Second pass of preview" or "Continue from video".', '请清空“继续二采”或“接着生成”其中一项。']},
+    {key: 'continuation-media', message: 'Continue from video cannot be used with these settings. Connect up to 3 pictures as references, and remove video, audio and pre-encoded inputs.',
+        title: ['A continued part takes picture references only', '接续段只能用图片参考'],
+        summary: ['Connect up to 3 pictures as references, and remove video, audio and pre-encoded inputs.', '最多接 3 张图片作为参考图，并移除视频、音频参考和预编码输入。']},
     {key: 'continuation-frames', message: 'Frame count must be 5 + 17n and at least 39 (39, 56, 73, 90, ...).',
         aliases: ['Frames must be 0 to use Duration, or 5 + 17n and at least 39 (for example, 39, 56, 141 or 243). The total includes 22 overlap frames when continuing.'],
         title: ['Choose a supported frame count', '请选择支持的帧数'],
@@ -32,11 +53,17 @@ const PLAIN_ERRORS = [
     {key: 'video-no-picture', message: 'No picture could be read from this video file. Choose another video.',
         title: ['This video could not be read', '无法读取这个视频'],
         summary: ['No picture could be read from this video file. Choose another video.', '无法从这个视频文件里读出画面，请换一个视频。']},
+    {key: 'lora-unusable', message: 'This LoRA was not trained for the FreeVideo model and cannot be used.',
+        prefixes: ['LoRA target/shape incompatible with this VDN model', 'Full-difference LoRA target/shape incompatible with this VDN model',
+            'Unsupported LoRA tensor (no patches are ignored): ', 'Adapter contains no LoRA factors', 'Expected matching 2-D LoRA factors', 'Incomplete LoRA pair'],
+        title: ['This LoRA cannot be used', '此 LoRA 无法使用'],
+        summary: ['This LoRA is not made for the FreeVideo model. Turn it off or remove it, then generate again.', '此 LoRA 不适用于 FreeVideo 的模型。请关闭或移除后重新生成。']},
     {key: 'lora-int8', message: 'This LoRA changes parts of the model that the int8 version cannot merge yet, so it cannot be used for now. LoRAs that change only linear layers work.',
-        title: ['This LoRA cannot be used with the int8 model yet', '这个 LoRA 暂时不能用于 int8 模型'],
-        summary: ['This LoRA changes parts of the model that the int8 version cannot merge yet, so it cannot be used for now. LoRAs that change only linear layers work.', '这个 LoRA 修改了 int8 模型目前还不能合并的部分，暂时无法使用。只修改线性层的 LoRA 可以正常使用。']},
+        title: ['This LoRA cannot be used', '此 LoRA 无法使用'],
+        summary: ['The int8 version cannot merge the layers this LoRA changes yet. Turn it off or remove it, then generate again.',
+            'int8 版本暂时无法合并此 LoRA 修改的层。请关闭或移除后重新生成。']},
     {key: 'fa4-update', message: 'The attention speed-up component on this computer needs an update. Run freevideo setup --fa4-guard in a terminal, then restart FreeVideo.',
-        title: ['The attention speed-up component needs an update', '需要更新注意力加速组件'],
+        title: ['Runtime components need updating', '运行组件需要更新'],
         summary: ['The attention speed-up component on this computer needs an update. Run freevideo setup --fa4-guard in a terminal, then restart FreeVideo.', '注意力加速组件需要更新。请在终端运行 freevideo setup --fa4-guard，然后重新启动 FreeVideo。']},
     {key: 'duration-too-short', message: 'The video must be at least 1.625 s long.',
         title: ['The video is too short', '视频时长太短'],
@@ -50,22 +77,44 @@ const PLAIN_ERRORS = [
 function knownError(text) {
     const lines = String(text).slice(0, 65536).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
     const index = /^FreeVideo generation failed(?: \(exit -?\d+\))?$/.test(lines[0] ?? '') ? 1 : 0;
-    const line = (lines[index] ?? '').replace(/^[A-Za-z_][\w.]*(?:Error|Exception):\s*/, '');
-    return PLAIN_ERRORS.find(error => line === error.message || error.aliases?.includes(line))?.key ?? null;
+    const line = (lines[index] ?? '').replace(/^(?:[A-Za-z_][\w.]*(?:Error|Exception)|(?:[\w.]+\.)?SamplingTableUnavailable):\s*/, '');
+    if (line.startsWith('SAMPLING_TABLE_UNAVAILABLE: ')) {
+        try {
+            const d = JSON.parse(line.slice('SAMPLING_TABLE_UNAVAILABLE: '.length));
+            if (Number.isInteger(d.base_steps) && d.base_steps >= 1 && d.base_steps <= 32
+                && typeof d.two_pass === 'boolean' && Number.isInteger(d.refine_steps) && d.refine_steps >= 0 && d.refine_steps <= 31
+                && Number.isSafeInteger(d.missing_bytes) && d.missing_bytes > 0 && typeof d.decimal_sizes === 'boolean'
+                && Array.isArray(d.available) && d.available.every(i => Number.isInteger(i) && i >= 0 && i <= 3)
+                && (d.step_cache === undefined || STEP_CACHES.includes(d.step_cache))
+                && (d.scale === undefined || UPSCALE_FACTORS.includes(d.scale)))
+                return {kind: 'sampling-table', base_steps: d.base_steps, two_pass: d.two_pass, refine_steps: d.refine_steps,
+                    missing_bytes: d.missing_bytes, decimal_sizes: d.decimal_sizes, available: [...new Set(d.available)].sort(),
+                    ...(d.step_cache ? {step_cache: d.step_cache} : {}), ...(d.scale && d.scale !== 2 ? {scale: d.scale} : {})};
+        } catch { /* Malformed metadata stays in technical details. */ }
+    }
+    return PLAIN_ERRORS.find(error => line === error.message || error.aliases?.includes(line)
+        || error.prefixes?.some(prefix => line.startsWith(prefix)))?.key ?? null;
 }
 
 // When a diagnostic report exists the card hides Export report; the same advice
 // then names Download report in the preview or node panel.
-const DOWNLOAD_ADVICE = ['If it still fails, click Download report in the preview or node panel and attach the report to a GitHub issue.',
-    '仍然失败时，请在预览区或节点面板中点击“下载报告”，并提交到 GitHub issue。'];
+const DOWNLOAD_ADVICE = ['If it still fails, use Download report in the preview and submit it in a GitHub issue.',
+    '仍然失败时，可点预览区的“下载报告”，提交到 GitHub issue。'];
 const EXPORT_TO_DOWNLOAD = [
     ['Export the report if it still fails.', DOWNLOAD_ADVICE[0]],
-    ['If it still fails, export the report and attach it to a GitHub issue.', DOWNLOAD_ADVICE[0]],
+    ['If it still fails, export the report and submit it in a GitHub issue.', DOWNLOAD_ADVICE[0]],
     ['仍失败时请导出报告。', DOWNLOAD_ADVICE[1]],
     ['仍然失败时，请导出报告并提交到 GitHub issue。', DOWNLOAD_ADVICE[1]],
     ['If it still fails, export the report.', DOWNLOAD_ADVICE[0]],
     ['仍然失败时，请导出报告。', DOWNLOAD_ADVICE[1]],
 ];
+
+// A permission error counts as the output folder's only when the path it names is not a model or cache file.
+export function outputNotWritable(text) {
+    const value = String(text).slice(0, 65536);
+    return /PermissionError|Permission denied|Read-only file system|\[Errno (?:13|30)\]/i.test(value)
+        && !/models?[\\/]|cache|\.(?:safetensors|gguf|bin|pt)\b|manifest\.json/i.test(value);
+}
 
 export function errorText(detail) {
     if (typeof detail === 'string') return detail;
@@ -188,6 +237,10 @@ export function createErrorReport(detail, context = {}) {
         const value = Array.isArray(inputs?.[key]) && inputs[key].length === 1 ? inputs[key][0] : inputs?.[key];
         if (typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value)) settings[key] = value;
     }
+    const cache = Array.isArray(inputs?.step_cache) && inputs.step_cache.length === 1 ? inputs.step_cache[0] : inputs?.step_cache;
+    if (typeof cache === 'string' && (cache === 'none' || STEP_CACHES.includes(cache))) settings.step_cache = cache;
+    const factor = Array.isArray(inputs?.upscale_factor) && inputs.upscale_factor.length === 1 ? inputs.upscale_factor[0] : inputs?.upscale_factor;
+    if (typeof factor === 'string' && UPSCALE_FACTORS.map(String).includes(factor)) settings.upscale_factor = factor;
     const progress = {};
     for (const key of ['phase', 'stage']) if (typeof context.progress?.[key] === 'string') progress[key] = clean(context.progress[key]);
     for (const key of ['done', 'total']) if (Number.isFinite(context.progress?.[key])) progress[key] = context.progress[key];
@@ -230,6 +283,39 @@ export function createErrorReport(detail, context = {}) {
 export function failureAdvice(value, t, known = knownError(value)) {
     const text = String(value).slice(0, 65536);
     const row = (kind, title, summary, action) => ({kind, title: t(...title), summary: t(...summary), action: t(...action)});
+    if (known?.kind === 'sampling-table') {
+        // Names and plan matching follow sampling_effort.js; metadata carries no user text.
+        const levels = SAMPLING_EFFORTS.map(tier => [tier.name, tier.zh]);
+        const level = tableLevel(known.base_steps, known.two_pass, known.refine_steps, known.step_cache ?? null, known.scale ?? 2);
+        const index = SAMPLING_EFFORTS.findIndex(tier => tier.name === level?.name);
+        const custom = index < 0;
+        // Tables follow the step count: a level with the same steps and passes (Light and Medium) needs the same download.
+        const available = known.available.filter(i => SAMPLING_EFFORTS[i]?.steps !== known.base_steps || SAMPLING_EFFORTS[i].twoPass !== known.two_pass);
+        // Iris: a level name and its 档 never break apart. The summary is set as text,
+        // so word joiners (U+2060) keep each group on one line instead of markup.
+        const keep = value => [...value].join('\u2060');
+        const join = language => {
+            const names = available.map(i => language ? `“${levels[i][1]}”` : levels[i][0]);
+            if (language) names[names.length - 1] += '档';
+            const kept = language ? names.map(keep) : names;
+            return kept.length < 2 ? kept[0] || '' : kept.slice(0, -1).join(language ? '、' : ', ') + (language ? '或' : ' or ') + kept.at(-1);
+        };
+        const bytes = known.missing_bytes;
+        // As launcher_copy.size_text: one decimal for GiB, whole MiB; decimal units on macOS.
+        let size = bytes >= 2**30 ? (bytes / 2**30).toFixed(1) + ' GiB' : Math.floor(bytes / 2**20) + ' MiB';
+        if (known.decimal_sizes) {
+            const unit = [[1e12, 'TB', 2], [1e9, 'GB', 2], [1e6, 'MB', 1]].find(([scale]) => bytes >= scale);
+            size = unit ? Number((bytes / unit[0]).toFixed(unit[2])) + ' ' + unit[1] : Math.round(bytes / 1e3) + ' KB';
+        }
+        // A custom step count is not a quality level: no "档" / "quality level" for it.
+        const title = custom
+            ? [`Custom (${known.base_steps} steps) is not downloaded yet`, `“自定义（${known.base_steps} 步）”还没下载`]
+            : [`The ${levels[index][0]} quality level is not downloaded yet`, `${keep(`“${levels[index][1]}”档`)}还没下载`];
+        const what = custom ? ['This step count', '这个步数'] : ['This level', '这一档'];
+        return {...row('sampling-table', title,
+            [`${what[0]} needs a download (about ${size}) that did not finish this time. Generate again when online and it downloads automatically.${available.length ? ` You can also use ${join(0)} for now.` : ''}`,
+             `${what[1]}要先下载（约 ${size}），这次没能下载。联网后再生成一次，会自动下载。${available.length ? `也可以先用${join(1)}。` : ''}`], ['', '']), plain: true};
+    }
     // ComfyUI and worker tracebacks carry English exceptions. Translate these
     // actionable failures through the existing signature/advice path.
     for (const {key, title, summary} of PLAIN_ERRORS) {
@@ -237,8 +323,8 @@ export function failureAdvice(value, t, known = knownError(value)) {
             return {...row(key, title, summary, ['', '']), plain: true};
     }
     if (/Prompt outputs failed validation|Required input is missing|Value not in list|Return type mismatch|Failed to validate prompt|value (?:\S+ )?(?:smaller|bigger) than/i.test(text))
-        return row('validation', ['Check the workflow inputs', '请检查工作流输入'],
-            ['ComfyUI rejected the workflow before generation. The affected nodes and reasons are listed below.', 'ComfyUI 在生成开始前拒绝了工作流，相关节点和具体原因列在下方。'],
+        return row('validation', ['Check generation settings', '检查生成设置'],
+            ['The generation settings did not pass validation; see the error details below.', '生成设置未通过检查，可查看下方错误详情。'],
             ['Check the named inputs, connections and model choices. Copy the details or export the error report when asking for help.', '检查下方指出的输入、节点连接和模型选项；反馈时可复制详情或导出错误报告。']);
     if (/FreeVideo resource planning could not admit/i.test(text)) {
         // The planner names smaller requests it admitted on this GPU just now.
@@ -247,46 +333,54 @@ export function failureAdvice(value, t, known = knownError(value)) {
         if (fits.length) {
             const en = fits.map(f => f.longest ? `${f.width}\u00a0×\u00a0${f.height} up to ${f.seconds.toFixed(1)}\u00a0s` : `${f.width}\u00a0×\u00a0${f.height} at ${f.seconds.toFixed(1)}\u00a0s`).join(', or ');
             const zh = fits.map(f => f.longest ? `${f.width}\u00a0×\u00a0${f.height} 最长 ${f.seconds.toFixed(1)}\u00a0秒` : `${f.width}\u00a0×\u00a0${f.height} 生成 ${f.seconds.toFixed(1)}\u00a0秒`).join('，或 ');
-            return row('resources', ['This video is too large for the free GPU memory', '这段视频超出了当前可用显存'],
-                ['Before generating, FreeVideo estimated the GPU memory this video needs, and it is more than the GPU has free right now.', 'FreeVideo 在开始生成前估算了所需显存，这段视频超过了显卡现在空闲的显存。'],
-                [`This computer can make ${en} right now. Change the duration or total pixels and generate again; closing other programs that use the GPU also frees memory.`,
-                 `现在可以生成：${zh}。请调整时长或总像素后重新生成；关闭其他占用显卡的程序也可以腾出显存。`]);
+            return row('resources', ['Not enough GPU memory', '显存不够'],
+                ['Generation needs more GPU memory than is currently available.', '生成所需显存超过当前可用量。'],
+                [`This computer can make ${en} right now. Change the duration or resolution and generate again; closing other programs that use the GPU also frees memory.`,
+                 `现在可以生成：${zh}。请调整时长或清晰度后重新生成；关闭其他占用显卡的程序也可以腾出显存。`]);
         }
         return row('resources', ['The request exceeds available memory', '当前任务的可用内存不足'],
-            ['Before generating, FreeVideo estimated the GPU memory and RAM this task needs, and it is more than is available right now.', 'FreeVideo 在开始生成前估算了所需的显存和内存，这次任务超过了现在可用的部分。'],
-            ['Close other memory-heavy programs, or lower the resolution or shorten the duration, and retry. The details show whether GPU memory or RAM ran short, and by how much.', '请关闭其他占用内存的程序，或调低分辨率、缩短时长后重试。详情里写明了是显存还是内存不足，以及还差多少。']);
+            ['Generation did not start because there is not enough available RAM or GPU memory.', '可用内存或显存不足，本次生成未开始。'],
+            ['Close memory-heavy applications, or lower the resolution or duration, then retry.', '可关闭占用内存较多的程序，或调低分辨率、缩短时长后重试。']);
     }
-    if (/commit headroom exhausted|paging file is too small|WinError 1455/i.test(text))
-        return row('commit', ['Windows memory allocation limit reached', 'Windows 内存提交额度不足'],
-            ['Windows cannot back another memory allocation, even if physical RAM is still available.', 'Windows 已没有足够的内存提交额度；即使物理内存还有空闲，也无法再分配内存。'],
+    if (/commit headroom exhausted|paging file is too small|WinError 1455|os error 1455/i.test(text))
+        return row('commit', ['Not enough Windows memory', 'Windows 内存不足'],
+            ['Windows cannot provide enough memory for generation right now.', 'Windows 暂时无法提供生成所需的内存。'],
             ['Close memory-heavy applications and retry. In Windows virtual memory settings, use a system-managed paging file on a drive with free space.', '关闭占用内存较多的程序后重试。在 Windows 虚拟内存设置中，使用系统管理的分页文件，并确保所在磁盘有空闲空间。']);
     // Refused before it starts: more than this Mac can allocate at all, so closing
     // other applications cannot help (macos_generate.request_admission).
     if (/needs at least [\d.]+ GiB of unified memory for .*this Mac can allocate at most/i.test(text))
         return row('unified-memory-limit', ['Not enough unified memory', '统一内存不足'],
-            ['These settings need more unified memory than this Mac can allocate, even with other applications closed.', '这组设置需要的统一内存超过了这台 Mac 可分配的上限，关闭其他程序也无法满足。'],
+            ['These settings need more memory than the device can provide.', '这组设置需要的内存超过设备上限。'],
             ['Choose a lower resolution or a shorter duration and retry.', '请降低分辨率或缩短时长后重试。']);
     if (/MPS backend out of memory|MPS (?:generation|encoding|decoding) reached|No unified-memory allowance|Native generation needs at least .* unified memory/i.test(text))
         return row('unified-memory', ['Not enough unified memory', '统一内存不足'],
-            ['On a Mac, the CPU and GPU share unified memory. This step needed more unified memory than was available at the time.', 'Mac 的 CPU 和 GPU 共用统一内存。这一步需要的统一内存超过了当时可用的量。'],
-            ['Close memory-heavy applications and retry, or choose a lower resolution or a shorter duration. If you set a memory limit or reserve in Settings, check it as well. If it still fails, export the report.', '请关闭占用内存较多的程序后重试，或降低分辨率、缩短时长。如果在设置中手动设置了内存上限或预留，请一并检查。仍然失败时，请导出报告。']);
+            ['Generation needed more memory than was available.', '生成所需内存超过当时可用量。'],
+            ['Close memory-heavy applications, or lower the resolution or duration, then retry. Export the report if it still fails.', '可关闭占用内存较多的程序，或调低分辨率、缩短时长后重试。仍然失败时，请导出报告。']);
     if (/CUDA out of memory|torch\.OutOfMemoryError|cudaErrorMemoryAllocation/i.test(text))
-        return row('vram', ['GPU memory allocation failed', '显存分配失败'],
-            ['The GPU could not allocate the memory needed at this stage.', '这一阶段的显存申请没有成功。'],
-            ['Close other GPU workloads and retry so FreeVideo can replan using the newly available memory. Your resolution, duration and steps are kept.', '关闭其他占用显卡的任务后重试，FreeVideo 会根据新的可用显存重新规划，保留你的分辨率、时长和步数。']);
+        return row('vram', ['GPU memory unavailable', '显存暂不可用'],
+            ['', ''],
+            ['Close other programs using the GPU, then retry.', '关闭其他占用显卡的程序后重试。']);
     const ramReasons = /RAM guard:\s*([a-z_, ]+)\./i.exec(text)?.[1] || '';
     if (ramReasons.includes('system_or_commit_pressure') && !ramReasons.includes('working_memory_budget'))
         return row('ram', ['System memory headroom is too low', '系统可用内存不足'],
-            ['Memory headroom fell below the safety threshold during execution, so generation stopped. Earlier planning values may be higher.', '运行时测得的系统内存余量低于保护线，生成已停止。此前资源规划时的数值可能更高。'],
+            ['Generation stopped because available memory was too low.', '可用内存不足，生成已停止。'],
             ['Close memory-heavy applications and duplicate FreeVideo/ComfyUI instances, then retry. Export the report if it still fails.', '关闭占用内存较多的程序及重复运行的 FreeVideo／ComfyUI 后重试。仍失败时请导出报告。']);
     if (ramReasons.includes('working_memory_budget') && !ramReasons.includes('system_or_commit_pressure'))
-        return row('ram', ['The configured RAM limit was reached', '已触及设置的 RAM 限额'],
-            ['The worker exceeded the enforced RAM budget from a manual limit or selected profile.', '生成进程超过了手动限额或所选配置规定的 RAM 预算。'],
-            ['Review the RAM limit or selected profile. Automatic mode replans from available memory. Export the report if it still fails.', '检查 RAM 限额或所选配置；自动模式会根据可用内存重新规划。仍失败时请导出报告。']);
+        return row('ram', ['Memory limit reached', '已达到内存上限'],
+            ['This generation exceeded the configured memory limit.', '本次生成超过了设置的内存上限。'],
+            ['Check the memory limit in Settings, or switch back to automatic. Export the report if it still fails.', '请在设置里检查内存上限，或改回自动。仍然失败时，请导出报告。']);
     if (/RAM guard:|crossed its RAM budget|Insufficient currently available memory/i.test(text))
-        return row('ram', ['Available memory or an explicit RAM limit reached', '可用内存或手动 RAM 限额不足'],
-            ['Automatic RAM estimates can be exceeded while memory is available. This stop indicates system pressure or an explicitly enforced limit.', '自动模式允许在系统仍有余量时超出预估 RAM；停止意味着系统内存压力，或触及了手动设置的硬限制。'],
-            ['Close memory-heavy applications and retry. If you set a RAM limit for testing, remove or raise it for normal generation. Copy the details below if it still fails.', '关闭占用内存较多的程序后重试。如果设置过测试用 RAM 限制，正常生成时可取消或调高。仍失败时可复制下方详情。']);
+        return row('ram', ['Memory is low or its limit was reached', '内存不足或已达到上限'],
+            ['Generation stopped because memory was low or its configured limit was reached.', '内存不足或已达到设置的上限，生成已停止。'],
+            ['Close memory-heavy applications and retry. If you set a memory limit, remove or raise it. Copy the details below if it still fails.', '关闭占用内存较多的程序后重试；设置过内存上限的，请取消或调高。仍然失败时，可复制下方详情。']);
+    if (outputNotWritable(text))
+        return row('output-folder', ['The output folder cannot be written to', '输出目录不可写'],
+            ['The video could not be saved.', '视频没能保存。'],
+            ['Check that the output folder can be written to, then retry.', '请检查输出文件夹的写入权限后重试。']);
+    if (/manifest\.json/i.test(text) && /No such file|FileNotFoundError|\[Errno 2\]/i.test(text))
+        return row('model-files', ['The model is not fully installed', '模型没有装全'],
+            ['Some of the model files FreeVideo needs are missing.', 'FreeVideo 需要的部分模型文件缺失。'],
+            repairAction());
     if (/No space left on device|WinError 112|disk (?:is )?full/i.test(text))
         return row('disk', ['Disk space is insufficient', '磁盘空间不足'],
             ['FreeVideo could not write a required file.', 'FreeVideo 无法写入所需文件。'],
@@ -294,14 +388,13 @@ export function failureAdvice(value, t, known = knownError(value)) {
     if (/Model download paused|unexpected-transfer-size|ConnectionError|ConnectTimeout|ReadTimeout|Every download source failed|All Git sources failed|All package sources failed|curl-28/i.test(text))
         return row('download', ['Download needs attention', '下载未完成'],
             ['A transfer failed or its received data did not match the expected file.', '传输中断，或收到的数据与预期文件不一致。'],
-            ['Check your connection or select another download source in Settings, then retry. Existing download fragments are retained.', '检查网络，或在设置中切换下载源后重试。已有下载片段会保留。']);
+            ['Choose another download source in Settings and retry; download progress is kept.', '可在设置中切换下载源后重试，下载进度会保留。']);
     if (/ModuleNotFoundError|No module named|DLL load failed/i.test(text))
-        return row('dependencies', ['A runtime dependency could not load', '运行依赖无法加载'],
-            ['A component FreeVideo needs could not load. This usually means the environment is incomplete or an incompatible environment was selected.', 'FreeVideo 运行所需的组件没能加载，通常是运行环境不完整，或者选择了不兼容的环境。'],
-            ['In the FreeVideo launcher, open Settings › Environment and click Repair; it checks this installation and restores what is missing. If it still fails, export the report and attach it to a GitHub issue.', '请在 FreeVideo 启动器的“设置 → 环境”里点击“修复”，它会检查这份安装并补齐缺少的组件。仍然失败时，请导出报告并提交到 GitHub issue。']);
+        return row('dependencies', ['A runtime component could not load', '运行组件无法加载'],
+            ['A component needed to run FreeVideo could not load.', 'FreeVideo 所需的运行组件未能加载。'],
+            ['Select "Repair" in the launcher under Settings > Environment. If it still fails, export the report and submit it in a GitHub issue.', '可在启动器“设置 → 环境”里点“修复”。仍然失败时，请导出报告并提交到 GitHub issue。']);
     return row('unknown', ['Generation stopped', '生成已停止'],
-        ['FreeVideo hit an internal error, and this generation did not finish.', 'FreeVideo 内部出错，这次生成没有完成。'],
-        ['Click Export report and attach the report to a GitHub issue; we will look into it and fix the problem for you.', '请点击“导出报告”，并把报告提交到 GitHub issue，我们会专门排查，为您解决这个问题。']);
+        ['', ''], ['', '']);
 }
 
 let activeDialog = null;
@@ -341,6 +434,34 @@ function showFailureDialog(report, t) {
 // cause drops it: the technical details and the report keep the original text.
 const shownCause = text => text.replace(/\s*Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=[\d.]+ to disable upper limit for memory allocations(?: \(may cause system failure\))?\.?/g, '');
 
+/** The written title and explanation for a report, and whether it gets the packaged layout (not a rejected input). */
+export function adviceFor(report, t, value) {
+    const advice = report.browser_extension
+        ? browserExtensionAdvice(report.browser_extension, t)
+        : failureAdvice(report.details, t, report.known_error ?? null);
+    // A dropped connection reads as one sentence; the browser's own wording stays in the details.
+    if (advice.kind === 'unknown' && isNetworkTypeError(value) && ['submission', 'queue'].includes(report.stage)) {
+        Object.assign(advice, {kind: 'connection', title: t('Lost the connection to FreeVideo', '与 FreeVideo 的连接已断开'), summary: connectionLostText(t), action: ''});
+    }
+    if (report.stage === 'submission' && advice.kind === 'unknown') {
+        advice.title = t('The task could not be submitted', '任务提交失败');
+        advice.summary = '';
+    }
+    if (report.stage === 'queue' && advice.kind === 'unknown') {
+        advice.title = t('The queue operation did not complete', '队列操作未完成');
+        advice.summary = t('Check that ComfyUI is still running and connected, then retry.', '请确认 ComfyUI 仍在运行、连接正常后重试。');
+    }
+    // Every failure except a rejected input (which the user fixes in place) has one layout: written title,
+    // Export report / Submit to GitHub, the raw error only inside the technical details.
+    const generated = advice.kind !== 'validation';
+    // A generation that stopped without a known cause is named by the stage it stopped in.
+    if (generated && advice.kind === 'unknown' && report.stage === 'execution') {
+        const stage = failureStage(report);
+        advice.title = stage ? t(`Generation did not finish: ${stage[0]}`, `生成未完成：${stage[1]}`) : t('Generation did not finish', '生成未完成');
+    }
+    return {advice, generated};
+}
+
 export function createErrorPanel(t) {
     if (!document.getElementById('freevideo-error-style')) {
         const style = document.createElement('style'); style.id = 'freevideo-error-style';
@@ -352,7 +473,7 @@ export function createErrorPanel(t) {
 .fv-failure code{display:inline-block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:inherit;white-space:nowrap;background:var(--fv-raised);border-radius:var(--fv-r-xs,3px);padding:0 3px}
 .fv-failure-dialog{box-sizing:border-box;font-size:14px;width:min(560px,94vw);max-height:88vh;overflow:auto;padding:22px 24px;border:1px solid var(--fv-border,#45454a);border-radius:var(--fv-r-lg,16px);background:var(--fv-bg,#202126);color:var(--fv-ink,#eee);box-shadow:0 24px 80px #0008}
 .fv-failure-dialog::backdrop{background:#070a0db8;backdrop-filter:blur(6px)}.fv-failure-dialog>.fv-failure{border:0;margin:0 0 16px;padding:0}.fv-failure-dialog>button,.fv-failure-dialog .fv-failure-primary{display:block;margin-left:auto;background:var(--fv-accent,#6db8fa);border-color:var(--fv-accent,#6db8fa);color:var(--fv-bg,#111720);font-weight:var(--fv-semibold,600)}
-.fv-failure .fv-extension-steps{font-size:14px;line-height:1.6}.fv-failure-reload{order:-1}.fv-failure-footer{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.fv-failure-footer>.fv-failure-actions{margin-right:auto}
+.fv-failure .fv-extension-steps{font-size:14px;line-height:1.6}.fv-failure-reload{order:-1}.fv-failure .fv-failure-copy{margin-top:8px}.fv-failure-footer{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.fv-failure-footer>.fv-failure-actions{margin-right:auto}
 .fv-failure-footer button{min-height:var(--fv-h-sm,32px);border:1px solid var(--fv-border,#45454a);border-radius:var(--fv-r-sm,8px);background:var(--fv-raised,#303138);color:var(--fv-ink,#eee);padding:5px 12px;font:inherit;font-weight:var(--fv-medium,500);cursor:pointer}.fv-failure-footer .fv-failure-primary{margin-left:0}`;
         document.head.append(style);
     }
@@ -361,27 +482,31 @@ export function createErrorPanel(t) {
     const title = document.createElement('strong'); title.textContent = t('Generation failed', '生成失败');
     const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = t('Copy error', '复制错误');
     const download = document.createElement('button'); download.type = 'button'; download.textContent = t('Export report', '导出报告');
+    // A generation that stopped offers two buttons: the report file, or the same facts as a GitHub issue.
+    const github = document.createElement('button'); github.type = 'button'; github.className = 'fv-failure-github';
+    github.textContent = t('Report a problem', '提交问题');
     // Shown only for a browser extension, whose steps end with a reload.
     const reload = document.createElement('button'); reload.type = 'button'; reload.className = 'fv-failure-reload';
     reload.textContent = t('Reload page', '刷新页面'); reload.hidden = true; reload.onclick = () => globalThis.location?.reload();
     const actions = document.createElement('div'); actions.className = 'fv-failure-actions';
     // Last in the DOM, first on screen (CSS order), so copy stays the first child.
-    actions.append(copy, download, reload);
+    actions.append(copy, download, reload, github);
     const explanation = document.createElement('p'), action = document.createElement('p');
     const location = document.createElement('p'), cause = document.createElement('p'); cause.className = 'fv-failure-cause';
     location.className = 'fv-failure-location';
     const privacy = document.createElement('p'); privacy.className = 'fv-failure-privacy';
-    privacy.textContent = t('Known input text, paths and common credentials are removed. Export saves a local JSON file; review it before sharing.',
-        '已去除已知输入文本、路径和常见凭据。导出会保存为本地 JSON 文件，分享前可查看内容。');
+    privacy.textContent = t('Paths and typed text are removed.', '已去掉路径和输入的文字。');
+    const privacyInside = document.createElement('p'); privacyInside.className = 'fv-failure-privacy'; privacyInside.hidden = true;
+    privacyInside.textContent = t('Paths and typed text are removed.', '已去掉路径和输入的文字。');
     const downloadStatus = document.createElement('p'); downloadStatus.setAttribute('role', 'status');
-    let currentReport = null;
+    let currentReport = null, githubLora = false;
     const disclosure = document.createElement('details'), summary = document.createElement('summary');
     summary.textContent = t('Technical details', '技术详情');
     const detailLocation = document.createElement('p'); detailLocation.className = 'fv-failure-location'; detailLocation.hidden = true;
     const detailCause = document.createElement('p'); detailCause.className = 'fv-failure-cause'; detailCause.hidden = true;
     const details = document.createElement('textarea'); details.readOnly = true;
     details.setAttribute('aria-label', t('Error details', '错误详情')); details.spellcheck = false;
-    copy.onclick = async () => {
+    const copyDetails = async button => {
         let copied = false;
         try { await navigator.clipboard.writeText(details.value); copied = true; } catch {
             // Remote ComfyUI commonly uses plain HTTP, where Clipboard API is
@@ -389,7 +514,23 @@ export function createErrorPanel(t) {
             disclosure.open = true; details.focus(); details.select();
             try { copied = document.execCommand('copy'); } catch { /* manual Ctrl+C */ }
         }
-        copy.textContent = copied ? t('Copied', '已复制') : t('Press Ctrl+C', '请按 Ctrl+C');
+        button.textContent = copied ? t('Copied', '已复制') : t('Press Ctrl+C', '请按 Ctrl+C');
+    };
+    copy.onclick = () => copyDetails(copy);
+    // A generation failure keeps the raw text inside the collapsed technical details, with its own copy button.
+    const copyInside = document.createElement('button'); copyInside.type = 'button'; copyInside.className = 'fv-failure-copy';
+    copyInside.hidden = true; copyInside.onclick = () => copyDetails(copyInside);
+    // The issue address needs two browser-only modules. They load when the card is shown, so the click opens the
+    // page at once (a page opened after waiting can be blocked as a pop-up).
+    let issueModules = null;
+    const loadIssueModules = () => import('./feedback.js').then(feedback => import('./updates.js').then(updates => { issueModules = {feedback, updates}; })).catch(() => {});
+    github.onclick = async () => {
+        if (!currentReport) return;
+        if (!issueModules) await loadIssueModules();
+        if (!issueModules) return;
+        const draft = failureIssue(currentReport, element.freevideoKind, {lora: githubLora, t});
+        const url = issueModules.feedback.feedbackIssueURL(draft.text, issueModules.updates.productVersion(), draft.summary, draft.title);
+        globalThis.open?.(url, '_blank', 'noopener');
     };
     download.onclick = () => {
         if (!currentReport) return;
@@ -406,30 +547,18 @@ export function createErrorPanel(t) {
             // disabled by the browser or the page is served over plain HTTP.
             disclosure.open = true; details.value = JSON.stringify(currentReport, null, 2);
             details.focus(); details.select();
-            downloadStatus.textContent = t('Download unavailable. Use Copy error to copy the report below.', '浏览器未能下载，请点击“复制错误”复制下方完整报告。');
+            downloadStatus.textContent = t('The download did not finish; select "Copy error" to copy the report below.', '下载未完成，可点“复制错误”复制下方报告。');
         } finally {
             link?.remove();
             if (url) setTimeout(() => URL.revokeObjectURL(url), 30000);
         }
     };
-    disclosure.append(summary, detailLocation, detailCause, details);
+    disclosure.append(summary, detailLocation, detailCause, details, copyInside, privacyInside);
     head.append(title, actions); element.append(head, explanation, location, cause, action, disclosure, privacy, downloadStatus);
     return {element, show(value, popup = true, context = {}) {
         const report = createErrorReport(value, context); currentReport = report;
-        const advice = report.browser_extension
-            ? browserExtensionAdvice(report.browser_extension, t)
-            : failureAdvice(report.details, t, report.known_error ?? null);
-        if (report.stage === 'submission' && advice.kind === 'unknown') {
-            advice.title = t('The task could not be submitted', '任务提交失败');
-            advice.summary = t('The task submission returned an error. Its details are shown below.', '提交任务时返回了错误，具体原因显示在下方。');
-        }
-        if (report.stage === 'queue' && advice.kind === 'unknown') {
-            advice.title = t('The queue operation did not complete', '队列操作未完成');
-            advice.summary = t('Check that ComfyUI is still running and connected, then retry.', '请确认 ComfyUI 仍在运行、连接正常后重试。');
-        }
-        if (advice.kind === 'unknown' && ['submission', 'queue'].includes(report.stage))
-            advice.action = t('Copy the error details when reporting the issue; they include the failed stage when available.', '反馈问题时请复制错误详情，其中会保留已记录的失败阶段。');
-        title.textContent = advice.title; explanation.textContent = advice.summary; action.textContent = advice.action;
+        const {advice, generated} = adviceFor(report, t, value);
+        title.textContent = advice.title; explanation.textContent = advice.summary; explanation.hidden = !advice.summary; action.textContent = advice.action;
         element.querySelector('.fv-extension-steps')?.remove();
         if (advice.kind === 'browser-extension') action.after(extensionSteps(advice));
         element.freevideoKind = advice.kind; reload.hidden = advice.kind !== 'browser-extension';
@@ -441,15 +570,14 @@ export function createErrorPanel(t) {
         }
         action.hidden = !advice.action;
         const stage = report.stage === 'submission' ? t('Submitting task', '提交任务')
-            : report.stage === 'queue' ? t('Queue operation', '队列操作') : t('Executing workflow', '执行工作流');
+            : report.stage === 'queue' ? t('Queue operation', '队列操作') : t('Generating', '正在生成');
         location.textContent = stage + (report.http_status ? ` · HTTP ${report.http_status}` : '')
             + report.nodes.map(node => ` · ${node.type || t('Node', '节点')} #${node.id}`).join('');
         const reasons = report.nodes.flatMap(node => node.errors.map(error =>
             `${node.type || t('Node', '节点')} #${node.id}${error.input ? ' · ' + error.input : ''}: ${error.message}${error.details ? ': ' + error.details : ''}`));
         const causeText = shownCause(reasons.length ? reasons.join('\n') : [report.message, report.error_details].filter(Boolean).join('\n'));
         const internal = advice.kind === 'unknown' && !['submission', 'queue'].includes(report.stage);
-        const causeInDetails = advice.kind === 'browser-extension'
-            || advice.kind !== 'validation' && !['submission', 'queue'].includes(report.stage);
+        const causeInDetails = generated;
         location.hidden = causeInDetails; detailLocation.hidden = !causeInDetails;
         detailLocation.textContent = causeInDetails ? location.textContent : '';
         if (causeInDetails) location.textContent = '';
@@ -460,18 +588,27 @@ export function createErrorPanel(t) {
         downloadStatus.textContent = '';
         download.hidden = diagnosticReports.has(report);
         if (internal && download.hidden)
-            action.textContent = t('Click Download report in the preview or node panel and attach the report to a GitHub issue; we will look into it and fix the problem for you.',
-                '请在预览区或节点面板中点击“下载报告”，并把报告提交到 GitHub issue，我们会专门排查，为您解决这个问题。');
+            action.textContent = t('Use Download report in the preview and submit it in a GitHub issue.',
+                '请点预览区的“下载报告”，提交到 GitHub issue。');
         else if (download.hidden) {
             // Advice that ends with "export the report" points at the report this card does offer.
             for (const [from, to] of EXPORT_TO_DOWNLOAD)
                 if (action.textContent.includes(from)) action.textContent = action.textContent.replace(from, to);
         }
+        action.hidden = !action.textContent;
         privacy.textContent = download.hidden
-            ? t('Use Download report in the preview or node panel for the diagnostic report.', '完整诊断请使用预览区或节点面板中的“下载报告”。')
-            : t('Known input text, paths and common credentials are removed. Export saves a local error summary; review it before sharing.',
-                '已去除已知输入文本、路径和常见凭据。导出会保存本地错误摘要，分享前可查看内容。');
-        copy.textContent = t('Copy error', '复制错误');
+            ? t('Select "Download report" in the preview to save the full diagnostic information.', '可在预览区点“下载报告”保存完整诊断信息。')
+            : t('Paths and typed text are removed.', '已去掉路径和输入的文字。');
+        copy.textContent = advice.kind === 'sampling-table' ? t('Copy details', '复制详情') : t('Copy error', '复制错误');
+        // A generation failure shows two buttons; copying moves into the technical details.
+        copy.hidden = generated; copyInside.hidden = !generated; copyInside.textContent = copy.textContent;
+        // For a generation failure the note on removed text sits in the technical details, beside the copy button.
+        privacy.hidden = generated; privacyInside.hidden = !generated;
+        const lora = advice.kind === 'lora-unusable' || advice.kind === 'lora-int8';
+        // An int8 limit is not a judgement, so there is no mistake to report.
+        github.hidden = !generated || advice.kind === 'lora-int8'; githubLora = lora;
+        github.textContent = lora ? t('Report a mistake', '报告误判') : t('Report a problem', '提交问题');
+        if (generated && typeof window !== 'undefined') loadIssueModules();
         if (popup) showFailureDialog(report, t);
         return report;
     }, clear() { currentReport = null; details.value = ''; element.hidden = true; }};

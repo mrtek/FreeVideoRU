@@ -1,0 +1,21 @@
+SAM 2.1 Hiera small inference code and checkpoint
+Copyright (c) Meta Platforms, Inc. and affiliates. Apache License, Version 2.0.
+Full license: SAM2-Apache-2.0.txt in this directory.
+Source: https://github.com/facebookresearch/sam2
+Pinned revision: 2b90b9f5ceec907a1c18123530e92e794ad901a4
+Imported from the pinned region-sam/upstream/sam2 delivery.
+
+FreeVideo modifications (2026-10-18): inference modules are namespaced as
+freevideo_engine.sam2; Hydra initialization and the hub-download constructor are
+omitted; Hiera uses Python open and weights_only=True instead of iopath. The
+fixed sam2.1_hiera_s configuration is constructed in image_gen/segment.py.
+RoPE frequency construction stays on CPU and CUDA position-cache warmup is disabled.
+No upstream inference mathematics or image transforms are changed. Automatic
+masks, video predictors, training code, CUDA extension and setup scripts are
+not included. Postprocessing holes/sprinkles is disabled, as in the reference.
+
+Checkpoint: facebook/sam2.1-hiera-small/sam2.1_hiera_small.pt
+184416285 bytes
+SHA256: 6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38
+https://huggingface.co/facebook/sam2.1-hiera-small
+The official SAM2 README licenses model checkpoints under Apache-2.0 as well.

@@ -39,7 +39,7 @@ function travel({history, future, doc = history[history.length - 1], selection =
     const nextHistory = direction < 0 ? history.slice(0, -1) : [...history, future[future.length - 1]];
     const nextFuture = direction < 0 ? [...future, history[history.length - 1]] : future.slice(0, -1);
     let next = nextHistory[nextHistory.length - 1];
-    if (!next.layers.some(l => l.id === next.active)) next = {...next, active: next.layers[next.layers.length - 1].id};
+    if (!next.layers.some(l => l.id === next.active)) next = {...next, active: next.layers.at(-1)?.id || null};
     const sx = next.width / doc.width, sy = next.height / doc.height;
     return {history: nextHistory, future: nextFuture, doc: next,
         selection: sx === 1 && sy === 1 ? selection : scaleSelection(selection, sx, sy), scale: {sx, sy}};
@@ -49,7 +49,7 @@ export function redoStep(state) { return travel(state, 1); }
 
 export function insertLayer(doc, layer) {
     const index = doc.layers.findIndex(l => l.id === doc.active);
-    if (index < 0) fail('not_found', 'Active layer not found');
+    if (index < 0 && doc.layers.length) fail('not_found', 'Active layer not found');
     if (doc.layers.some(l => l.id === layer.id)) fail('unsupported', 'Duplicate layer id');
     const layers = [...doc.layers]; layers.splice(index + 1, 0, layer);
     return {...doc, layers, active: layer.id};
@@ -86,7 +86,8 @@ export function deleteLayer(doc, id) {
 export function moveLayer(doc, id, delta) {
     layerOf(doc, id);
     const index = doc.layers.findIndex(l => l.id === id), to = index + delta;
-    if (!Number.isInteger(delta) || index < 1 || to < 1 || to >= doc.layers.length) fail('range', 'Layer move out of range');
+    const first = doc.layers[0]?.id === 'base' ? 1 : 0;
+    if (!Number.isInteger(delta) || index < first || to < first || to >= doc.layers.length) fail('range', 'Layer move out of range');
     const layers = [...doc.layers]; [layers[index], layers[to]] = [layers[to], layers[index]];
     return {...doc, layers};
 }

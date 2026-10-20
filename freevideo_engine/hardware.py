@@ -23,6 +23,8 @@ class Hardware:
     cgroup_ram_limit: int | None = None
     gpu_uuid: str = ''
     driver_version: str = ''
+    ram_physical_available: int | None = None
+    ram_commit_available: int | None = None
 
     @property
     def architecture(self):
@@ -177,8 +179,9 @@ def detect():
     import json
     import subprocess
     import sys
+    from . import subprocess_output
     code = 'import json; from freevideo_engine.hardware import _detect_local; print(json.dumps(_detect_local().to_dict()))'
-    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+    result = subprocess_output.run_python([sys.executable, '-c', code], capture_output=True)
     if result.returncode:
         error = RuntimeError('Hardware detection failed: ' + result.stderr[-2000:])
         # The probe imports torch; a damaged library can end it without a word
@@ -195,11 +198,13 @@ def detect():
     limit, available = cgroup_capacity(include_reclaimable=True)
     return replace(observed, ram_total=memory['total_bytes'],
                    ram_available=min(memory['available_bytes'], available) if available is not None else memory['available_bytes'],
-                   cgroup_ram_limit=limit)
+                   cgroup_ram_limit=limit, ram_physical_available=memory.get('physical_available_bytes'),
+                   ram_commit_available=memory.get('commit_available_bytes'))
 
 
 def _detect_local():
     from .system import system_memory, nvidia_smi
+    from . import subprocess_output
     import subprocess
     import torch
     if not torch.cuda.is_available():
@@ -216,12 +221,13 @@ def _detect_local():
         query = [nvidia_smi(), '--query-gpu=driver_version', '--format=csv,noheader']
         if uuid:
             query += ['--id=' + uuid]
-        driver = subprocess.check_output(query, text=True, stderr=subprocess.DEVNULL, timeout=5).strip().splitlines()[0]
+        driver = subprocess_output.output_external(query, stderr=subprocess.DEVNULL, timeout=5).strip().splitlines()[0]
     except (OSError, RuntimeError, subprocess.SubprocessError, IndexError):
         pass
     return Hardware(torch.cuda.get_device_name(index), torch.cuda.get_device_capability(index),
                     total, free, ram['total_bytes'], min(ram['available_bytes'], available) if available is not None else ram['available_bytes'],
-                    platform.system(), str(torch.__version__), str(torch.version.cuda), cap, uuid, driver)
+                    platform.system(), str(torch.__version__), str(torch.version.cuda), cap, uuid, driver,
+                    ram.get('physical_available_bytes'), ram.get('commit_available_bytes'))
 
 
 def installed_backends():

@@ -1,6 +1,7 @@
 .fv-studio .fv-guide-layer{position:fixed;inset:0;z-index:40;pointer-events:none;overflow:hidden;font-family:var(--fv-font);color:var(--fv-ink)}
 .fv-studio .fv-guide-ring{position:absolute;border:2px solid var(--fv-accent);box-shadow:0 0 0 9999px rgb(0 0 0 / 42%);pointer-events:none}
 .fv-studio .fv-guide-bubble{position:absolute;pointer-events:auto;width:340px;max-width:calc(100vw - 48px);padding:20px;border-radius:14px;background:var(--fv-raised);border:1px solid var(--fv-border);box-shadow:0 16px 48px #0005}
+.fv-studio .fv-guide-layer[data-group=editor] .fv-guide-bubble{max-width:calc(100vw - 24px)}
 .fv-studio .fv-guide-message{font-size:14px;font-weight:400;line-height:1.6;text-wrap:balance;margin:0;white-space:normal;overflow-wrap:normal;color:var(--fv-ink)}
 .fv-studio .fv-guide-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:18px}
 .fv-studio .fv-guide-dots{display:flex;align-items:center;gap:6px;flex-shrink:0}
@@ -19,4 +20,16 @@
 .fv-studio .fv-guide-bubble[data-side=below] .fv-guide-arrow{top:-7px;border-left:1px solid var(--fv-border);border-top:1px solid var(--fv-border)}
 .fv-studio .fv-guide-wait{position:absolute;top:76px;right:24px;z-index:40;display:flex;align-items:center;gap:16px;max-width:calc(100% - 48px);padding:14px 18px;background:var(--fv-raised);border:1px solid var(--fv-border);border-radius:var(--fv-r-sm);box-shadow:0 8px 24px #0005}
 .fv-studio .fv-guide-wait p{margin:0;font-size:14px;line-height:1.6}
+.fv-studio .fv-guide-bubble[data-side=center] .fv-guide-arrow{display:none}
+.fv-studio .fv-guide-picture{display:block;width:100%;height:auto;margin:0 0 14px;border-radius:8px;border:1px solid var(--fv-border)}
 @media(prefers-reduced-motion:reduce){.fv-studio .fv-guide-layer *{transition:none!important;animation:none!important}}
+
+.fv-studio .fv-entry-showcase{display:grid;place-items:center;pointer-events:auto;padding:24px;background:#0008;overflow:auto}
+.fv-studio .fv-showcase-card{position:relative;width:min(760px,100%);max-height:100%;overflow:auto;padding:32px 24px 24px;border:1px solid var(--fv-border);border-radius:var(--fv-r-lg,16px);background:var(--fv-raised);box-shadow:0 24px 80px #0006;text-align:center}
+.fv-studio .fv-showcase-card h2{margin:0 24px 24px;font-size:clamp(19px,3vw,26px);line-height:1.4;font-weight:600;text-wrap:balance}
+.fv-studio .fv-showcase-card:focus{outline:none}
+.fv-studio .fv-showcase-card img{display:block;width:100%;height:auto;aspect-ratio:960/272;object-fit:contain;border-radius:var(--fv-r-sm,8px);background:#ddd}
+.fv-studio .fv-showcase-card .fv-guide-next{margin-top:24px;min-width:112px;min-height:40px;height:auto;font-size:14px}
+.fv-studio button.fv-showcase-close{position:absolute;top:8px;right:8px;width:36px;height:36px;min-height:36px;padding:0;border:0;background:transparent;color:var(--fv-muted);font-size:25px;line-height:1}
+.fv-studio button.fv-showcase-close:hover{color:var(--fv-ink);background:var(--fv-hover)}
+@media(max-width:480px){.fv-studio .fv-entry-showcase{padding:12px}.fv-studio .fv-showcase-card{padding:40px 12px 20px}.fv-studio .fv-showcase-card h2{margin:0 12px 20px;font-size:20px}}

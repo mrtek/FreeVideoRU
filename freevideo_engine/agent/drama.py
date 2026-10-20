@@ -20,6 +20,7 @@ import re
 import time
 
 from . import spec as specs
+from ..chain_plan import MIN_PART_SECONDS
 
 EXAMPLE = {
     'title': '末班车', 'name': 'the-last-train', 'aspect': '9:16', 'quality': 'light',
@@ -33,7 +34,7 @@ EXAMPLE = {
                    'looking up at the departure board.', 'camera': 'The camera tracks her with small amplitude, then '
          'holds still.', 'lines': [{'who': 'lin', 'line': '还来得及吗？', 'how': 'says breathlessly'}],
          'sound': 'Heavy rain on the platform roof, splashing footsteps, the buzz of the lamp.'},
-        {'id': 'arrival', 'seconds': 6, 'continue': True, 'framing': 'vertical medium close-up',
+        {'id': 'arrival', 'seconds': 10, 'continue': True, 'framing': 'vertical medium close-up',
          'action': 'A train headlight sweeps across Lin\'s face; the wind of the arriving train lifts her wet hair and '
                    'her worry turns into a relieved smile.', 'camera': 'The camera pushes in slowly toward her face.',
          'lines': [{'who': 'lin', 'line': '来了。', 'how': 'says quietly'}],
@@ -60,8 +61,9 @@ class Screenplay(ValueError):
 CAPTIONED = 3  # the score of a take with unwanted captions
 CARD = re.compile(r'c[0-9a-f]{12}')  # characters.<key>.card names a cast library card
 # How a shot carries its cast cards. Change these after the reference tests; nothing else needs to.
-PICTURE_ORDER = ('sheet', 'front', 'three_quarter', 'face')  # then any other label, in card order
-PICTURES_EACH = 3
+# Each person is two pictures: one sheet of every view (made by the cast library when the card has none), then
+# the face close-up. A continuing shot with several people has no room for two each: it carries one picture a person.
+FACE_ORDER = ('face', 'front', 'three_quarter')  # the one picture standing for a person, then any other label, in card order
 MAX_VOICES = 3      # voice clips per shot, the model limit
 MAX_REFERENCES = 32
 
@@ -149,16 +151,16 @@ def check(play):
                 validate(specs._int, shot[field], path + '/' + field, low, high)
         if 'seconds' in shot:
             validate(specs._number, shot['seconds'], path + '/seconds', 1.625, 60.)
-        modes = int(shot.get('first') is not None) + int(bool(shot.get('continue'))) + int('references' in shot)
-        if modes > 1:
-            problem(path, 'first, continue and references are mutually exclusive')
+        # A continuing shot starts from the previous one and may add reference pictures, never a first frame.
+        if shot.get('first') is not None and (shot.get('continue') or shot.get('references')):
+            problem(path, 'first is exclusive with continue and references')
         # Continuing a shot, or one longer than one 15 s block, needs two-pass text generation.
         seconds = shot.get('seconds', play.get('seconds'))
         long = isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 15
         if ((shot.get('continue') or long) and play.get('quality') in specs.QUALITY
                 and not specs.QUALITY[play['quality']][0] and all(p['path'] != '/quality' for p in problems)):
-            problem('/quality', '"light" (two-pass) when a shot continues another or is longer than 15 s')
-        if long and (shot.get('first') is not None or 'references' in shot):
+            problem('/quality', '"light" or "medium" (two-pass) when a shot continues another or is longer than 15 s')
+        if long and (shot.get('first') is not None or shot.get('references') and not shot.get('continue')):
             problem(path + '/seconds', 'at most 15 with a first frame or references')
         elif long and not shot.get('continue') and _carded(play, shot):
             # Cast cards travel as references, which one generation of at most 15 s carries.
@@ -170,9 +172,13 @@ def check(play):
             refs = shot['references']
             if not isinstance(refs, list) or len(refs) > 32:
                 problem(path + '/references', 'must be a list of at most 32 items')
+            elif shot.get('continue') and len(refs) > specs.CONTINUED_PICTURES:
+                problem(path + '/references', 'at most %d pictures when the shot continues' % specs.CONTINUED_PICTURES)
             if isinstance(refs, list):
                 for j, ref in enumerate(refs):
-                    validate(specs.media_item, ref, path + '/references/%d' % j)
+                    validate(specs.media_item, ref, path + '/references/%d' % j, image=bool(shot.get('continue')))
+                    if shot.get('continue') and not specs.still_picture(ref):
+                        problem(path + '/references/%d' % j, 'must be a picture when the shot continues')
         if 'cast' in shot:
             if not isinstance(shot['cast'], list):
                 problem(path + '/cast', 'must be a list of character names')
@@ -260,7 +266,9 @@ def prompt(play, shot):
 def subject_definitions(subjects):
     """The prompt prefix tying cast cards to their reference tags; the one place its wording lives.
 
-    subjects: [{'name', 'description', 'pictures': (first, last) or None, 'audio': number or None}]."""
+    subjects: [{'name', 'description', 'pictures': (first, last), a list of such pairs, or None, 'audio': number or None}].
+    The page writes the same prompt from the same wording (web/cast_mention.js); tests/fixtures/subject_definitions.json
+    holds the cases both sides must reproduce exactly."""
     parts = []
     for number, subject in enumerate(subjects, 1):
         text = '<Subject %d> is %s' % (number, subject['name'])
@@ -268,9 +276,12 @@ def subject_definitions(subjects):
         text += (': %s.' % description) if description else '.'
         tags = []
         if subject.get('pictures'):
-            first, last = subject['pictures']
-            pictures = '<Picture %d>' % first if first == last else '<Picture %d> to <Picture %d>' % (first, last)
-            tags.append('%s show%s its appearance' % (pictures, 's' if first == last else ''))
+            # One (first, last) pair, or several when the person's pictures are not side by side.
+            ranges = [subject['pictures']] if isinstance(subject['pictures'][0], int) else subject['pictures']
+            pictures = ', '.join('<Picture %d>' % a if a == b else '<Picture %d> to <Picture %d>' % (a, b)
+                                 for a, b in ranges)
+            single = len(ranges) == 1 and ranges[0][0] == ranges[0][1]
+            tags.append('%s show%s its appearance' % (pictures, 's' if single else ''))
         if subject.get('audio'):
             tags.append('<Audio %d> is its voice' % subject['audio'])
         if tags:
@@ -279,10 +290,32 @@ def subject_definitions(subjects):
     return 'subject_definitions: ' + ' '.join(parts)
 
 
-def _pictures(card):
-    rank = {label: i for i, label in enumerate(PICTURE_ORDER)}
-    rows = sorted(enumerate(card.get('images') or []), key=lambda r: (rank.get(r[1]['label'], len(rank)), r[0]))
-    return [row['media'] for _, row in rows[:PICTURES_EACH]]
+def _views(card):
+    """The card's pictures other than a sheet, best stand-in first: the face, the front, the three-quarter view, the rest."""
+    rank = {label: i for i, label in enumerate(FACE_ORDER)}
+    rows = [(i, row) for i, row in enumerate(card.get('images') or []) if row['label'] != 'sheet']
+    rows.sort(key=lambda r: (rank.get(r[1]['label'], len(rank)), r[0]))
+    return [row['media'] for _, row in rows]
+
+
+def sheet_of(card):
+    """The card's sheet of every view: one it carries itself, else the one the cast library made from its pictures."""
+    own = next((row['media'] for row in card.get('images') or [] if row['label'] == 'sheet'), None)
+    return own or card.get('_sheet')
+
+
+def person_pictures(card, *, alone=True, continues=False):
+    """The pictures one person carries into a shot, in order: the sheet, then the face close-up (the front view
+    when there is no face). Two of them on every device. A card that has no sheet (one picture, or none could be
+    made) carries its face alone (else the front view). A shot that continues the previous one with several
+    people carries only the face (else the front view) of each, with no sheet."""
+    views = _views(card)
+    if continues and not alone:
+        return views[:1] or ([sheet_of(card)] if sheet_of(card) else [])
+    sheet = sheet_of(card)
+    if sheet is None:
+        return views[:1]
+    return [sheet] + [view for view in views[:1] if view.get('file') != sheet.get('file')]
 
 
 def cast_references(play, shot, cards, *, continues=False):
@@ -290,21 +323,22 @@ def cast_references(play, shot, cards, *, continues=False):
 
     cards maps a card ID to the current card, or None once it is gone. The same
     function serves plan previews and the moment a take is submitted.
-    cast_reference: None (no character in the shot has a card), 'inherited'
-    (continues the previous shot), 'own' (the shot names its own first frame or
-    references), 'missing' (a card was deleted), 'partial' (not everyone fit)
-    or 'cards'. 'omitted' lists people left out entirely; 'voice_omitted' lists
-    people whose pictures are carried but whose voice did not fit."""
+    pictures_each is the most pictures one person carries in this shot.
+    cast_reference: None (no character in the shot has a card), 'own' (the shot
+    names its own first frame or references; an empty list means no pictures), 'missing' (a card was deleted),
+    'partial' (not everyone fit) or 'cards'. 'omitted' lists people left out
+    entirely; 'voice_omitted' lists people whose pictures are carried but whose
+    voice did not fit. A shot that continues the previous one carries no voice
+    clip (its voices carry on from the previous shot) and at most CONTINUED_PICTURES
+    pictures: two for a single person, else one for each of up to that many people."""
     characters = play.get('characters', {})
     keys = [k for k in cast(play, shot) if isinstance(characters[k].get('card'), str)]
     result = dict(cast_reference=None, people=[], omitted=[], voice_omitted=[], missing=[], references=[],
-                  prefix=None, subjects=[], cards={})
+                  prefix=None, subjects=[], cards={}, pictures_each=None, clip_seconds=[])
     if not keys:
         return result
-    if continues:
-        result['cast_reference'] = 'inherited'
-        return result
-    if shot.get('first') is not None or 'references' in shot:
+    # A references list, even an empty one, is the shot's own choice: cards are added only when it is left out.
+    if shot.get('first') is not None or isinstance(shot.get('references'), list):
         result['cast_reference'] = 'own'
         return result
     spoken = {}
@@ -312,13 +346,21 @@ def cast_references(play, shot, cards, *, continues=False):
         spoken[line['who']] = spoken.get(line['who'], 0) + 1
     # People with more lines come first when not everyone fits; ties keep the order of appearance.
     chosen, pictures, voices = [], 0, 0
+    alone = sum(1 for k in keys if cards.get(characters[k]['card']) is not None
+                and (cards[characters[k]['card']].get('images') or [])) == 1
     for key in sorted(keys, key=lambda k: -spoken.get(k, 0)):
         identity = characters[key]['card']
         card = cards.get(identity)
         if card is None:
             result['missing'].append(key)
             continue
-        images = _pictures(card)
+        images = person_pictures(card, alone=alone, continues=continues)
+        if continues:
+            if images and len(chosen) < specs.CONTINUED_PICTURES:
+                chosen.append((key, card, images, False))
+            else:
+                result['omitted'].append(key)
+            continue
         voice = card.get('voice') is not None and voices < MAX_VOICES
         if pictures + len(images) + voices + voice > MAX_REFERENCES:
             result['omitted'].append(key)
@@ -334,6 +376,7 @@ def cast_references(play, shot, cards, *, continues=False):
         result['references'].extend(dict(item) for item in images)
         if voice:
             clips.append(dict(card['voice']['clip']))
+            result['clip_seconds'].append(card['voice'].get('end', 15.) - card['voice'].get('start', 0.))
         person = characters[key]
         subject = dict(name=person.get('name') or key, description=card.get('description'),
                        pictures=(picture + 1, picture + len(images)) if images else None,
@@ -344,6 +387,7 @@ def cast_references(play, shot, cards, *, continues=False):
         result['people'].append(dict(character=key, card=card['id'], revision=card['revision'],
                                      pictures=len(images), voice=voice))
     result['references'].extend(clips)
+    result['pictures_each'] = max((len(images) for _, _, images, _ in chosen), default=0) or None
     if subjects:
         result['prefix'] = subject_definitions(subjects)
         result['subjects'] = subjects
@@ -406,10 +450,16 @@ def intent(play, shot):
                                                           shot.get('camera'), lines, looks) if x and x.strip())
 
 
+def shot_seconds(play, shot):
+    """A shot says its length; else the film does; else 6 s, and 10 s for a shot that continues the one before
+    (a part that continues another video is at least 10 s)."""
+    return shot.get('seconds', play.get('seconds', MIN_PART_SECONDS if shot.get('continue') else 6))
+
+
 def shot_job(play, shot, index, ref):
     job = dict(ref=ref, label='%s · %s' % (play.get('title') or 'drama', shot['id']), project=play.get('name'),
                aspect=play.get('aspect', '9:16'), quality=play.get('quality', 'light'),
-               seconds=shot.get('seconds', play.get('seconds', 6)), metadata={'drama_shot': shot['id']})
+               seconds=shot_seconds(play, shot), metadata={'drama_shot': shot['id']})
     if play.get('megapixels'):
         job['megapixels'] = play['megapixels']
     if shot.get('seed') is not None:
@@ -448,7 +498,7 @@ def batch(play):
     for i, shot in enumerate(play['shots']):
         if shot.get('idea') and not shot.get('action') and not shot.get('prompt'):
             rows.append(dict(ref='s%d-idea' % i, kind='enhance', text=shot['idea'],
-                             seconds=shot.get('seconds', play.get('seconds', 6)), project=play.get('name'),
+                             seconds=shot_seconds(play, shot), project=play.get('name'),
                              label='%s · %s idea' % (play.get('title') or 'drama', shot['id'])))
         rows.append(shot_job(play, shot, i, 's%d' % i))
     rows.append(review_job(play, [(shot, '@s%d' % i) for i, shot in enumerate(play['shots'])]))

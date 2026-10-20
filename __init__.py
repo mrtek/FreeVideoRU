@@ -17,6 +17,12 @@ async def comfy_entrypoint():
     setup_routes()
     from .freevideo_engine.prompt_vlm.service import register as prompt_routes
     prompt_routes()
+    try:
+        from .freevideo_engine.image_gen.service import register as image_routes
+        image_routes()
+    except Exception as error:
+        import logging
+        logging.warning('[FreeVideo] Image generation routes not registered: %s', error)
     from .freevideo_engine.comfy_launcher_api import register as launcher_routes
     launcher_routes()
     from .freevideo_engine.comfy_updates import register as update_routes
@@ -43,5 +49,6 @@ async def comfy_entrypoint():
     except Exception as error:
         import logging
         logging.warning('[FreeVideo] Agent routes not registered: %s', error)
-    from .freevideo_engine.comfy_nodes import FreeVideoExtension
+    from .freevideo_engine.comfy_nodes import FreeVideoExtension, register_prompt_cleanup
+    register_prompt_cleanup()
     return FreeVideoExtension()

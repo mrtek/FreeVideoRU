@@ -218,7 +218,6 @@ def encode(prompt, output, *, root, budget_bytes=3 * 2**30, reserve_bytes=2 * 2*
                 # encoder reference before the independent input VAE is loaded.
                 del encoded, tokens, vision_kwargs
                 release_encoder()
-                # Text streaming deliberately uses a small allocation ceiling.
                 # Input VAEs have separate workspaces: re-admit after releasing
                 # text weights, against the request's original capacity bound.
                 # configure_budget also enforces live availability, the reserve

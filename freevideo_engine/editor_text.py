@@ -8,6 +8,7 @@ from functools import lru_cache
 from bisect import bisect_right
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -79,7 +80,7 @@ def validate_text_project(raw, validate_media):
             _check(all(c.get(k) is None for k in ('source','pending','link','part','job','reason')) and c.get('extend',False) is False
                    and ('versions' not in c or isinstance(c['versions'],list) and not c['versions']))
             _check(type(c.get('in',0)) is int and c.get('in',0) == 0 and type(c.get('length',c['frames'])) is int and c.get('length',c['frames']) == c['frames'])
-            _check(not any(k in c for k in ('volume','fit','splice','target_frames','text_by','ref','take','made_text')))
+            _check(not any(k in c for k in ('volume','fit','splice','target_frames','text_by','ref','note','take','made_text')))
             clip = dict(id=identity, start=c['start'], frames=c['frames'], length=c['frames'], source=None,
                         link=None, text=text, part=None, pending=None, reason=None, job=None, extend=False, versions=[], text_kind=kind, **{'in':0})
             _check(kind != 'subtitle' or 'text_style' not in c)
@@ -136,7 +137,8 @@ def _font(name, bold, size):
 @lru_cache(maxsize=8)
 def _verify_font(path, digest):
     if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
-        raise ValueError('Text font coverage is out of date')
+        # A replaced font can still render; the cached check warns once per face.
+        logging.getLogger(__name__).warning('Text font coverage is out of date; using font: %s', path)
 
 
 def wrap_text(text, measure, width):

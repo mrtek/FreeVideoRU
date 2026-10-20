@@ -30,6 +30,7 @@ NAMES = {'report.json', 'report.csv', 'inventory.json', 'case.json', 'status.jso
          'prompt-rewrite.json',
          'plan.json', 'machine.before.json', 'comparison.json', 'profile.json',
          'result.json', 'gpu.csv', 'ram.jsonl', 'network.jsonl', 'optimization.json', 'storage.json', 'kernel-capabilities.json'}
+SENSITIVE_FILES = frozenset(('lan-password.json', 'lan-devices.json'))
 SENSITIVE = re.compile(r'(?:^|[_-])(?:token|password|secret|credential|api[_-]?key)(?:$|[_-])', re.I)
 # Path-bearing fields are retained only as installation-relative names (when a
 # known report root is available) or as a basename under ``<PATH>``.  Reports
@@ -283,6 +284,9 @@ def collect(root, config, run, output, *, complete=False, extra_files=(), notes=
             manifest['payload_bytes'] += len(data)
 
         def add_path(name, path):
+            if Path(path).name.lower() in SENSITIVE_FILES:
+                manifest['omitted'].append({'file': name, 'reason': 'Private LAN authentication record'})
+                return
             try:
                 data, truncated = read_complete(path) if complete else read_bounded(path)
                 add(name, data, truncated)
@@ -403,7 +407,7 @@ def collect(root, config, run, output, *, complete=False, extra_files=(), notes=
         # What the browser page found (web/health.js), and the page files of the
         # source ComfyUI served: a missing or changed file explains a page
         # without FreeVideo's styles or workspace.
-        for name in ('page-check.json', 'page-checks.jsonl'):
+        for name in ('page-check.json', 'page-checks.jsonl', 'workflow-repairs.jsonl'):
             if (root / 'logs' / name).is_file():
                 add_path('logs/' + name, root / 'logs' / name)
         add('source/web-files.json', json.dumps(web_files(root, machine)).encode())

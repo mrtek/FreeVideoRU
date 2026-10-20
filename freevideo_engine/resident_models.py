@@ -2,6 +2,7 @@
 import gc
 import json
 from pathlib import Path
+import sys
 import time
 
 import torch
@@ -95,19 +96,21 @@ def parked_bytes(model):
 
 
 def release_encoder(clip, manager):
-    """Discard our Windows mapped encoder without a full GPU-to-CPU copy.
+    """Discard our mapped encoder without a full GPU-to-CPU copy.
 
     Native unpatching still releases pins, hooks and loaded-model registrations.
     Once the bank drops its references, unused tensors can die where they are;
     any other owner keeps valid tensors. Future encoding uses the mmap loader.
     """
     from .encoder_checkpoint import load_clip_model_patcher
-    from .system import windows
     def owned(patcher):
         factory = getattr(patcher, 'cached_patcher_init', None)
         return isinstance(factory, (tuple, list)) and bool(factory) and factory[0] is load_clip_model_patcher
     patcher = getattr(clip, 'patcher', None)
-    targets = [patcher] if windows() and owned(patcher) else []
+    # A native unpatch copies every weight to the CPU first: 13 GiB for the video text encoder,
+    # enough to exceed a machine's memory in the moment it was meant to make room. The Mac
+    # releases its encoder its own way (macos_encoder) and keeps the native path here.
+    targets = [patcher] if owned(patcher) and sys.platform != 'darwin' else []
     if targets:
         for loaded in manager.current_loaded_models:
             candidate = loaded.model
@@ -266,7 +269,16 @@ class ModelBank:
         weights = sum(t.numel()*t.element_size() for t in list(model.parameters()) + list(model.buffers()))
         area = canvas.get('width', 1344)*canvas.get('height', 768)/(1344*768)
         workspace = 2*GiB if audio else max(2*GiB, 6*GiB*area)
-        self.make_room('input_audio_vae' if audio else 'input_video_vae', weights + workspace)
+        # The same stage also grows this whole process's host memory: the
+        # video encoder's checkpoint pages and the decoded reference frames
+        # rose by more than 13 GiB at 960x544 (about 26 GiB per full 1344x768
+        # canvas) beside an idle engine's pinned weights. That pushed a
+        # 25.6 GiB budget through its RAM guard and failed the continued
+        # segment. The GPU estimate says nothing about host memory, so an idle
+        # model's host copy is released unless the live budget covers the
+        # stage as well. Plentiful hosts keep it for reuse.
+        host = weights + (2*GiB if audio else max(8*GiB, 26*GiB*area))
+        self.make_room('input_audio_vae' if audio else 'input_video_vae', weights + workspace, ram_need=host)
 
     def device_ceiling(self):
         """What this process's allocator can hold before the device itself is full.
@@ -355,6 +367,9 @@ class ModelBank:
             found = None
         hit = found is not None
         rows = canvas.get('video_tokens', 72576) + canvas.get('reference_video_tokens', 0) + canvas.get('reference_audio_tokens', 0)
+        if canvas.get('early_reference') is not None:
+            from .two_pass import placement_tokens
+            rows = placement_tokens(canvas)
         from .policy import BLOCK_BYTES, activation_bytes, windows_gpu_output_workspace
         from .system import windows
         # Use the same measured token/head envelopes as placement. The old

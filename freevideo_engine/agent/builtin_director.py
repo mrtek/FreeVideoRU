@@ -501,7 +501,7 @@ def run(tools, production_id, *, ask, stop, wait=25):
                 fingerprint = _ref(production_id, 'review', shot)
                 if fingerprint in handed_off or shot['chosen'] is not None or shot['chosen_by'] == 'user':
                     continue
-                sheets = tools.sheet(production_id, shot['id'], frames=6)
+                sheets = tools.sheet(production_id, shot['id'], frames=None)
                 if stop():
                     return
                 decision = judge(shot, sheets, ask=ask)

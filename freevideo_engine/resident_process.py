@@ -22,6 +22,16 @@ from . import processes
 from .monitoring import save
 
 ENV = 'FREEVIDEO_RESIDENT_SESSION'
+GiB = 2**30
+# A finished request releases the worker unless its next part is already on the
+# way. Then it is kept briefly, and given up at once when anything else needs
+# the memory: another program's GPU use grows, host memory runs low, or an
+# image or prompt model starts (those release it themselves).
+HOLD_SECONDS = 90.
+AGENT_HOLD_SECONDS = 30.
+OTHER_GPU_GROWTH = 512 * 2**20
+HOST_FLOOR = 4 * GiB
+RELEASE_LOG = 20
 
 
 class SessionRestarted(RuntimeError):
@@ -346,9 +356,76 @@ class SessionOwner:
         self.identity = None
         self.active = False
         self.prewarm = None
+        self.mutex = threading.RLock()
+        self.generation = 0
+        self.idle_since = None
+        self.decisions = []
         atexit.register(self.close)
 
+    def record(self, **row):
+        row.setdefault('at', time.time())
+        with self.mutex:
+            self.decisions = (self.decisions + [row])[-RELEASE_LOG:]
+        return row
+
+    def take_decisions(self):
+        """Keep or release decisions since the previous request, for its report."""
+        with self.mutex:
+            rows, self.decisions = self.decisions, []
+        return rows
+
+    def finished(self, *, next_part=None, agent=False, gpu=None):
+        """Release the idle worker now, or keep it while a next part is on its way."""
+        with self.mutex:
+            if self.active or self.process is None or self.process.poll() is not None:
+                return None
+            hold = min(HOLD_SECONDS, AGENT_HOLD_SECONDS) if agent else HOLD_SECONDS
+            if not next_part or hold <= 0:
+                return self.release('finished' if not next_part else 'no_hold')
+            reason = pressure(gpu, None)
+            if reason:
+                return self.release(reason)
+            self.generation += 1
+            self.idle_since = time.monotonic()
+            baseline = gpu_used(gpu)
+            threading.Thread(target=self._watch, args=(self.generation, self.idle_since, hold, gpu, baseline),
+                             name='freevideo-resident-hold', daemon=True).start()
+            return self.record(action='kept', reason=next_part, seconds=hold, pid=self.process.pid)
+
+    def _watch(self, generation, since, hold, gpu, baseline):
+        while True:
+            time.sleep(.5)
+            reason = ('idle' if time.monotonic() - since >= hold
+                      else pressure(gpu, baseline))
+            with self.mutex:
+                if generation != self.generation or self.active or self.process is None:
+                    return
+                if self.process.poll() is not None:
+                    return  # The image or prompt model released it and recorded why.
+                if reason:
+                    self.release(reason)
+                    return
+
+    def release(self, reason):
+        with self.mutex:
+            if self.process is None or self.process.poll() is not None:
+                self.close()
+                return None
+            row = dict(action='released', reason=reason, pid=self.process.pid,
+                       idle_seconds=None if self.idle_since is None else round(time.monotonic() - self.idle_since, 1),
+                       **worker_memory(self.process.pid))
+            self.generation += 1
+            self.idle_since = None
+            self.close()
+            return self.record(**row)
+
     def start(self, root, source, python, environment):
+        with self.mutex:
+            self.generation += 1
+            self.idle_since = None
+            return self._start(root, source, python, environment)
+
+    def _start(self, root, source, python, environment):
         import hashlib
         import psutil
         from .triton_compat import COMPILER_ENVIRONMENT_KEYS, environment as compiler_environment
@@ -419,22 +496,55 @@ class SessionOwner:
                     receipt['worker_released'] = True
         return receipt
 
-    def warm_encoder(self, output, python, environment, *, busy=None, notify=None):
-        if (self.process is None or self.process.poll() is not None or self.active or
-                environment.get('FREEVIDEO_ENCODER_PREWARM', 'auto').lower() in ('0', 'off', 'false')):
-            return False
-        self.stop_prewarm()
-        if self.process is None:
-            return False
-        from .idle_encoder import IdleEncoder
-        self.prewarm = IdleEncoder()
-        return self.prewarm.schedule(self.endpoint, output, python, environment, busy=busy, notify=notify)
-
     def close(self):
         self.stop_prewarm()
         if self.process is not None:
             processes.stop(self.process, grace=2)
             self.process = None
+
+
+def gpu_used(gpu):
+    try:
+        from .background_room import Gpu
+        device = Gpu(gpu)
+        try:
+            memory = device.memory()
+        finally:
+            device.close()
+        return memory[0] if memory else None
+    except (OSError, RuntimeError, AttributeError, ValueError, ImportError):
+        return None
+
+
+def pressure(gpu, baseline):
+    """Why a kept idle worker should go now, or None."""
+    try:
+        from .background_room import available_memory
+        if available_memory() < HOST_FLOOR:
+            return 'host_memory_low'
+    except (OSError, RuntimeError, AttributeError, ValueError, ImportError):
+        pass
+    if baseline is not None:
+        # The idle worker does not allocate, so growth on the card is another program's.
+        used = gpu_used(gpu)
+        if used is not None and used - baseline >= OTHER_GPU_GROWTH:
+            return 'other_program_gpu'
+    return None
+
+
+def worker_memory(pid):
+    """Host memory the release returns, from the worker tree."""
+    try:
+        import psutil
+        from .background_room import family
+        rss = private = 0
+        for member in family(pid):
+            info = psutil.Process(member).memory_info()
+            rss += info.rss
+            private += getattr(info, 'private', 0) or getattr(info, 'rss', 0) - getattr(info, 'shared', 0)
+        return dict(worker_rss_bytes=rss, worker_private_bytes=private)
+    except Exception:
+        return {}
 
 
 OWNER = SessionOwner()
@@ -484,6 +594,8 @@ def serve(endpoint, runner, snapshot):
                         environment = execution_environment(request['environment'])
                         os.environ.clear()
                         os.environ.update(environment)
+                        from .triton_compat import own_temporary_environment
+                        own_temporary_environment()
                         os.environ.pop(processes.HANDLE_ENV, None)
                         os.environ['FREEVIDEO_RUNTIME_LOCK_FD'] = str(descriptor)
                         from .locking import runtime_lock

@@ -191,6 +191,9 @@ RESIDENT_TARGET = 8
 # Above this the resident copies displace nothing useful, so it bounds the
 # VRAM-side arithmetic before host RAM narrows it further.
 RESIDENT_VRAM_CEILING = 44
+# Extra card memory the whole stack needs beyond the table's activations: the
+# 1280x704 run peaked 0.5 GiB above the plan, and one more GiB stays free.
+WHOLE_STACK_MARGIN = int(1.5 * GiB)
 
 # A streamed transformer uses one device transfer slot without prefetch.  The
 # read-ahead slot adds one prepared block (BLOCK_BYTES) and lets host staging
@@ -404,6 +407,62 @@ INT8_GPU_OUTPUT_MARGIN = int(.25 * GiB)
 INT8_GPU_OUTPUT_MARGIN_WINDOWS = int(.5 * GiB)
 
 
+# Report 243, B200 on pinned OpenVDN/Diffusers, int8, cudnn/torch-flash,
+# native allocator, 1088x1920x362 + 2040 reference rows (220320 effective
+# tokens), staged residual, grouped host outputs, stream, no resident block,
+# window 4, FF 2048 / projection 1024. One cold and two warm refinement steps
+# at the same 10 GiB cap: head 4/2 allocated peaks 7.309/6.797 GiB; the largest
+# paired-step widening cost was 601331200 bytes (0.56003 GiB, the cold step).
+# That is 2729.35 bytes per effective token, scaled below without rounding down.
+# Reserved peaks were 8.342/8.736 GiB: pool layout is not live activation cost.
+# At a shared 14 GiB cap, allocated was 7.313/6.797 (delta 0.516 GiB), but
+# reserved was 10.299/8.693 (delta 1.605 GiB). The 0.56003 paired-step bound
+# covers both caps; the reserved delta must not become an activation slope.
+# See benchmarks/report243-b200. B200 absolute peaks are NOT Windows/sage2
+# peaks. Charge only its measured widening delta over the existing Windows
+# staged envelope, with the same 0.5 GiB allocator margin used above. Report
+# 243's allocator fell from its 10.69 GiB plan to 10.00 GiB before refinement;
+# a plan's budget is only an upper bound on that live allocator ceiling.
+# Do not extrapolate this correction below its measured token count: smaller
+# Windows staging requests already have completed head-4 capacity evidence.
+WINDOWS_INT8_CPU_HEAD_TOKENS = 220320
+WINDOWS_INT8_CPU_HEAD4_EXTRA = 601331200
+
+
+def windows_int8_cpu_output_need(tokens, canvas=None):
+    """Head-4 staged Windows envelope including measured widening and margin.
+
+    A starting estimate for this large-token route, not B200/Windows capacity
+    equivalence. None preserves the smaller, independently qualified paths.
+    """
+    if tokens is None or tokens < WINDOWS_INT8_CPU_HEAD_TOKENS:
+        return None
+    adjustment = int(4.6 * GiB * (tokens / (72 * 1008) - 1.))
+    staged = max(decoder_workspace(canvas),
+                 RESIDUAL_ACTIVATION_RESERVE + adjustment - tokens * FF_STASH_WIDTH * 2)
+    extra = (WINDOWS_INT8_CPU_HEAD4_EXTRA * tokens + WINDOWS_INT8_CPU_HEAD_TOKENS - 1) // WINDOWS_INT8_CPU_HEAD_TOKENS
+    return staged + extra + INT8_GPU_OUTPUT_MARGIN_WINDOWS
+
+
+def windows_int8_refinement_head_need(engine, canvas, *, windows=False, lora=False):
+    """The measured envelope only for the eligible Windows refinement route."""
+    if (not windows or lora or engine.get('linear_compute') != 'int8' or engine.get('head_chunk') != 4
+            or not engine.get('residual_offload') or not engine.get('attention_cpu_outputs')
+            or not engine.get('grouped_attention_outputs') or not engine.get('stream_weights')
+            or engine.get('resident_blocks') != 0):
+        return None
+    from .two_pass import placement_tokens
+    return windows_int8_cpu_output_need(placement_tokens(canvas), canvas)
+
+
+def windows_int8_refinement_heads(engine, canvas, allocator_limit, *, windows=False, lora=False):
+    """Pass-local narrowing when Windows's allocator shrank since planning."""
+    if type(allocator_limit) is not int or allocator_limit <= 0:
+        return None
+    need = windows_int8_refinement_head_need(engine, canvas, windows=windows, lora=lora)
+    return {'head_chunk': 2} if need is not None and need > allocator_limit else None
+
+
 def int8_gpu_output_need(tokens, windows=False, full_tail=False):
     """Bytes the int8 staging path needs with its attention outputs on the GPU.
 
@@ -427,8 +486,25 @@ MIN_GPU_RESERVE_GIB = .2
 
 FF_STASH_WIDTH = 14336  # BF16 SwiGLU output channels kept for the per-tensor FP8 scale
 
+# Int8 GPU-output workspace in GiB, second transfer slot included, for
+# canvases below the envelope's anchors: (video tokens, GiB). A two-pass
+# 960x544 / 4.5 s request on a Windows RTX 5060 Ti 16 GB peaked 2.48 GiB at
+# 4320 tokens and 3.46 GiB at 16320 tokens beyond its sixteen resident
+# blocks, against 7.14 and 7.82 from the envelope, so the plan held sixteen
+# and eighteen blocks where the budget held about twenty-five and streamed
+# the rest from disk on every step. Each figure carries one GiB of margin.
+# It rests on one card and holds only up to its last measured point. Joined
+# straight to the envelope's anchor, a 16 GB Windows laptop's 44370-token
+# refinement held three more blocks than the envelope gave, filled the card
+# beside other programs, and Windows moved memory to system RAM: each step
+# took five times as long. Above 16320 tokens the envelope applies.
+SMALL_CANVAS_INT8_WORKSPACE = (
+    (4320, 3.48),
+    (16320, 4.46),
+)
 
-def windows_gpu_output_workspace(video_tokens, *, prefetch=False, ff_stash=True):
+
+def windows_gpu_output_workspace(video_tokens, *, prefetch=False, ff_stash=True, small_canvas=False):
     """Starting workspace for head-8 GPU outputs with the full per-tensor FF stash.
 
     Int8 projections scale each activation row on its own, so every FF row tile
@@ -442,8 +518,17 @@ def windows_gpu_output_workspace(video_tokens, *, prefetch=False, ff_stash=True)
     The 6.5 + 6 * token-ratio envelope covers both anchors. It is a cold-start
     estimate, not a fitted throughput model or proof of capacity elsewhere.
     The OS growth reserve has already been subtracted from the budget.
+
+    small_canvas=True counts resident blocks up to the last measured point
+    from the int8 curve (SMALL_CANVAS_INT8_WORKSPACE) instead of the envelope.
+    Head-group choices keep using the envelope.
     """
     tokens = 72576 if video_tokens is None else video_tokens
+    if small_canvas and not ff_stash and tokens <= SMALL_CANVAS_INT8_WORKSPACE[-1][0]:
+        for (low, at_low), (high, at_high) in zip(SMALL_CANVAS_INT8_WORKSPACE, SMALL_CANVAS_INT8_WORKSPACE[1:]):
+            if tokens <= high:
+                at = at_low + (at_high - at_low) * max(0, tokens - low) / (high - low)
+                return int(at * GiB) - (0 if prefetch else BLOCK_BYTES)
     workspace = int((6.5 + 6. * tokens / 72576) * GiB) + (BLOCK_BYTES if prefetch else 0)
     return workspace if ff_stash else workspace - tokens * FF_STASH_WIDTH * 2
 
@@ -460,7 +545,9 @@ class ResourceBudgetError(ValueError):
             ram_total_bytes=hardware.ram_total, ram_capacity_bytes=ram_total,
             ram_available_bytes=free_ram, ram_reserve_bytes=int(reserve_ram * GiB),
             ram_budget_bytes=free_ram-int(reserve_ram * GiB), ram_minimum_bytes=ram_minimum_bytes,
-            cgroup_ram_limit_bytes=hardware.cgroup_ram_limit)
+            cgroup_ram_limit_bytes=hardware.cgroup_ram_limit,
+            ram_physical_available_bytes=hardware.ram_physical_available,
+            ram_commit_available_bytes=hardware.ram_commit_available)
         failed = [name for name in ('gpu', 'ram')
                   if self.details[name+'_budget_bytes'] < self.details[name+'_minimum_bytes']]
         self.details['insufficient'] = failed
@@ -502,6 +589,9 @@ class ResourceBudgetError(ValueError):
                           self.details[name+'_total_bytes']/GiB))
             if self.details[name+'_shortfall_bytes']:
                 lines.append('%s shortfall: %.2f GiB.' % (label, self.details[name+'_shortfall_bytes']/GiB))
+        if hardware.ram_commit_available is not None and hardware.ram_physical_available is not None:
+            lines.append('Windows reports %.2f GiB of free physical RAM and %.2f GiB of commit headroom.' %
+                         (hardware.ram_physical_available / GiB, hardware.ram_commit_available / GiB))
         lines.append('Available memory includes validated idle-cache credit, if present. Resolution, frames and steps were not reduced.')
         super().__init__('\n'.join(lines))
 
@@ -515,12 +605,19 @@ def feasible_alternatives(hardware, canvas, **options):
     by this same planner, never estimated separately.
     """
     from .geometry import geometry
-    keep = {key: canvas[key] for key in ('task', 'steps', 'reference_video_tokens', 'reference_audio_tokens')
+    keep = {key: canvas[key] for key in ('task', 'steps', 'reference_video_tokens', 'reference_audio_tokens', 'early_reference')
             if key in canvas}
 
     def fits(width, height, frames):
         try:
-            choose(hardware, **dict(options, canvas=dict(geometry(width, height, frames=frames), **keep)))
+            candidate = dict(geometry(width, height, frames=frames), **keep)
+            if canvas.get('early_reference') is not None and canvas.get('sampling_plan'):
+                from .two_pass import plan
+                sampling = canvas['sampling_plan']
+                candidate['sampling_plan'] = plan(candidate, sampling['enabled'], canvas.get('task', 't2va'),
+                    base_steps=sampling['base_steps'], refine_steps=sampling['refine_steps'] or 3,
+                    scale=sampling.get('scale', 2))
+            choose(hardware, **dict(options, canvas=candidate))
             return True
         except (ResourceBudgetError, ValueError):
             return False
@@ -679,10 +776,74 @@ def adaln_extra_bytes(canvas=None):
     return max(0, steps - 8) * times_per_step * 50 * 3 * 6 * 5376 * 2
 
 
-def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
-           gpu_reserve_gib=None, ram_reserve_gib=None, available_backends=None, canvas=None,
-           demonstrated_ram_bytes=None, allow_capacity_trial=False, stage='generation',
-           lora_max_block_bytes=0, lora_root_bytes=0, precision='fp8'):
+STEP_CACHES = ('easycache-av', 'fbcache')
+# Engine choices the first-block cache may change. B200 at 24 GiB, 20 steps with the
+# cache against without: 8 resident blocks given up 297 s vs 396 s sampling (20 s),
+# head chunk 16 -> 8 368 s vs 439 s, 28 -> 16 149-166 s vs 184-200 s (10 s). Host pins
+# follow the GPU placement. Anything else (prefetch, attention outputs on the CPU, ...)
+# costs more than the skipped steps save, and the request runs every step instead.
+FIRST_BLOCK_CACHE_MAY_CHANGE = ('pin_host_gb', 'resident_blocks', 'head_chunk')
+# Reserved growth over the counted video rows: 3.34 GiB measured / 2.87 GiB counted (B200, 20 s 1344x768).
+FIRST_BLOCK_CACHE_RESERVED_SCALE = 1.17
+
+
+def first_block_cache_bytes(canvas):
+    """GPU storage the first-block cache keeps through a sampling pass.
+
+    It holds two packed residuals of the last full step: block 0's output and
+    the remaining blocks' contribution, BF16 rows of 5376 channels. At 20 s of
+    1344x768 the video rows are 2 x 1.43 GiB; B200 measured 2.98 GiB more
+    allocated and 3.34 GiB more reserved than the same request without it (text
+    and audio rows, allocator rounding), so the rows are scaled to the reserved
+    growth.
+    """
+    from .two_pass import placement_tokens
+    return math.ceil(2 * placement_tokens(canvas) * 5376 * 2 * FIRST_BLOCK_CACHE_RESERVED_SCALE)
+
+
+def choose(hardware: Hardware, *, canvas=None, stage='generation', **options):
+    """Placement for a request; canvas['step_cache'] asks for a step cache.
+
+    The first-block cache is kept when reserving its storage only gives up
+    resident blocks or at most halves the head chunk; otherwise the request
+    samples every step in full. EasyCache keeps only latent-sized tensors and
+    is always kept.
+    """
+    wanted = (canvas or {}).get('step_cache') if stage == 'generation' else None
+    if wanted is None:
+        plain = canvas if canvas is None or 'step_cache' not in canvas else {
+            key: value for key, value in canvas.items() if key != 'step_cache'}
+        return _choose(hardware, canvas=plain, stage=stage, **options)
+    if wanted not in STEP_CACHES:
+        raise ValueError('Step cache must be one of ' + ', '.join(STEP_CACHES))
+    from dataclasses import replace
+    plain = {key: value for key, value in canvas.items() if key != 'step_cache'}
+    base = _choose(hardware, canvas=plain, stage=stage, **options)
+    kept, note = True, None
+    if wanted == 'fbcache':
+        try:
+            cached = _choose(hardware, canvas=plain, stage=stage, step_cache_bytes=first_block_cache_bytes(plain), **options)
+        except ResourceBudgetError:
+            cached = None
+        route = lambda engine: {key: value for key, value in engine.items() if key not in FIRST_BLOCK_CACHE_MAY_CHANGE}
+        kept = (cached is not None and route(cached.engine) == route(base.engine)
+                and 2 * (cached.engine.get('head_chunk') or 0) >= (base.engine.get('head_chunk') or 0))
+        note = ('First-block cache keeps %.2f GiB of residuals in free GPU memory.' if kept else
+                'First-block cache needs %.2f GiB the placement does not leave free; every step runs in full.'
+                ) % (first_block_cache_bytes(plain) / GiB)
+        if kept:
+            # Decoding starts after the pass has released the cache.
+            base = replace(base, engine=cached.engine)
+    # Without a cache the engine options stay exactly those of a plain request,
+    # so its history and identities still match.
+    return replace(base, engine=dict(base.engine, step_cache=wanted) if kept else base.engine,
+                   notes=list(base.notes) + ([note] if note else []))
+
+
+def _choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
+            gpu_reserve_gib=None, ram_reserve_gib=None, available_backends=None, canvas=None,
+            demonstrated_ram_bytes=None, allow_capacity_trial=False, stage='generation',
+            lora_max_block_bytes=0, lora_root_bytes=0, precision='fp8', step_cache_bytes=0):
     """precision is the prepared cache's: int8 caches run int8 projections."""
     from .geometry import geometry
     if stage not in ('encoding', 'generation'):
@@ -703,7 +864,7 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
     lora_workspace = (128 * 2**20 + 2 * lora_max_block_bytes + lora_root_bytes
                       if lora_max_block_bytes or lora_root_bytes else 0)
     table_workspace = adaln_extra_bytes(canvas) if stage == 'generation' else 0
-    placement_workspace = lora_workspace + table_workspace
+    placement_workspace = lora_workspace + table_workspace + step_cache_bytes
     if canvas is not None:
         checked = geometry(canvas['width'], canvas['height'], frames=canvas['frames'])
         if any(canvas.get(k) != checked[k] for k in ('width', 'height', 'frames', 'video_tokens')):
@@ -715,7 +876,8 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
             if type(count) is not int or count < 0:
                 raise ValueError('Reference token counts must be nonnegative integers')
             reference_rows += count
-    effective_tokens = canvas['video_tokens'] + reference_rows if canvas is not None else None
+    from .two_pass import placement_tokens
+    effective_tokens = placement_tokens(canvas) if canvas is not None else None
     compatibility = hardware.cuda_compatibility()
     if compatibility['error']:
         raise ValueError(compatibility['error'])
@@ -759,7 +921,14 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
     # Scale the existing activation estimate with output and reference rows.
     # Keep the decoder's fixed workspace funded; neither weights nor its
     # temporal tile shrink in proportion to the number of output frames.
-    fixed_workspace = decoder_workspace(canvas)
+    # The decoder runs after the transformer is released, and with it the
+    # schedule tables, LoRA workspace and step cache: it is funded from the
+    # request budget, as its resident blocks are below. gpu_budget has those
+    # sampling allocations taken out already, so charge the decoder only what
+    # they do not cover. Sampling still has to fit its own working set beside
+    # them. Charging both refused full-size requests whose sampling and decode
+    # each fit the card.
+    fixed_workspace = max(0, decoder_workspace(canvas) - placement_workspace)
     # The staging estimate was measured on per-tensor FP8, whose FF keeps every
     # SwiGLU row for one scale (1.94 GiB at 72576 tokens). Int8 rows carry their
     # own scales and stash nothing. At 1344x768x243 on int8, with a 4.70 GiB
@@ -794,7 +963,11 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
     # WDDM, and the two bounds above: the head group may not exceed its
     # measured requirement, and the no-weights path stays on the platform
     # whose margin was measured.
-    if not desktop and gpu_reserve_gib is None and free_gpu < 10 * GiB and gpu_budget < residual_need:
+    # The trigger keeps the decoder's whole workspace. The credit above is for
+    # admission; the cards this reduction already covered spend the headroom
+    # keeping attention outputs on the GPU, which is worth more than the margin.
+    if (not desktop and gpu_reserve_gib is None and free_gpu < 10 * GiB
+            and gpu_budget < max(residual_need, decoder_workspace(canvas))):
         reserve_gpu = MIN_GPU_RESERVE_GIB
         request_gpu_budget = free_gpu - int(reserve_gpu * GiB)
         gpu_budget = request_gpu_budget - placement_workspace
@@ -1153,6 +1326,22 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
                         head, reserve = 8, wider
         else:
             cpu_outputs = not no_weights and gpu_budget < reserve + GPU_ATTENTION_OUTPUT_BYTES
+            if (cpu_outputs and hardware.system == 'Linux' and not int8 and gpu_reserve_gib is None and free_gpu < 7.5 * GiB
+                    and reserve_gpu > MIN_GPU_RESERVE_GIB):
+                # Host outputs plus staging cost 70 to 100 times the sampling
+                # time, so a shortfall of a few MiB must not select them while
+                # the minimum growth reserve would cover the outputs. A 6 GiB
+                # card at 20 steps missed by 13 MiB (the modulation tables
+                # grow with steps) and the same request one step count lower
+                # ran the plain route in 211 s. The plain route peaked 5312 MiB
+                # of a 6246 MiB cap at 6.1 GiB, so the reduced reserve is the
+                # same trade the residual admission above already makes.
+                reduced = free_gpu - int(MIN_GPU_RESERVE_GIB * GiB) - placement_workspace
+                if reduced >= reserve + GPU_ATTENTION_OUTPUT_BYTES:
+                    reserve_gpu = MIN_GPU_RESERVE_GIB
+                    request_gpu_budget = free_gpu - int(reserve_gpu * GiB)
+                    gpu_budget = reduced
+                    cpu_outputs = False
             if not cpu_outputs:
                 reserve += GPU_ATTENTION_OUTPUT_BYTES
         # Outputs in host memory means the budget could not cover them on the
@@ -1185,11 +1374,18 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
             # The second transfer slot in place of one resident block.
             prefetch, resident = True, resident - 1
     pinned_like = None
+    whole_stack = False
     if not small:
         # One measured requirement for the group in use, so the block count is
         # continuous across the band edges rather than restarting at each.
-        resident = max(0, min(RESIDENT_VRAM_CEILING,
-                              int((gpu_budget - activation_bytes(head, effective_tokens)) / block_bytes)))
+        card_blocks = int((gpu_budget - activation_bytes(head, effective_tokens)) / block_bytes)
+        resident = max(0, min(RESIDENT_VRAM_CEILING, card_blocks))
+        # The card holds every block with the activations to spare: keeping them
+        # all there costs no host copy and no locked pages, and the sampling
+        # latents come out the same (measured at 1280x704, 96 GB).
+        # Windows keeps its own margin: the display can take card memory mid-run.
+        whole_stack = (hardware.system != 'Windows' and
+                       gpu_budget - activation_bytes(head, effective_tokens) - WHOLE_STACK_MARGIN >= 50 * block_bytes)
         # The pinned subset below keeps the size sixteen heads give it: a
         # wider group's activations come out of the same budget, and a lower
         # count here would only lock more host memory, which no run measured.
@@ -1220,7 +1416,8 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
         # FF stash. In addition, crediting a shorter geometry against its old
         # 345-frame anchor added five blocks to a request that already OOMed.
         # Budget the current execution path before host placement is planned.
-        windows_workspace = windows_gpu_output_workspace(effective_tokens, prefetch=prefetch, ff_stash=not int8)
+        windows_workspace = windows_gpu_output_workspace(effective_tokens, prefetch=prefetch, ff_stash=not int8,
+                                                         small_canvas=True)
         windows_workspace += max(0, activation_bytes(head, effective_tokens) - activation_bytes(8, effective_tokens))
         if prefetch and gpu_budget < 14 * GiB:
             # Saving a transfer slot must not turn fully retained host weights
@@ -1320,6 +1517,8 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
     ram_wants = max(0, 50 - max(0, int(host_room // block_bytes)))
     if not small:
         resident = min(resident, max(RESIDENT_TARGET, ram_wants))
+        if whole_stack:
+            resident, pin = 50, 0.
     # Windows reads non-streamed offloaded blocks into private memory (pread;
     # a section view would be charged to commit in full). The RAM guard counts
     # it, it cannot be reclaimed, and pins planned after that load-all pass find
@@ -1353,6 +1552,15 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
         # at all -- it is the bounded retained subset that stops those bytes
         # being reread every step, which is the larger cost there.
         pin = 0.
+    windows_cpu_head_limited = False
+    if (desktop and int8 and not lora and stage == 'generation' and not capacity_trial
+            and head == 4 and residual_offload and cpu_outputs and streamed_weights and resident == 0):
+        head4_need = windows_int8_cpu_output_need(effective_tokens, canvas)
+        if head4_need is not None and head4_need > gpu_budget:
+            # Fund activations before dispatch. Keep residency, windows, host
+            # caching and every other compute/placement choice intact.
+            head = 2
+            windows_cpu_head_limited = True
     engine = dict(attention='/'.join(legs), prefetch=prefetch,
                   adaln_cache=True, adaln_disk_cache=True, inference_kernels=True,
                   # One chunk size for every band, on neutrality rather than
@@ -1422,10 +1630,13 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
                      'This is a capacity attempt, not measured proof that this GPU fits.' %
                      (gpu_budget / GiB, residual_floor / GiB))
     if windows_activation_limited:
-        notes.append('The Windows GPU-output activation estimate exceeds the live budget even with zero resident blocks. Start this token count with four-head groups, %s attention outputs and one host residual buffer; estimated workspace %.2f GiB. Resolution, duration, steps, weights and attention backend are preserved. This is request-specific, not a persistent compatibility downgrade.' % ('host' if cpu_outputs else 'GPU', windows_workspace / GiB))
+        notes.append('The Windows GPU-output activation estimate exceeds the live budget even with zero resident blocks. Start this token count with %s-head groups, %s attention outputs and one host residual buffer; estimated workspace %.2f GiB. Resolution, duration, steps, weights and attention backend are preserved. This is request-specific, not a persistent compatibility downgrade.' % ('two' if head == 2 else 'four', 'host' if cpu_outputs else 'GPU', windows_workspace / GiB))
     elif windows_workspace is not None:
         notes.append('Windows head-8 GPU-output workspace estimate: %.2f GiB for the selected FF storage path, caches and transfer buffers; remaining live budget permits %d resident blocks. Based on complete Windows measurements, not a capacity guarantee. Head/window/FF tile shapes and system reserves are unchanged.' %
                      (windows_workspace / GiB, resident))
+    if windows_cpu_head_limited:
+        notes.append('The large-token Windows int8 host-output/residual path estimates %.2f GiB for four heads, including measured widening workspace and allocator margin, above the %.2f GiB planning upper bound on the live allocator. Start with two heads; resident blocks, window batch, weight caching, geometry, steps and backend are preserved. B200 measured the head-width delta, not this Windows GPU\'s capacity.' %
+                     (head4_need / GiB, gpu_budget / GiB))
     if residual_offload:
         notes.append('The original small path exceeds the live VRAM budget: stage residuals in one reusable CPU buffer, preserving kernel shapes, dtype and every requested row. Host weight caching leaves an additional %.2f GiB for this buffer. Extra transfers cost time; this is a capacity route, not a claimed speedup.' % (residual_host / GiB))
     if streamed_weights:
@@ -1458,6 +1669,11 @@ def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
     decoder_offload = gpu_budget < 20 * GiB
     if reference_rows:
         notes.append('Reference conditioning adds %d packed rows; activation placement scales with total rows. This is a starting estimate, not a verified reference-capacity result.' % reference_rows)
+    if canvas is not None and canvas.get('early_reference') is not None:
+        from .two_pass import stage_tokens
+        rows = stage_tokens(canvas)
+        notes.append('Early reference placement: first pass %d rows, refinement %s rows; fixed engine covers %d rows.'
+                     % (rows['first'], rows['refinement'], rows['engine']))
     # A full floating video plus its RGB copy grows with output geometry.
     # The temporal streaming path uses the original decoder tiles and blend;
     # completed uint8 frames go to the retained disk artifact immediately.

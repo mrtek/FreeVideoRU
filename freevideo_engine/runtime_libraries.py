@@ -57,7 +57,7 @@ def site_packages(environment):
 
 def _digest(path, algorithm):
     digest = hashlib.new(algorithm)
-    with open(path, 'rb') as handle:
+    with open(io_path(path), 'rb') as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b''):
             digest.update(chunk)
     return algorithm + '=' + base64.urlsafe_b64encode(digest.digest()).rstrip(b'=').decode('ascii')
@@ -69,7 +69,7 @@ def _canonical(path):
     return os.path.normcase(plain(text))
 
 
-def check(site):
+def check(site, progress=None):
     """Compare every recorded cuDNN file under ``site`` with its RECORD hash.
 
     A file is changed only when it matches none of the hashes recorded for its
@@ -83,7 +83,7 @@ def check(site):
     root = os.path.normcase(os.path.normpath(str(site)))
     result = dict(owners=[], checked=0, changed=[], unrecorded=[], unreadable=[], directories=[])
     expected = {}
-    for distribution in importlib.metadata.distributions(path=[str(site)]):
+    for distribution in importlib.metadata.distributions(path=[str(io_path(site))]):
         try:
             rows = list(csv.reader(io.StringIO(distribution.read_text('RECORD') or '')))
             name = distribution.metadata['Name']
@@ -100,16 +100,18 @@ def check(site):
             if name not in result['owners']:
                 result['owners'].append(name)
     directories = set()
+    if progress:
+        progress(0, len(expected))
     for path, records in expected.values():
         owners = sorted({name for name, _, _ in records})
         entry = dict(name=os.path.basename(path), owner=owners[0], owners=owners)
         directories.add(os.path.dirname(path))
         result['checked'] += 1
         try:
-            if not os.path.isfile(path):
+            if not os.path.isfile(io_path(path)):
                 result['changed'].append(dict(entry, state='missing'))
                 continue
-            size = os.path.getsize(path)
+            size = os.path.getsize(io_path(path))
             matching = [(value, length) for _, value, length in records if length is None or length == size]
             hashed = {}
             def matches(value):
@@ -125,10 +127,13 @@ def check(site):
                                               expected_size=sizes[0] if len(sizes) == 1 else sizes or None))
         except OSError as error:
             result['unreadable'].append(dict(entry, error=type(error).__name__))
+        finally:
+            if progress:
+                progress(result['checked'], len(expected))
     recorded = {_canonical(path) for path, _ in expected.values()}
     for directory in sorted(directories):
         try:
-            names = sorted(os.listdir(directory))
+            names = sorted(os.listdir(io_path(directory)))
         except OSError:
             continue
         for name in names:
@@ -261,7 +266,7 @@ def dependency_closure(python, requirements, additional=()):
     dependencies = {}
     site = site_for(python)
     if site is not None:
-        for distribution in importlib.metadata.distributions(path=[str(site)]):
+        for distribution in importlib.metadata.distributions(path=[str(io_path(site))]):
             try:
                 name = distribution.metadata['Name']
                 if name:
@@ -301,7 +306,7 @@ def dependency_closure(python, requirements, additional=()):
     return set(seen)
 
 
-def damaged(python):
+def damaged(python, progress=None):
     """Distributions whose recorded cuDNN files differ in this Python's environment.
 
     Sizes are compared first and only files of the recorded size are hashed,
@@ -310,7 +315,7 @@ def damaged(python):
     """
     try:
         site = site_for(python)
-        found = check(site) if site is not None else {'changed': []}
+        found = check(site, **({'progress': progress} if progress else {})) if site is not None else {'changed': []}
     except Exception:
         return []
     return sorted({owner for row in found['changed'] for owner in row['owners']})
@@ -362,7 +367,7 @@ def installed_bytes(python, name):
     """Installed size of one distribution in this Python's environment, from its RECORD."""
     try:
         site = site_for(python)
-        for distribution in importlib.metadata.distributions(path=[str(site)] if site else []):
+        for distribution in importlib.metadata.distributions(path=[str(io_path(site))] if site else []):
             if (distribution.metadata['Name'] or '').lower() == name.lower():
                 rows = csv.reader(io.StringIO(distribution.read_text('RECORD') or ''))
                 return sum(int(row[2]) for row in rows if len(row) > 2 and row[2].isdigit())

@@ -1,5 +1,6 @@
 """Machine-local timing forecasts shared by planning and durable films."""
 import math
+from .length import capability_table, single_frame_limit
 
 
 def generation_estimate(port, spec, chain=None):
@@ -9,9 +10,9 @@ def generation_estimate(port, spec, chain=None):
     reasons here so a film never invents a time for unsupported conditioning.
     """
     from ..chain_plan import plan as chain_plan
-    chain = chain if chain is not None else chain_plan(spec['seconds'], continued=bool(spec.get('continue_from')))
-    table = port.capability_snapshot(dict(width=str(spec['width']), height=str(spec['height']),
-                                          task=spec['task'], adapters='1' if spec['loras'] else '0'))
+    table = capability_table(port, spec)
+    chain = chain if chain is not None else chain_plan(spec['seconds'], max_frames=single_frame_limit(spec, table=table),
+                                                     continued=bool(spec.get('continue_from')))
     seconds = None
     reason = table['status'] if table['status'] in ('computing', 'unavailable') else 'no_matching_estimate'
     if table['status'] == 'ready' and not spec['preview'] and not spec['media']:

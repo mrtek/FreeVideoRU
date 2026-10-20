@@ -83,6 +83,9 @@ def recent_shapes(history, limit=SHAPES):
                      frames=geometry.get('frames'), two_pass=bool(plan.get('enabled')),
                      base_steps=plan.get('base_steps', geometry.get('steps', 8)),
                      refine_steps=plan.get('refine_steps') or 3)
+        if plan.get('enabled') and plan.get('scale', 2) != 2:
+            # Only another factor adds the key, so the shapes of 2x requests stay as they were.
+            shape['upscale_factor'] = plan['scale']
         if not all(type(shape[name]) is int and shape[name] > 0 for name in ('width', 'height', 'frames', 'base_steps')):
             continue
         key = json.dumps(shape, sort_keys=True)
@@ -122,7 +125,8 @@ def plan_request(machine, shape, history, identity):
     profile['engine'].update(steps=shape['base_steps'], task=shape['task'],
                              base=machine['base'], checkpoint=machine['checkpoint'])
     sampling_plan = plan(canvas, shape['two_pass'], shape['task'],
-                         base_steps=shape['base_steps'], refine_steps=shape['refine_steps'])
+                         base_steps=shape['base_steps'], refine_steps=shape['refine_steps'],
+                         scale=shape.get('upscale_factor', 2))
     if sampling_plan['enabled'] or sampling_plan['version'] == 2:
         canvas['sampling_plan'] = sampling_plan
     profile = tuned(profile, machine, hardware, canvas, sampling_plan, shape['text_tokens'][0])
@@ -172,6 +176,9 @@ def run(machine, *, environment=None, timeout=TIMEOUT_SECONDS, background=False,
     from .resource_history import ResourceHistory
     environment = dict(os.environ if environment is None else environment)
     root = Path(machine['root'])
+    from .triton_compat import own_temporary_environment, temporary_environment
+    own_temporary_environment(root)
+    environment = temporary_environment(root, environment)
     receipt = dict(success=False, started=time.time(), shapes=[])
     if machine.get('gpu_vendor') == 'amd':
         # Not measured on AMD GPUs yet; their first request compiles as before.
@@ -281,11 +288,15 @@ def check_kernels(hardware, machine, environment, room):
     In the background they run in a child this process watches like a worker
     and stops when the room is needed; an interrupted check publishes no receipt.
     """
-    from .kernel_capabilities import available_backends, matching_receipt
+    from .kernel_capabilities import available_backends, matching_receipt, needs_path_recheck
+    from .triton_compat import own_temporary_environment, temporary_environment
+    own_temporary_environment(machine['root'])
+    environment = temporary_environment(machine['root'], environment)
     if room is None:
         available_backends(hardware)
         return
-    if matching_receipt(hardware) is not None:
+    receipt = matching_receipt(hardware)
+    if receipt is not None and not needs_path_recheck(receipt, environment):
         return
     # A forced stop skips the cleanup below; an hour-old folder is no live check.
     for stale in Path(tempfile.gettempdir()).glob('freevideo-kernel-checks-*'):
@@ -442,6 +453,11 @@ def watch_worker(command, env, descriptor, log, timeout, room):
     from .ram import ProcessMemory
     memory = ProcessMemory() if room is not None else None
     checkpoint(room)  # Never start a child after a stop or with the room needed.
+    from .triton_compat import temporary_environment, temp_root
+    from .system import install_root
+    managed_temp = temp_root(env)
+    root = env.get('FREEVIDEO_HOME') or (Path(managed_temp).parent if managed_temp else install_root())
+    env = temporary_environment(root, env)
     with log.open('wb') as stream:
         process = processes.popen(command, env=env, stdout=stream, stderr=subprocess.STDOUT,
                                   pass_fds=(descriptor,) if descriptor is not None else (), start_new_session=True)
@@ -496,6 +512,16 @@ def lower_priority():
         os.nice(19)
 
 
+def reclaim(machine):
+    """Free the AdaLN sources a table made unused; disk only, so the GPU may be busy (adaln_reclaim)."""
+    from .adaln_reclaim import run as reclaim_sources
+    result = reclaim_sources(machine, should_stop=CANCELLED.is_set)
+    if result['action'] == 'deleted' or result['reason'] not in ('full_install', 'no_manifest',
+                                                              'no_old_grid_table', 'unexpected_manifest'):
+        print(json.dumps(dict(event='adaln_reclaim', **result)), flush=True)
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True, help='The installation machine.json')
@@ -515,8 +541,11 @@ def main(argv=None):
     try:
         from .testing import environment
         # A request's own variables: the installation, its caches and its GPU.
+        from .triton_compat import own_temporary_environment
+        own_temporary_environment(machine.get('root'))
         os.environ.update(execution_environment(environment(machine)))
         owner = os.environ.get(OWNER_ENV)
+        reclaim(machine)
         receipt = run(machine, background=args.background, owner=int(owner) if owner else None)
     except Exception as error:
         if args.background and isinstance(error, BlockingIOError):

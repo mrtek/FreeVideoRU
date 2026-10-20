@@ -1,5 +1,7 @@
 import {editorIcon} from './editor_icons.js';
 import {sourceKey} from './editor_store.js';
+import {issueButton} from './issue_button.js';
+const LIBRARY_ISSUE = ['Editor media library', '剪辑器素材库'];
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 const stamp = frames => { const seconds = Math.floor((frames || 0) / 24); return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`; };
 const FORMATS = 'MP4, MOV, WebM, MKV, M4V, WAV, MP3, FLAC, OGG, M4A, AAC, Opus';
@@ -19,7 +21,9 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
     let tab = 'work', rows = [], imported = [], next = null, disposed = false, loading = false;
     let listRead = Promise.resolve(), refreshTask = null, retryTimer = null, finishRetry = null, refreshAgain = false;
     const expectedOutputs = new Set();
-    const uploading = new Map(), recentImports = new Map();
+    const uploading = new Map(), recentImports = new Map(), pendingAdds = new Map();
+    const preparing = () => t('Preparing this clip. It goes on the timeline when ready.', '素材准备好后会自动放到时间线上。');
+    const cannotOpen = () => t('This file cannot be opened. Supported formats: ', '这个文件打不开。支持的格式：') + FORMATS;
     function metadata(row, kind) {
         const g = row.geometry || row, cached = store.sources.get(`${kind}:${row.id}`);
         return {frames: cached?.frames || Math.round(g.frames || (g.seconds || 0) * (g.fps || 24)), hasVideo: cached?.has_video ?? (kind === 'work' || row.kind === 'video'),
@@ -27,22 +31,42 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
     }
     // The "＋" puts a video after the last picture and a sound at the play position;
     // a double click leaves the place to the page, which appends.
-    async function add(row, kind, plus = false) {
+    async function add(row, kind, plus = false, {queued = false, project = actions.projectToken?.()} = {}) {
         const source = {kind, id: row.id}, key = sourceKey(source), playhead = state?.playhead;
         await store.getSources([key]);
-        if (disposed) return;
+        if (disposed || project != null && project !== actions.projectToken?.()) return;
         const value = store.sources.get(key), fallback = metadata(row, kind), hasVideo = value?.has_video ?? fallback.hasVideo;
         const pictures = state?.record.tracks.find(track => track.id === 'v1')?.clips || [];
         const at = !plus || !state ? undefined : hasVideo ? Math.max(0, ...pictures.map(clip => clip.start + clip.frames)) : playhead;
-        await actions.insertSource({source, at, frames: value?.frames || fallback.frames,
+        const result = await actions.insertSource({source, at, frames: value?.frames || fallback.frames,
             hasVideo, hasAudio: value?.has_audio ?? fallback.hasAudio});
+        if (queued && !disposed && result?.ok !== false) actions.notify?.(t('Added to the timeline.', '已放到时间线上。'));
+    }
+    function requestAdd(row, kind, plus = false) {
+        if (disposed) return;
+        if (kind === 'work' || row.state === 'ready') return add(row, kind, plus).catch(actions.error);
+        if (row.state === 'failed') { actions.notify?.(cannotOpen(), LIBRARY_ISSUE); return; }
+        const key = `${kind}:${row.id}`;
+        if (!pendingAdds.has(key)) pendingAdds.set(key, {plus, project: actions.projectToken?.()});
+        actions.notify?.(preparing());
+    }
+    function startPending(items) {
+        for (const row of items) {
+            const key = `import:${row.id}`, pending = pendingAdds.get(key);
+            if (!pending) continue;
+            if (pending.project != null && pending.project !== actions.projectToken?.()) { pendingAdds.delete(key); continue; }
+            if (row.state === 'ready') {
+                pendingAdds.delete(key);
+                add(row, 'import', pending.plus, {...pending, queued: true}).catch(actions.error);
+            } else if (row.state === 'failed') { pendingAdds.delete(key); actions.notify?.(cannotOpen(), LIBRARY_ISSUE); }
+        }
     }
     function card(row, kind) {
         const container = el('div', 'fv-ed-source-card');
         const button = el('button', 'fv-ed-source'); button.type = 'button'; button.dataset.key = `${kind}:${row.id}`;
         const ready = kind === 'work' || row.state === 'ready';
         const label = row.name || row.text || new Date(row.created_at).toLocaleDateString();
-        button.setAttribute('aria-label', label); button.draggable = ready; button.disabled = !ready;
+        button.setAttribute('aria-label', label); button.draggable = ready; button.disabled = false;
         const picture = el('div', 'fv-ed-source-picture');
         const url = kind === 'work' ? (store.sources.get(`work:${row.id}`)?.thumbnail
             || '/freevideo/library/thumbnail?' + new URLSearchParams({id: row.id})) : row.thumbnail;
@@ -51,11 +75,12 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
         if (ready) picture.append(el('span', 'fv-ed-source-time', stamp(metadata(row, kind).frames)));
         else if (row.state === 'failed') {
             picture.append(el('span', 'fv-ed-source-preparing', t('Cannot open', '打不开')));
-        } else picture.append(el('span', 'fv-ed-source-preparing', `${Math.round((row.fraction || 0) * 100)}%`));
+        } else picture.append(el('span', 'fv-ed-source-preparing', t('Preparing', '准备中')
+            + (Number.isFinite(row.fraction) ? ` ${Math.round(Math.max(0, Math.min(1, row.fraction)) * 100)}%` : '')));
         button.append(picture);
         const used = el('span', 'fv-ed-source-used'); used.append(editorIcon('check')); used.setAttribute('aria-label', t('Used', '已用')); used.hidden = true; picture.append(used);
-        button.ondblclick = () => add(row, kind).catch(actions.error);
-        button.onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); add(row, kind).catch(actions.error); } };
+        button.ondblclick = () => requestAdd(row, kind);
+        button.onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); requestAdd(row, kind); } };
         button.ondragstart = event => {
             if (!ready) { event.preventDefault(); return; }
             const value = metadata(row, kind), key = `${kind}:${row.id}`;
@@ -64,14 +89,15 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
             store.getSources([key]).catch(actions.error);
         };
         // Single click previews the source; double click also inserts it.
-        button.onclick = () => { if (ready) Promise.resolve().then(() => actions.previewSource?.({kind, id: row.id})).catch(actions.error); };
-        const plus = el('button', 'fv-ed-source-add', '＋'); plus.type = 'button'; plus.disabled = !ready;
+        button.onclick = () => { if (ready) Promise.resolve().then(() => actions.previewSource?.({kind, id: row.id})).catch(actions.error); else requestAdd(row, kind); };
+        const plus = el('button', 'fv-ed-source-add', '＋'); plus.type = 'button'; plus.disabled = button.disabled; plus.title = button.title;
         plus.setAttribute('aria-label', `${t('Add to the tracks', '加到轨道上')}: ${label}`);
-        const insert = event => { event.preventDefault(); event.stopPropagation(); if (ready && !(event.detail > 1)) add(row, kind, true).catch(actions.error); };
+        const insert = event => { event.preventDefault(); event.stopPropagation(); if (!(event.detail > 1)) requestAdd(row, kind, true); };
         plus.onclick = insert;
         plus.ondblclick = event => { event.preventDefault(); event.stopPropagation(); };
         plus.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') insert(event); };
         container.append(button, plus);
+        if (kind !== 'work' && row.state === 'failed') container.append(issueButton(t, () => ({where: LIBRARY_ISSUE, message: t('Cannot open', '打不开')})));
         return container;
     }
     function updateUsed() {
@@ -97,6 +123,7 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
         updateUsed();
         message.textContent = ''; // Empty states stay silent.
         for (const row of shown) if (row.state === 'failed') message.textContent = t('This file cannot be opened. Supported formats: ', '这个文件打不开。支持的格式：') + FORMATS;
+        if (message.textContent) message.append(issueButton(t, () => ({where: LIBRARY_ISSUE, message: cannotOpen()})));
         if (scroll > 0) {
             const replacement = anchor && [...grid.querySelectorAll('.fv-ed-source')].find(node => node.dataset.key === anchor.dataset.key);
             host.scrollTop = replacement ? scroll + replacement.getBoundingClientRect().top - anchorTop : scroll;
@@ -165,8 +192,24 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
     }
     host.addEventListener('scroll', scheduleMore, {passive: true});
     const resize = new ResizeObserver(scheduleMore); resize.observe(host);
-    async function importFiles(files) {
+    // Files dropped on the tracks go to the drop point once ready, in drop order.
+    const placing = [];
+    let placed = Promise.resolve();
+    function placeReady(items) {
+        while (placing.length && !disposed) {
+            const head = placing[0], row = items.find(item => item.id === head.id);
+            if (row?.state === 'preparing' || (!row && recentImports.has(head.id))) return;
+            placing.shift();
+            if (row?.state !== 'ready') continue;
+            const value = metadata(row, 'import'), at = head.place.at;
+            if (value.hasVideo) head.place.at += value.frames;
+            const insert = {source: {kind: 'import', id: row.id}, at, frames: value.frames, hasVideo: value.hasVideo, hasAudio: value.hasAudio};
+            placed = placed.then(() => disposed ? null : actions.insertSource(insert, {loadMetadata: true})).catch(actions.error);
+        }
+    }
+    async function importFiles(files, {at} = {}) {
         choose('import');
+        const place = Number.isSafeInteger(at) && at >= 0 ? {at} : null;
         for (const value of files) {
             if (disposed) break;
             const id = 'upload-' + Math.random(), row = {id, name: value.name, kind: value.type.startsWith('audio') ? 'audio' : 'video', state: 'preparing', fraction: 0};
@@ -174,11 +217,16 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
             try {
                 const item = await store.upload(value, fraction => { row.fraction = fraction; render(); });
                 if (item && !disposed) {
+                    const pending = pendingAdds.get(`import:${id}`);
+                    pendingAdds.delete(`import:${id}`);
+                    if (pending) pendingAdds.set(`import:${item.id}`, pending);
                     recentImports.set(item.id, item);
                     imported = [item, ...imported.filter(existing => existing.id !== item.id)];
+                    if (place) { placing.push({id: item.id, place}); placeReady(imported); }
+                    else startPending([item]);
                 }
-            } catch { actions.notify(t('This file cannot be opened. Supported formats: ', '这个文件打不开。支持的格式：') + FORMATS); }
-            finally { uploading.delete(id); render(); }
+            } catch { actions.notify(cannotOpen(), LIBRARY_ISSUE); }
+            finally { pendingAdds.delete(`import:${id}`); uploading.delete(id); render(); }
         }
     }
     file.onchange = () => { importFiles([...file.files]); file.value = ''; };
@@ -186,8 +234,9 @@ export function createEditorLibrary(host, {store, t, actions, state}) {
         for (const item of items) recentImports.delete(item.id);
         // A list request started before an upload may finish after it.
         imported = [...recentImports.values(), ...items]; render();
+        placeReady(imported); startPending(imported);
     });
     const stopUsed = state?.subscribe(event => { if (event.type === 'record') updateUsed(); });
     render(); load();
-    return {element: host, importFiles, refresh, dispose() { disposed = true; host.removeEventListener('scroll', scheduleMore); resize.disconnect(); cancelAnimationFrame(moreFrame); stop(); stopUsed?.(); clearTimeout(retryTimer); finishRetry?.(); }};
+    return {element: host, importFiles, refresh, dispose() { disposed = true; pendingAdds.clear(); host.removeEventListener('scroll', scheduleMore); resize.disconnect(); cancelAnimationFrame(moreFrame); stop(); stopUsed?.(); clearTimeout(retryTimer); finishRetry?.(); }};
 }

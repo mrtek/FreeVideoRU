@@ -48,8 +48,8 @@ export function registerEditorShortcuts(audioRows = [], speedRows = []) {
             .map(([id, key, en, zh]) => row(id, `Ctrl / Cmd + ${key}`, en, zh, 'edit')),
         row('addText', 'T', 'Add text', '添加文字', 'text'),
         row('nextSubtitle', 'Enter', 'Next subtitle while editing', '编辑时添加下一条字幕', 'text'),
-        row('cancelSelection', 'Esc', 'Cancel selection / gesture / close popup', '取消选择、拖动或关闭弹层', 'edit'),
-        row('selectPart', 'Enter', 'Select the focused part', '选中聚焦的段', 'edit'),
+        row('cancelSelection', 'Esc', 'Cancel selection or dragging, or close a popup', '取消选择、拖动或关闭弹窗', 'edit'),
+        row('selectPart', 'Enter', 'Select the highlighted part', '选中高亮的段', 'edit'),
         row('toggleSelection', 'Ctrl / Cmd + click', 'Add or remove a part from selection', '添加或移出选择', 'edit'),
         row('rangeSelection', 'Shift + click', 'Select parts between two points', '选中两处之间的段', 'edit'),
         row('boxSelection', 'Shift + drag', 'Select parts in a box', '框选多段', 'edit'),
@@ -183,7 +183,7 @@ export function createEditorTransport({element, preview, transport, toolbar, edi
         try {
             if (document.fullscreenElement === fullHost) await document.exitFullscreen();
             else { sheet.hidden = true; await fullHost.requestFullscreen(); }
-        } catch { return {ok: false, reason: 'fullscreen'}; }
+        } catch { notify?.(t('Full screen is not available here.', '这里不能全屏。')); return {ok: false, reason: 'fullscreen'}; }
         refresh();
     }
     const handlers = {

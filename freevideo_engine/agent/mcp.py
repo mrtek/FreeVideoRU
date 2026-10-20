@@ -31,7 +31,12 @@ Chain shots by starting the next shot from the previous one's last frame (media.
 "frame": "last"}), look at results with freevideo_look, ask the local VLM with freevideo_ask, and join clips
 with freevideo_assemble. For durable filming, use freevideo_drama_plan → start → get → sheet → choose/reshoot → finish.
 Cast first: search freevideo_cast_list, reuse the card the user named or one that fits, create a card only if none does.
-If paused is set, wait for the user using get with since and wait=25. Only the user may pause/resume."""
+If paused is set, wait for the user using get with since and wait=25. Only the user may pause/resume.
+Bring your own footage: render complete video clips on your computer with ffmpeg/Canvas, baking effects into pixels.
+freevideo_import_media reads your local file and uploads content (up to 2 GiB); reuse ref for safe retries.
+Poll freevideo_imports about every two seconds until state=ready (failed is terminal), then insert its source=import:<id>
+at an integer frame in a 24 fps project, add subtitles/audio, and export. GET /guide bring_your_own_footage explains
+authenticated source downloads, dimensions and audio. No second video track or blend mode is needed."""
 
 
 def tool_list():
@@ -44,14 +49,17 @@ def tool_list():
         dict(name='freevideo_prompt_guide', title='H3 prompt guide', description='How to write prompts: sections, shots and cuts, camera motion, dialogue, references, short-drama tips, and a full example.', annotations=read),
         dict(name='freevideo_schema', title='Job JSON Schemas', description='JSON Schemas of every job kind and of image edit recipes.', annotations=read),
         dict(name='freevideo_plan', title='Plan a job', description="Validate a job without running it: actual frames/seconds, sampling passes, warnings and a time estimate from this computer's history. Same fields as freevideo_generate.", annotations=read),
-        dict(name='freevideo_generate', title='Generate a video', description='Generate one video from an H3 prompt, up to 60 seconds: a longer request continues and joins into one file automatically. Prefer a new shot with its reference pictures wherever the film can cut; continue only a take, action or sound that must stay unbroken. Use this for any single video, also after freevideo_enhance_prompt; the drama tools are only for a film of several separately chosen shots. Optionally from first/last frames or references (files, local paths, or frames of earlier jobs). Returns the job; with wait, its result (video path and URL).', annotations=write),
-        dict(name='freevideo_submit_batch', title='Submit a storyboard', description='Submit several jobs at once. Each row is a job object with "kind" (generate default, assemble, vlm, enhance) and an optional "ref"; later rows use "@ref" wherever a job id is expected (from_job, after, clips, refine_from). FreeVideo runs them in dependency order.', annotations=write),
+        dict(name='freevideo_generate', title='Generate a video', description='Generate one video from an H3 prompt, up to 60 seconds. Under 30 s defaults to one generation if the device supports this size and quality; unknown limits use 15 s. Otherwise the video is cut into as few parts as possible, each at least 10 s, and how many parts depends on how long this computer can generate in one run; the parts continue and join automatically. Prefer a new shot with its reference pictures wherever the film can cut; continue only a take, action or sound that must stay unbroken. Use this for any single video, also after freevideo_enhance_prompt; the drama tools are only for a film of several separately chosen shots. Optionally from first/last frames or references (files, local paths, or frames of earlier jobs). Returns the job; with wait, its result (video path and URL).', annotations=write),
+        dict(name='freevideo_generate_image', title='Generate a picture', description='Generate a picture from a prompt; with images, change or combine input pictures; with people, make a first frame with cast members standing where you say. The result is an input file to use as a first frame, as a reference, or in images again.', annotations=write),
+        dict(name='freevideo_submit_batch', title='Submit a storyboard', description='Submit several jobs at once. Each row is a job object with "kind" (generate default, assemble, vlm, enhance, image) and an optional "ref"; later rows use "@ref" wherever a job id is expected (from_job, after, clips, refine_from). FreeVideo runs them in dependency order.', annotations=write),
         dict(name='freevideo_job', title='Job status', description='Status, progress, result or error of a job.', annotations=read),
-        dict(name='freevideo_wait', title='Wait for a job or the user', description="Wait at most 25 seconds for a job (with id) or, without id, for the user's words in this session. Returns early when the user says something (inbox). If the job is still active, call it again with the same ID; do not resubmit.", annotations=read),
+        dict(name='freevideo_wait', title='Wait for a job or the user', description="Wait at most 25 seconds for a job (with id) or, without id, at most 50 seconds for what the user says in FreeVideo (inbox). again=true means nothing new yet: call it again. A job wait returns early when the user says something. If the job is still active, call it again with the same ID; do not resubmit.", annotations=read),
         dict(name='freevideo_jobs', title='List jobs', description='Recent agent jobs, optionally by status (comma-separated), project or kind.', annotations=read),
         dict(name='freevideo_cancel', title='Cancel a job', description='Cancel a waiting, queued or running job.', annotations={'readOnlyHint': False, 'destructiveHint': True, 'openWorldHint': False}),
         dict(name='freevideo_resume', title='Resume generation', description='Resume a failed, interrupted or cancelled generation; only unfinished blocks run. Poll the same job ID.', annotations=write),
         dict(name='freevideo_add_media', title='Add media', description='Read a local image, video or audio file and upload its content; returns the "file" to use in media.', annotations=write),
+        dict(name='freevideo_import_media', title='Import footage', description='Read a local video or audio file and upload it into the editor. Returns import.source (import:<id>) and state. Poll freevideo_imports until ready, then insert that source into a project. Same ref and content safely replay.', annotations=write),
+        dict(name='freevideo_imports', title='Imported footage', description='List editor imports with source, state (preparing/ready/failed), fraction and authenticated preview URLs. Wait for ready before insert; failed is terminal.', annotations=read),
         dict(name='freevideo_look', title='Look at media', description='Return a picture you can see: one frame of a video (at = first, last or seconds) or a contact sheet of timed frames (mode = sheet), or an image file. Use it to review shots.', annotations=read),
         dict(name='freevideo_edit_image', title='Edit an image', description="Crop/rotate/flip/pad/adjust an image, add text, shapes or image overlays, or remove burned-in captions (remove_text), without the browser. The result is a new input file plus an editor document a person can reopen in FreeVideo's image editor.", annotations=write),
         dict(name='freevideo_ask', title='Ask the local VLM', description='Ask FreeVideo\'s local vision-language model about images or sampled frames of a video (e.g. "Does this shot match its description? Answer as JSON {score, issues}").', annotations=write),
@@ -70,6 +78,10 @@ def tool_list():
     rows.extend(dict(name=PROJECT_TOOLS[name], title='Editing project: ' + name, description=summary,
                      annotations=read if method == 'GET' else write)
                 for name, (method, _, summary) in PROJECT_OPERATIONS.items())
+    from .schema import WHITEBOX_OPERATIONS, WHITEBOX_TOOLS
+    rows.extend(dict(name=WHITEBOX_TOOLS[name], title='White model: ' + name, description=summary,
+                     annotations=read if method == 'GET' else write)
+                for name, (method, _, summary) in WHITEBOX_OPERATIONS.items())
     from .schema import IMAGE_OPERATIONS, IMAGE_TOOLS
     rows.extend(dict(name=IMAGE_TOOLS[name], title='Image: ' + name, description=summary,
                      annotations=read if method == 'GET' else write)
@@ -107,6 +119,19 @@ def short_drama(arguments):
 Use ref to replay writes safely. Ordinary job batches remain available through freevideo_submit_batch."""
 
 
+def preload():
+    """Load what tool calls import before stdin is read.
+
+    Tool calls run on threads while this thread waits on stdin. On Windows a DLL loaded for the first
+    time then (numpy's OpenBLAS, loaded through spec) can wait for the client's next line, so the first
+    tool call would stall."""
+    from . import errors, schema, spec  # noqa: F401
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        pass
+
+
 class Server:
     def __init__(self, client, out=None):
         self.client = client
@@ -128,6 +153,7 @@ class Server:
             self.client.hello(via='mcp')
         except (ApiError, AttributeError):
             pass  # Starting before FreeVideo is allowed; later authenticated requests mark it online.
+        preload()
         for line in stream:
             line = line.strip()
             if not line:
@@ -271,9 +297,9 @@ class Server:
             return c.schema(), []
         if name == 'freevideo_plan':
             return c.plan(dict(args, kind='generate')), []
-        if name in ('freevideo_generate', 'freevideo_assemble', 'freevideo_ask', 'freevideo_enhance_prompt'):
-            kind = dict(freevideo_generate='generate', freevideo_assemble='assemble', freevideo_ask='vlm',
-                        freevideo_enhance_prompt='enhance')[name]
+        from .schema import TOOL_KINDS
+        if name in TOOL_KINDS:
+            kind = TOOL_KINDS[name]
             takes = args.pop('takes', 1)
             response = c.post('/jobs', dict(args, kind=kind, **({'takes': takes} if takes != 1 else {})))
             jobs = response['jobs']
@@ -301,7 +327,7 @@ class Server:
                     images.append(dict(type='image', **value['previous']))
                     value['previous'] = True
             return value, images
-        from .schema import IMAGE_TOOLS, PROJECT_TOOLS, TOOL_ENDPOINTS
+        from .schema import IMAGE_TOOLS, PROJECT_TOOLS, TOOL_ENDPOINTS, WHITEBOX_TOOLS
         from .schema import SESSION_OPERATIONS, SESSION_TOOLS
         if name in SESSION_TOOLS.values():
             operation = next(op for op, tool in SESSION_TOOLS.items() if tool == name)
@@ -311,7 +337,7 @@ class Server:
             if method == 'GET' and wait is not None:
                 args['wait'] = wait
             return (c.get(path, **args) if method == 'GET' else c.post(path, args)), []
-        if name in PROJECT_TOOLS.values() or name in IMAGE_TOOLS.values():
+        if name in PROJECT_TOOLS.values() or name in IMAGE_TOOLS.values() or name in WHITEBOX_TOOLS.values():
             method, path = TOOL_ENDPOINTS[name]
             if '{id}' in path:
                 path = path.replace('{id}', args.pop('id'))
@@ -330,8 +356,8 @@ class Server:
             return c.job(args['id'], **({'wait': wait} if wait is not None else {})), []
         if name == 'freevideo_wait':
             if not args.get('id'):
-                return c.get('/inbox', wait=min(25., float(args.get('timeout', 25)))), []
-            return self.wait(identity, args['id'], args.get('timeout', 25), token), []
+                return c.get('/inbox', wait=min(50., float(args.get('timeout', 50)))), []
+            return self.wait(identity, args['id'], min(25., float(args.get('timeout', 25))), token), []
         if name == 'freevideo_jobs':
             return dict(jobs=c.jobs(**args)), []
         if name == 'freevideo_cancel':
@@ -340,6 +366,10 @@ class Server:
             return c.resume(args['id'], **({'ref': args['ref']} if 'ref' in args else {})), []
         if name == 'freevideo_add_media':
             return c.upload(args['path']), []
+        if name == 'freevideo_import_media':
+            return c.import_media(args['path'], **({'ref': args['ref']} if 'ref' in args else {})), []
+        if name == 'freevideo_imports':
+            return c.get('/imports'), []
         if name == 'freevideo_edit_image':
             made = c.edit(args['source'], args.get('recipe'), document=args.get('document'), target=args.get('target'))
             return made, self.picture(made['view'])

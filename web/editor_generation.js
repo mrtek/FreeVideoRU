@@ -13,3 +13,13 @@ export function generationSize(project, sizes = []) {
         || Math.abs(a.width * a.height - area) - Math.abs(b.width * b.height - area));
     return {width: candidates[0].width, height: candidates[0].height};
 }
+// A part that continues finished footage is made at that footage's shape, whatever the edit's own: the size all the
+// footage a request continues has in common (an imported video off the 32-pixel grid gets the nearest size of its
+// shape). null when a video in the request starts fresh or the sizes differ; the edit's size then stands.
+export function continuedSize(before, sources) {
+    const sizes = before.map(key => key && sources.get(key)).map(size =>
+        valid(size) ? size : [size?.width, size?.height].every(side => Number.isSafeInteger(side) && side > 0) ? generationSize(size) : null);
+    if (!sizes.length || !sizes.every(valid)) return null;
+    const {width, height} = sizes[0];
+    return sizes.every(size => size.width === width && size.height === height) ? {width, height} : null;
+}

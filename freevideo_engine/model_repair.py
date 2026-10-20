@@ -41,8 +41,8 @@ BUSY = ('When the current task ends, a Repair button appears here; after you cli
         'FreeVideo renames and keeps this file, then downloads the tested version.',
         '当前任务结束后，这里会出现“修复”按钮；点击并确认后，FreeVideo 会把这个文件改名保留，再下载测试过的版本。')
 OFFLINE = ('This offline-package installation cannot switch back in one step yet. Move or rename the file below, '
-           'then import the Text encoder package again on the Installation page.',
-           '离线包安装暂时不能一键换回。请把下面这个文件移走或改名，再在“安装”页重新导入“文本编码器”包。')
+           'then import the Prompt model package (FreeVideo-文本编码器.zip) again on the Installation page.',
+           '离线包安装暂时不能一键换回。请把下面这个文件移走或改名，再在“安装”页重新导入“提示词模型（FreeVideo-文本编码器.zip）”包。')
 FIRST_INSTALL = (
     '{file} differs from the version FreeVideo tests and was left unchanged. Click Retry installation below: '
     'the confirmation page will list this file, and after you confirm, it is renamed and kept, '
@@ -54,19 +54,17 @@ CHANGED = 'The installation plan changed. Detect configuration again and review 
 # A file the review listed changed before setup reached it (the confirmed plan
 # can also differ in other ways: bootstrap.confirmed raises plain CHANGED).
 FILE_CHANGED = 'A file in the installation folder changed after the review. ' + CHANGED
-CHANGED_TITLE = ('The installation plan changed', '安装计划有变化')
+CHANGED_TITLE = ('Installation stopped', '安装已停止')
 CHANGED_WHY = dict(
-    files=('Files in the installation folder changed after you confirmed the plan, so FreeVideo stopped instead of '
-           'continuing with it.', '确认计划之后，安装位置里的文件又有变化，FreeVideo 因此停止，未按原计划继续。'),
-    other=('Something changed after you confirmed the plan (for example the settings, the GPU or the free disk '
-           'space), so FreeVideo stopped instead of continuing with it.',
-           '确认计划之后，设置、显卡或可用磁盘空间发生了变化，FreeVideo 因此停止，未按原计划继续。'),
+    files=('Files in the installation folder changed after you confirmed.', '确认之后安装位置里的文件有变化。'),
+    other=('The settings, GPU or free disk space changed after you confirmed.',
+           '确认之后设置、显卡或磁盘空间有变化。'),
 )
-CHANGED_REPAIR = ('Click Repair again to review the new plan.', '请再次点击“修复”，查看新的计划。')
+CHANGED_REPAIR = ('Click Repair again.', '请再点一次“修复”。')
 CHANGED_WAYS = dict(
-    busy=('When the current task ends, a Repair button appears here; click it to review the new plan.',
-          '当前任务结束后，这里会出现“修复”按钮；点击后可以查看新的计划。'),
-    none=('Click Retry installation below to review the new plan.', '请点击下方的“重试安装”，查看新的计划。'),
+    busy=('A Repair button appears here when the current task ends. Click it.',
+          '当前任务结束后，这里会出现“修复”按钮，请点它。'),
+    none=('Click Retry installation below.', '请点下方的“重试安装”。'),
 )
 IDENTITY = ('bytes', 'mtime_ns', 'st_dev', 'st_ino', 'parent_realpath')
 

@@ -20,7 +20,7 @@ export function handleSpeedKey(event) {
 export function speedErrorText(error, t) {
     if (error?.code === 'speed_pending') return t('Speed can be adjusted after generation is complete.', '生成完成后可以调整速度。');
     if (error?.code === 'speed_locked') return t('This track is locked', '这条轨道已锁定');
-    if (error?.code === 'speed') return t('Enter a speed from 0.25 to 4.', '请输入 0.25 至 4 的速度。');
+    if (error?.code === 'speed') return t('Enter a speed from 0.25× to 4×.', '请输入 0.25× 至 4× 的速度。');
     return null;
 }
 export function previewSpeed(media, clip, playing, sound = clip) {

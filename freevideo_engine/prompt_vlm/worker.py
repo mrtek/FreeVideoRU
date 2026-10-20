@@ -103,6 +103,31 @@ def available_memory():
     return available
 
 
+class Cancelled(BaseException):
+    """Raised by a stop signal between Python operations, never inside a GPU call."""
+
+
+def stop_on_signal():
+    """Stop like a finished run: no hard exit while weights or tokens are on their way to the GPU."""
+    import signal
+    names = [signal.SIGTERM, signal.SIGINT] + ([signal.SIGBREAK] if os.name == 'nt' else [])
+    def stop(*_):
+        for name in names:
+            signal.signal(name, signal.SIG_IGN)
+        raise Cancelled()
+    for name in names:
+        signal.signal(name, stop)
+
+
+def settle():
+    torch = sys.modules.get('torch')
+    if torch is not None and torch.cuda.is_initialized():
+        try:
+            torch.cuda.synchronize()
+        except (RuntimeError, OSError):
+            pass
+
+
 def emit(**value):
     print(json.dumps(value, ensure_ascii=True), flush=True)
 
@@ -125,7 +150,7 @@ def failure(error, mode='rewrite'):
     Tokenizers may quote only a fragment of either draft: replacing the full
     prompt in an exception is not sufficient to make that exception private.
     """
-    allowed = {'ram_space', 'image_size', 'context_length', 'invalid_output'}
+    allowed = {'ram_space', 'image_size', 'context_length', 'invalid_output', 'out_of_memory'}
     message = str(error)
     fallback = 'ask_failed' if mode == 'ask' else 'rewrite_failed'
     code = message if message in allowed else 'out_of_memory' if 'out of memory' in message.lower() else fallback
@@ -180,6 +205,7 @@ def tokenize(processor, messages, max_pixels=512 * 32 * 32):
 # CUDA context alone take about 2.5 GB of commit). Other placements map and
 # merge the whole model in RAM; theirs is checked after the imports.
 RESIDENT_RAM = 4 * 2**30
+STREAMED_RAM = 6 * 2**30   # download-card figure for 6 GB cards: resident part plus the streamed layers' host copy
 MAPPED_RAM = 11 * 2**30
 
 
@@ -238,6 +264,8 @@ def load_model(folder, torch, stats, checkpoint):
     shapes = stored(folder)
     weights = sum(row['bytes'] for row in shapes.values())
     resident = None
+    keep = None
+    host_bytes = 0
     weight_budget = 0
     if torch.cuda.is_available():
         from .. import gpu_budget
@@ -252,7 +280,19 @@ def load_model(folder, torch, stats, checkpoint):
         kv = kv_bytes(shapes, reserved_tokens(stats))
         stats.update(gpu_allocator_budget_bytes=free, gpu_weight_budget_bytes=weight_budget, gpu_kv_reserve_bytes=kv)
         resident = placement(weights, int8.saved_bytes(shapes), kv, free)
-    stats['ram_required_bytes'] = RESIDENT_RAM if resident else MAPPED_RAM
+        if not resident:
+            # Too big even as int8: keep what fits on the GPU and stream the other
+            # layers' int8 rows from host memory, a layer ahead of use.
+            plan = int8.resident_layers(weights, shapes, free - kv - WORKING_VRAM)
+            if plan:
+                resident, (keep, host_bytes) = 'int8', plan
+        stats.update(streamed_layers=len(int8.layer_bytes(shapes)) - keep if keep is not None else 0,
+                     streamed_host_bytes=host_bytes)
+        if not resident and weight_budget <= 2 * 2**30:
+            # Not even the streaming tier fits: the model would run on the CPU at
+            # about 0.2 tokens/s and hit the request deadline, so say so at once.
+            raise ValueError('out_of_memory')
+    stats['ram_required_bytes'] = (RESIDENT_RAM + host_bytes) if resident else MAPPED_RAM
     available = stats['available_memory_at_start_bytes' if resident else 'available_memory_before_load_bytes']
     if available < stats['ram_required_bytes']:
         raise ValueError('ram_space')
@@ -260,7 +300,7 @@ def load_model(folder, torch, stats, checkpoint):
     loading = time.monotonic()
     if resident:
         from .load import resident as load_resident
-        model = load_resident(folder, torch, 'cuda:0', resident)
+        model = load_resident(folder, torch, 'cuda:0', resident, keep)
         mapping, device = {'': 0}, 'cuda:0'
         stats.update(weights=resident, kv_positions=kv_positions(reserved_tokens(stats)))
     else:
@@ -318,6 +358,8 @@ def run(folder, value, *, stats=None):
     stats = {} if stats is None else stats
     if value.get('mode') == 'ask':
         return ask(folder, value, stats)
+    if value.get('mode') == 'split':
+        return split(folder, value, stats)
     return rewrite(folder, value, stats)
 
 
@@ -382,6 +424,62 @@ def rewrite(folder, value, stats):
     rewritten = validate_output(text, value)
     stats['stage'] = 'complete'
     emit(phase='complete', text=rewritten, diagnostics=dict(stats))
+
+
+def split(folder, value, stats):
+    """One description per part of a long video; text leaves only via stdout."""
+    from .rules import SPLIT_RETRY, split_instruction, split_user_text, validate_split
+    count = len(value['seconds'])
+    limit = min(2 * OUTPUT_TOKENS - 200, 600 + 300 * count)  # Within the cache reserved for a rewrite and its retry.
+    stats.update(stage='imports', pid=os.getpid(), mode='split', part_count=count, dtype='bfloat16',
+                 attention='sdpa', kv_cache='dynamic', backend='transformers', accelerations=[],
+                 persistent_model=False)
+    torch, checkpoint = begin(stats)
+    from transformers import AutoProcessor
+    checkpoint('preprocess')
+    preparing = time.monotonic()
+    processor = AutoProcessor.from_pretrained(folder, local_files_only=True, trust_remote_code=False)
+    messages = [{'role': 'system', 'content': split_instruction(value)},
+                {'role': 'user', 'content': [{'type': 'text', 'text': split_user_text(value)}]}]
+    inputs = tokenize(processor, messages)
+    if inputs.input_ids.shape[-1] > 6500:
+        raise ValueError('context_length')
+    stats.update(input_tokens=int(inputs.input_ids.shape[-1]), preprocess_seconds=time.monotonic() - preparing)
+    model, device = load_model(folder, torch, stats, checkpoint)
+    loaded = time.monotonic()
+    checkpoint('prefill', 'splitting')
+    shown = [0.]
+    def on_token(timing):
+        stats.update(output_tokens=timing['output_tokens'], decode_seconds=timing['decode_seconds'])
+        if time.monotonic() - shown[0] > .5:
+            checkpoint('decode', 'splitting')
+            shown[0] = time.monotonic()
+    ids, _ = generate(torch, model, inputs.to(device), limit, loaded, on_token)
+    answers = [processor.decode(ids, skip_special_tokens=True)] if len(ids) < limit else []
+    stats.update(split_seconds=time.monotonic() - loaded, output_tokens=len(ids))
+    parts = None
+    try:
+        parts = validate_split(answers[0], value, strict=True)
+    except (ValueError, IndexError):
+        # One more try with the rules restated; resending the wrong answer would not fit the cache.
+        retry = [messages[0], {'role': 'user', 'content': [{'type': 'text', 'text': (
+            split_user_text(value) + '\n\n' + SPLIT_RETRY)}]}]
+        retry_inputs = tokenize(processor, retry)
+        if retry_inputs.input_ids.shape[-1] + limit <= stats.get('kv_positions', 10 ** 9):
+            ids, _ = generate(torch, model, retry_inputs.to(device), limit, time.monotonic(), lambda timing: None)
+            stats.update(split_retry=True, retry_output_tokens=len(ids), split_seconds=time.monotonic() - loaded)
+            if len(ids) < limit:
+                answers.insert(0, processor.decode(ids, skip_special_tokens=True))
+        for strict in (True, False):
+            for answer in answers:
+                try:
+                    parts = parts or validate_split(answer, value, strict=strict)
+                except ValueError:
+                    pass
+        if parts is None:
+            raise ValueError('split_failed')
+    stats['stage'] = 'complete'
+    emit(phase='complete', parts=parts, diagnostics=dict(stats))
 
 
 def ask(folder, value, stats):
@@ -480,6 +578,7 @@ def main():
     value = {}
     prestarting = os.environ.get(PRESTART_ENV) == '1'
     requested = False
+    stop_on_signal()
     try:
         if prestarting:
             started = time.monotonic()
@@ -503,6 +602,10 @@ def main():
         else:
             value = json.loads(sys.stdin.buffer.read(1024 * 1024))
         run(Path(sys.argv[1]), value, stats=stats)
+    except Cancelled:
+        settle()
+        emit(phase='cancelled')
+        return 0
     except Exception as error:
         if not prestarting or requested:
             gpu_snapshot(stats)

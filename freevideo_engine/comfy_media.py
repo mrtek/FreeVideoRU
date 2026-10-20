@@ -1,6 +1,8 @@
 """Native Comfy sockets -> retained local files, without model duplication."""
+import logging
 from pathlib import Path
 from .comfy_assets import REFERENCE_INPUTS
+from .media_request import validate_early_steps
 
 
 def _image(value, path):
@@ -43,7 +45,56 @@ def _audio(value, path):
             container.mux(packet)
 
 
-def export(run, canvas, *, first=None, last=None, references=None, loras=None, conditioning=None, assets=None):
+def continued(exported, notes=None):
+    """What a continued part keeps of exported inputs: up to three pictures, and the LoRAs.
+
+    It starts from the footage, so a first or last frame image becomes one more picture after the
+    reference pictures; pre-encoded conditioning, clips and sound are left out. When keyframes are
+    used or pictures are left out, notes gets one line saying so."""
+    from .continuation import PICTURES_MAX, pick_pictures
+    media = (exported or {}).get('media') or {}
+    kept = {key: value for key, value in media.items()
+            if key not in ('first', 'last', 'references', 'conditioning_info')}
+    pictures = [row for row in media.get('references', []) if row.get('kind') == 'image']
+    keyframes = [name for name in ('first', 'last') if media.get(name)]
+    # Characters added by an @ mention keep one picture each when there are several (pick_pictures).
+    chosen = pick_pictures(pictures, lambda row: row.get('cast'))
+    candidates = [_plain(row) for row in chosen] + [{'kind': 'image', 'path': media[name]} for name in keyframes]
+    if candidates:
+        kept['references'] = candidates[:PICTURES_MAX]
+    lines = [continued_note(len(pictures), keyframes, len(candidates[:PICTURES_MAX]))]
+    if any(row.get('kind') != 'image' for row in media.get('references', [])) or media.get('conditioning_info') \
+            or (exported or {}).get('conditioning'):
+        lines.append('A continued part uses picture references only. Video, audio and pre-encoded inputs are skipped.')
+    for line in filter(None, lines):
+        logging.info('[FreeVideo] %s', line)
+        if notes is not None:
+            notes.append(line)
+    return {'media': kept} if len(kept) > 1 else {}
+
+
+def _plain(row):
+    """A reference row without the panel's character mark, which the engine's request does not carry."""
+    return {key: value for key, value in row.items() if key != 'cast'}
+
+
+def continued_note(pictures, keyframes, used):
+    """One line for a continued part whose keyframes became pictures or whose pictures did not all fit."""
+    frames = 'the %s frame%s' % (' and '.join(keyframes), 's' if len(keyframes) > 1 else '')
+    if pictures + len(keyframes) > used:
+        return ('Continuing the previous video with %d of %d pictures: references first, then %s.'
+                % (used, pictures + len(keyframes), frames) if keyframes
+                else 'Continuing the previous video with the first %d of %d references.' % (used, pictures))
+    if keyframes:
+        return 'Continuing the previous video. %s %s used as %s.' % (
+            frames[0].upper() + frames[1:], 'are' if len(keyframes) > 1 else 'is',
+            'references' if len(keyframes) > 1 else 'a reference')
+    return None
+
+
+def export(run, canvas, *, first=None, last=None, references=None, loras=None, conditioning=None, assets=None,
+           continuing=False):
+    """continuing: the request continues a video, so keyframes and references may be mixed (see continued)."""
     media = {'version': 1}
     if assets:
         if conditioning is not None or first is not None or last is not None or references:
@@ -63,7 +114,8 @@ def export(run, canvas, *, first=None, last=None, references=None, loras=None, c
             references.append({'kind': 'audio', 'value': connected['reference_audio']})
     if conditioning is not None and (first is not None or last is not None or references):
         raise ValueError('Preencoded conditioning already includes media; do not connect a second set')
-    if references and (first is not None or last is not None):
+    keyframes = first is not None or last is not None or any(name in media for name in ('first', 'last'))
+    if not continuing and keyframes and (references or media.get('references')):
         raise ValueError('Choose keyframes or experimental references; mixed layouts are not supported')
     result = {}
     run = Path(run)
@@ -76,6 +128,8 @@ def export(run, canvas, *, first=None, last=None, references=None, loras=None, c
         media['references'] = list(media.get('references', []))
         for index, reference in enumerate(references):
             kind, value = reference['kind'], reference['value']
+            if 'early_steps' in reference:
+                validate_early_steps(reference)
             path = run / ('reference-%02d' % index)
             if kind == 'image':
                 path = path.with_suffix('.png')
@@ -91,7 +145,10 @@ def export(run, canvas, *, first=None, last=None, references=None, loras=None, c
                 _audio(value, path)
             else:
                 raise ValueError('Unknown reference type')
-            media['references'].append({'kind': kind, 'path': str(path)})
+            row = {'kind': kind, 'path': str(path)}
+            if 'early_steps' in reference:
+                row['early_steps'] = reference['early_steps']
+            media['references'].append(row)
     if loras:
         media['loras'] = [dict(row) for row in loras]
     if conditioning is not None:
@@ -102,6 +159,8 @@ def export(run, canvas, *, first=None, last=None, references=None, loras=None, c
         torch.save(value, path)
         media['conditioning_info'] = info
         result['conditioning'] = str(path)
+    if not continuing and media.get('references'):
+        media['references'] = [_plain(row) for row in media['references']]
     if len(media) > 1:
         result['media'] = media
     return result

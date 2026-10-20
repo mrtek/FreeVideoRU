@@ -12,7 +12,7 @@ from .system import windows
 from .long_paths import io_path, plain_data
 
 
-def save(path, value, *, staging=None):
+def save(path, value, *, staging=None, plain_paths=True):
     path = io_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Unique, closed staging file; Windows readers/antivirus may briefly hold
@@ -23,7 +23,7 @@ def save(path, value, *, staging=None):
             prefix=path.name + '.' if staging is None else staging, suffix='.tmp',
             dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
-        stream.write(json.dumps(plain_data(value), ensure_ascii=False, indent=2) + '\n')
+        stream.write(json.dumps(plain_data(value) if plain_paths else value, ensure_ascii=False, indent=2) + '\n')
     for attempt in range(8):
         try:
             temporary.replace(path)
@@ -93,18 +93,21 @@ def thermal_slowdown(measured, *, share=.5, clock_ratio=.7, minimum_samples=200)
     busy = measured.get('busy_activity') if isinstance(measured, dict) else None
     if not isinstance(busy, dict):
         return None
-    samples = busy.get('clock_reason_samples') or 0
-    counts = busy.get('clock_reason_counts') or {}
-    clock = busy.get('sm_clock_mhz') or {}
-    mean, peak = clock.get('mean'), clock.get('maximum')
+    samples = _count(busy.get('clock_reason_samples'))
+    counts = busy.get('clock_reason_counts')
+    counts = counts if isinstance(counts, dict) else {}
+    clock = busy.get('sm_clock_mhz')
+    clock = clock if isinstance(clock, dict) else {}
+    mean, peak = _count(clock.get('mean')), _count(clock.get('maximum'))
     if samples < minimum_samples or not mean or not peak:
         return None
-    thermal = min(samples, max(counts.get('sw_thermal') or 0, counts.get('hw_thermal') or 0))
+    thermal = min(samples, max(_count(counts.get('sw_thermal')), _count(counts.get('hw_thermal'))))
     if thermal < share * samples or mean > clock_ratio * peak:
         return None
-    temperature = (busy.get('temperature_c') or {}).get('mean')
+    temperature = busy.get('temperature_c')
+    temperature = temperature.get('mean') if isinstance(temperature, dict) else None
     return dict(share=round(thermal / samples, 3), sm_clock_mean_mhz=round(mean), sm_clock_max_mhz=round(peak),
-                temperature_mean_c=round(temperature, 1) if isinstance(temperature, (int, float)) else None)
+                temperature_mean_c=round(temperature, 1) if type(temperature) in (int, float) and 0 <= temperature <= 1000 else None)
 
 
 class OtherPrograms:
@@ -178,20 +181,23 @@ class OtherPrograms:
             self.ours = self.ours or {pid for pid in (os.getpid(), self.pid) if pid}
 
     def check(self, util):
-        """Read once a second; count the reading when the worker is computing on a busy device."""
+        """Read once a second; count the reading when the worker is computing on a busy device.
+
+        Returns the other programs' share of the cores in percent for a reading that was counted, else None.
+        """
         now = time.monotonic()
         if self.supported is False or now - self.checked < self.seconds:
-            return
+            return None
         self.checked = now
         found = self.read()
         if found is None:
             self.failures += 1
             if self.supported is None and self.failures >= self.failures_allowed:
                 self.supported = False
-            return
+            return None
         self.supported = True
         if not found or util is None or util < 50:
-            return
+            return None
         # A process we have not seen may be a child the worker just started.
         if now - self.refreshed >= self.refresh_seconds or any(pid not in self.seen for pid in found):
             self.refresh()
@@ -204,12 +210,13 @@ class OtherPrograms:
             # device did beyond the other programs was the worker's.
             own = max(0., util - other)
         if own < self.own_percent:
-            return
+            return None
         self.checks += 1
         self.shared += other >= self.share_percent
         self.other_total += other
         self.own_total += own
         self.other_peak = max(self.other_peak, other)
+        return other
 
     def result(self):
         result = dict(supported=bool(self.supported), own_reported=self.own_reported, checks=self.checks,
@@ -231,14 +238,33 @@ def shared_gpu(measured, *, share=.5, minimum_checks=30):
     if not isinstance(programs, dict):
         return None
     checks, shared, mean = (programs.get(key) for key in ('checks', 'shared_checks', 'other_mean_percent'))
-    if (any(type(value) not in (int, float) or not value >= 0 for value in (checks, shared, mean))
-            or checks < minimum_checks or shared < share * checks):
+    if (any(type(value) not in (int, float) for value in (checks, shared, mean))
+            or not minimum_checks <= checks <= 1e9 or not 0 <= shared <= checks or not 0 <= mean <= 100
+            or shared < share * checks):
         return None
     return dict(share=round(shared / checks, 3), other_mean_percent=round(mean))
 
 
+# Other programs' mean share of the GPU, in percent, from which the result says so:
+# the run took at least about a quarter longer than with the GPU to itself.
+SHARED_NOTE_PERCENT = 20
+
+
+def shared_gpu_note(measured):
+    """{other_mean_percent} for the note under a result, or None.
+
+    Shown when other programs averaged at least SHARED_NOTE_PERCENT of the
+    GPU, and shared_gpu holds: at least 30 checks, with other programs using
+    at least 20% in at least half of them.
+    """
+    if shared_gpu(measured) is None:
+        return None
+    mean = measured['other_programs']['other_mean_percent']
+    return dict(other_mean_percent=mean) if mean >= SHARED_NOTE_PERCENT else None
+
+
 def _count(value):
-    return value if type(value) in (int, float) and 0 <= value < float('inf') else 0
+    return value if type(value) in (int, float) and 0 <= value <= 1e12 else 0
 
 
 def combined(rows):
@@ -411,7 +437,8 @@ class Monitor:
         with self.path.open('w', buffering=1, encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['epoch_seconds', 'monotonic_seconds', 'used_bytes', 'total_bytes', 'gpu_util_percent',
-                             'temperature_c', 'power_mw', 'sm_clock_mhz', 'memory_clock_mhz', 'clock_reason_mask'])
+                             'temperature_c', 'power_mw', 'sm_clock_mhz', 'memory_clock_mhz', 'clock_reason_mask',
+                             'other_programs_percent'])
             while not self.stop_event.is_set():
                 try:
                     used, total, util = self.sample()
@@ -427,8 +454,12 @@ class Monitor:
                         self.max_temperature = max(self.max_temperature or 0, auxiliary[0])
                     if auxiliary[1] is not None:
                         self.max_power_mw = max(self.max_power_mw or 0, auxiliary[1])
-                    writer.writerow([time.time(), time.monotonic(), used, total, util, *auxiliary, reasons])
-                    self.programs.check(util)
+                    try:
+                        other = self.programs.check(util)
+                    except Exception:
+                        other = None
+                    writer.writerow([time.time(), time.monotonic(), used, total, util, *auxiliary, reasons,
+                                     '' if other is None else '%.1f' % other])
                 except Exception as e:
                     if str(e) not in self.errors and len(self.errors) < 20:
                         self.errors.append(str(e))
@@ -504,6 +535,13 @@ def step_activity(csv_path, steps, *, limit_bytes=64 * 2**20):
                 total = item['sums'].setdefault(key, [0., 0])
                 total[0] += value
                 total[1] += 1
+        other = number(sample, 'other_programs_percent')
+        if other is not None and other <= 100:
+            item['other_programs_checks'] = item.get('other_programs_checks', 0) + 1
+            item['other_programs_percent_peak'] = max(item.get('other_programs_percent_peak', 0.), other)
+            total = item['sums'].setdefault('other_programs_percent_mean', [0., 0])
+            total[0] += other
+            total[1] += 1
         used, size = number(sample, 'used_bytes'), number(sample, 'total_bytes')
         if used is not None:
             item['device_used_peak_bytes'] = max(item.get('device_used_peak_bytes', 0), int(used))

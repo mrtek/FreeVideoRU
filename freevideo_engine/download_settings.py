@@ -10,7 +10,9 @@ from .long_paths import io_path, plain
 from .proxy import MODES
 
 CHOICES = ('auto', 'official', 'hf-mirror', 'modelscope')
-FAMILIES = ('edge-models', 'vdn-models', 'models')
+# Shown as is by the Tk window and mapped to Chinese by the setup page.
+SPEED_TEST_FAILED = 'The speed test did not finish. Click "Test source speeds".'
+FAMILIES = ('edge-models', 'vdn-models', 'models', 'image-models')
 
 
 def speed_text(row, zh=False):
@@ -19,7 +21,7 @@ def speed_text(row, zh=False):
     rate = row.get('bytes_per_second')
     if (row.get('speed_measured') is False or not isinstance(rate, (int, float))
             or not math.isfinite(rate) or rate <= 0):
-        return '已连通，样本不足' if zh else 'Connected; insufficient sample'
+        return '已连通，速度还没测出' if zh else 'Connected; speed not measured yet'
     speed = rate / 2**20
     return '<0.01 MiB/s' if speed < .005 else (('%.2f' if speed < 1 else '%.1f') % speed + ' MiB/s')
 
@@ -35,6 +37,42 @@ def read(path):
     if value['proxy_mode'] not in MODES:
         raise ValueError('Invalid download connection mode')
     return value
+
+
+SPEED_FILE = 'download-speed.json'
+SPEED_MIN_BYTES = 32 * 2**20
+
+
+def record_speed(root, size, seconds):
+    """Remember how fast the last large download ran, to say how long the next one takes."""
+    if not (size >= SPEED_MIN_BYTES and seconds >= 1.5):
+        return
+    path = Path(root) / SPEED_FILE
+    rate = size / seconds
+    try:
+        old = observed_speed(root)
+        save(path, dict(bytes_per_second=rate if old is None else (old + rate) / 2, updated_at=time.time()))
+    except OSError:
+        pass  # A missing estimate only hides the time, never stops a download.
+
+
+def observed_speed(root):
+    """Bytes per second of recent real downloads, else the best connected source of the last speed test."""
+    try:
+        rate = json.loads(io_path(Path(root) / SPEED_FILE).read_text(encoding='utf-8')).get('bytes_per_second')
+        if isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0:
+            return float(rate)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        rows = [r for family in read(Path(root) / 'download-settings.json').get('probe', {}).get('sources', {}).values()
+                for r in family if r.get('ok') and r.get('speed_measured') is not False]
+        rates = [r['bytes_per_second'] for r in rows
+                 if isinstance(r.get('bytes_per_second'), (int, float)) and math.isfinite(r['bytes_per_second'])
+                 and r['bytes_per_second'] > 0]
+        return float(max(rates)) if rates else None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
 
 
 def preference(root, source=None, *, proxy_mode=None):
@@ -134,7 +172,7 @@ class Probe:
                     with self.lock:
                         # Provider exceptions can contain request headers/URLs.
                         self.state=dict(status='failed',root=str(root),
-                            error='Source speed test failed (' + type(error).__name__ + '). Retry the speed test.')
+                            error=SPEED_TEST_FAILED)
             self.thread=threading.Thread(target=work,daemon=True)
             self.thread.start()
             return dict(self.state)

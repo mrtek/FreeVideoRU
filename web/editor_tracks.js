@@ -1,5 +1,5 @@
 import {editorIcon} from './editor_icons.js';
-import {displayTracks, isText, isTextTrack} from './editor_text_model.js';
+import {displayTracks, isText, isTextTrack, textDropLocked} from './editor_text_model.js';
 // Pointer gestures translate coordinates into model calls; the model owns edits.
 // These exports deliberately have no DOM dependencies, so input arithmetic can
 // be checked in Node with the same code that runs in the browser.
@@ -39,11 +39,13 @@ export function insertionPoint(clips, frame, exceptIds = []) {
     return {frame: edge === 'start' ? hit.start : hit.start + hit.frames, hit: hit.id, edge};
 }
 
+// A range starts where it was pressed (ends there when drawn leftwards); its length is whole seconds, at least two.
 export function rangeParameters(anchor, frame, tracks = ['v1', 'a1'], fps = model.FPS) {
-    const first = Math.max(0, Math.round(anchor / fps) * fps);
-    const last = Math.max(0, Math.round(frame / fps) * fps);
-    const start = Math.min(first, last);
-    return {kind: 'range', start, frames: Math.max(2 * fps, Math.abs(last - first)), tracks: [...tracks]};
+    const from = Math.max(0, Math.round(anchor)), to = Math.max(0, Math.round(frame));
+    let frames = Math.max(2 * fps, Math.round(Math.abs(to - from) / fps) * fps);
+    // Drawn leftwards past the start, the end stays put: the length shrinks to the whole seconds that fit before it.
+    if (to < from && frames > from) frames = Math.max(2 * fps, Math.floor(from / fps) * fps);
+    return {kind: 'range', start: to < from ? Math.max(0, from - frames) : from, frames, tracks: [...tracks]};
 }
 
 export function moveParameters(clip, anchor, frame, points, zoom) {
@@ -75,14 +77,15 @@ export function rangeMoveParameters(record, range, anchor, frame, points, zoom, 
 
 // Classification uses the source tail only to decide which gesture to preview.
 // trim/extendClip still validate the requested edit (including pairs and limits).
-export function edgeParameters(clip, edge, frame, points, zoom, {canExtend = true} = {}) {
+export function edgeParameters(clip, edge, frame, points, zoom, {canExtend = true, maxFollowSeconds = model.RULES.maxSeconds} = {}) {
     const snapped = snapFrame(frame, points, zoom);
     if (clip.pending && !clip.source) return {kind: 'planned', edge, frame: snapped.frame, guide: snapped.guide};
     const sourceEnd = clip.start + clip.length - clip.in;
     if (speedEdited(clip)) return {kind: 'trim', edge, frame: snapped.frame, guide: snapped.guide};
     if (edge === 'end' && canExtend && clip.extend && snapped.frame > sourceEnd) {
-        const extra = Math.max(2 * model.FPS, Math.round((snapped.frame - sourceEnd) / model.FPS) * model.FPS);
-        return {kind: 'extend', frame: sourceEnd, frames: extra, guide: snapped.guide};
+        // What continues a video is at least followSeconds long; the preview already shows the raised length.
+        const wanted = Math.round((snapped.frame - sourceEnd) / model.FPS), seconds = model.continuedSeconds(wanted, maxFollowSeconds);
+        return {kind: 'extend', frame: sourceEnd, frames: seconds * model.FPS, guide: snapped.guide, raised: seconds !== wanted};
     }
     return {kind: 'trim', edge, frame: snapped.frame, guide: snapped.guide};
 }
@@ -132,6 +135,7 @@ const icon = kind => {
     svg.setAttribute('viewBox', '0 0 20 20'); svg.setAttribute('aria-hidden', 'true');
     const path = document.createElementNS(svg.namespaceURI, 'path');
     path.setAttribute('d', kind === 'video' ? 'M2 4h16v12H2z M4 13l4-5 4 4 2-2 3 4'
+        : kind === 'link' ? 'M8.5 11.5l3-3 M7.5 9.5l-1.5 1.5a3 3 0 0 0 4.2 4.2l1.5-1.5 M12.5 10.5l1.5-1.5a3 3 0 0 0-4.2-4.2l-1.5 1.5'
         : kind === 'warning' ? 'M10 2a8 8 0 1 0 0 16a8 8 0 0 0 0-16 M10 6v5 M10 14v.1'
             : 'M2 8h4l4-4v12l-4-4H2z M13 6c4 2 4 6 0 8 M13 9c1 1 1 1 0 2');
     svg.append(path); return svg;
@@ -144,6 +148,17 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
     const heads = create('div', 'fv-ed-track-heads');
     const addAudio = create('button', 'fv-ed-add-audio', t('+ Audio track', '＋ 声音轨'));
     addAudio.type = 'button'; heads.append(addAudio);
+    // Narrow heads show only the track's icon; a press opens that track's switches beside it.
+    // Pointer down, not click: the track view captures the pointer, so the click lands on the view.
+    heads.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        const head = event.target.closest('.fv-ed-track-head'), controls = head?.querySelector('[class$=-track-controls]');
+        if (!controls || controls.contains(event.target) || (head.dataset.open !== 'true' && controls.getClientRects().length)) return;
+        const open = head.dataset.open !== 'true';
+        for (const other of heads.querySelectorAll('.fv-ed-track-head[data-open]')) delete other.dataset.open;
+        if (open) head.dataset.open = 'true';
+    });
+    const closeHeads = event => { if (!event.target.closest?.('.fv-ed-track-head[data-open]')) for (const head of heads.querySelectorAll('.fv-ed-track-head[data-open]')) delete head.dataset.open; };
     const scroll = create('div', 'fv-ed-track-scroll');
     const content = create('div', 'fv-ed-track-content');
     const ruler = create('div', 'fv-ed-ruler');
@@ -163,6 +178,7 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
     const tooltip = create('div', 'fv-ed-drag-label');
     tooltip.hidden = true; tooltip.setAttribute('role', 'status');
     const popover = create('div', 'fv-ed-clip-popover'); popover.hidden = true;
+    let failedPopoverId = null;
     const zoomBar = create('div', 'fv-ed-track-zoom fv-ed-zoom');
     const zoomOut = create('button', '', '−'), zoomIn = create('button', '', '+');
     zoomOut.type = zoomIn.type = 'button';
@@ -194,6 +210,15 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
     const pixels = frame => frameToPixels(frame, state.zoom);
     const frameAt = event => Math.max(0, pixelsToFrame(event.clientX - content.getBoundingClientRect().left, state.zoom));
     const trackAt = event => event.target.closest?.('[data-track]')?.dataset.track || 'v1';
+    // Pointer capture retargets events to the view; locate audio rows by geometry.
+    const pointerTrackAt = event => {
+        const y = event.clientY - content.getBoundingClientRect().top;
+        return [...rows].find(([, row]) => y >= row.top && y < row.top + row.height)?.[0];
+    };
+    const audioTargetAt = (source, event) => {
+        const track = pointerTrackAt(event);
+        return !source.hasVideo && source.hasAudio && ['a1', 'a2'].includes(track) ? track : undefined;
+    };
     const sourceInfo = key => typeof sources === 'function' ? sources(key) : sources.get?.(key) || sources[key];
     // The snapping switch lives in the transport model: it empties the point list (and Alt flips it per gesture).
     const snap = snapFrame;
@@ -211,6 +236,19 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
             if (!(error instanceof model.EditError)) throw error;
             actions.editError?.(error); return false;
         }
+    }
+    function extendClip(id, frames, {silent = false} = {}) {
+        if (disposed || actions.generationAvailable?.() === false) return false;
+        let next;
+        try { next = model.extendClip(state.record, id, frames, actions.generationLimits?.() || {}); }
+        catch (error) {
+            if (!(error instanceof model.EditError)) throw error;
+            if (!silent) actions.editError?.(error);
+            return false;
+        }
+        const ids = next.tracks[0].clips.filter(clip => clip.pending === 'draft' && !model.find(state.record, clip.id))
+            .flatMap(clip => model.pair(next, clip.id).map(member => member.id));
+        return attempt(t('Extend', '拉长'), () => next, ids.length ? {selectionAfter: {kind: 'clip', ids}} : undefined);
     }
     function position(node, start, frames) {
         node.style.left = `${pixels(start)}px`; node.style.width = `${Math.max(2, pixels(frames))}px`;
@@ -365,7 +403,7 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         // Defer the initial 90-second view until a detached shell is mounted.
         if (!mountedStates.has(state) && scroll.clientWidth) {
             mountedStates.add(state);
-            if (state.zoom === 12) state.setZoom(scroll.clientWidth / 90);
+            if (state.zoom === 12) state.setZoom(model.openingZoom(scroll.clientWidth, state.record));
         }
         const duration = Math.max(model.duration(state.record), state.selection?.kind === 'range' ? state.selection.start + state.selection.frames : 0);
         contentWidth = Math.max(scroll.clientWidth, pixels(duration + 30 * model.FPS));
@@ -411,6 +449,7 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         const status = create('span', 'fv-ed-clip-status');
         const left = create('span', 'fv-ed-trim-handle fv-ed-trim-start'); left.dataset.edge = 'start';
         const right = create('span', 'fv-ed-trim-handle fv-ed-trim-end'); right.dataset.edge = 'end';
+        if (!isText(clip)) right.dataset.fvGuide = 'editor-trim';
         node.append(media, fill, status, left, right);
         const item = {element: node, media, fill, status, clip, kind: track.kind, component: null, waveKey: undefined};
         if (blockProgress && !isText(clip)) {
@@ -424,11 +463,12 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         const value = progresses.get(item.clip.id) || {state: item.clip.pending === 'queued' ? 'waiting'
             : busy(item.clip) ? 'generating' : model.clipState(item.clip) === 'done' ? 'done'
                 : item.clip.pending === 'stopped' ? 'stopped' : model.clipState(item.clip) === 'failed' ? 'failed' : 'waiting',
-        fraction: 0, remainingSeconds: null};
+        fraction: 0, remainingSeconds: null, ...(item.clip.pending === 'queued' ? {queued: true} : {})};
         item.element.style.setProperty('--fv-ed-progress', String(clamp(Number(value.fraction) || 0, 0, 1)));
         item.component?.update(value);
     }
     function renderRecord() {
+        const openFailure = !popover.hidden && failedPopoverId;
         selectGestures.finish(null, true);
         cachedPlan = ''; popover.hidden = true;
         const record = state.record, retained = new Set(), tracks = displayTracks(record);
@@ -440,6 +480,7 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
             let row = rows.get(track.id);
             if (!row) {
                 const node = create('div', 'fv-ed-track-row'); node.dataset.track = track.id;
+                if (track.id === 'v1') node.dataset.fvGuide = 'editor-empty';
                 const empty = create('div', 'fv-ed-track-empty');
                 node.append(empty);
                 const head = create('div', 'fv-ed-track-head'); head.dataset.track = track.id;
@@ -477,18 +518,31 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
                 item.element.dataset.state = visual; item.element.dataset.track = track.id;
                 item.element.dataset.busy = String(busy(clip)); item.element.dataset.extend = String(clip.extend && actions.generationAvailable?.() !== false && !busy(clip));
                 // A part not generated yet is attached only to the part it continues; drawn on its own it stays a separate block.
-                const attached = (left, right) => !!left && !!right && left.start + left.frames === right.start
-                    && (right.pending === null || model.continuesBefore(state.record, right.id));
-                item.element.classList.toggle('fv-ed-joined-left', attached(track.clips[index - 1], clip));
+                // Touching blocks are one video only when the later one continues the earlier one, or both are consecutive stretches of one source;
+                // two separate shots that merely touch are drawn apart.
+                const touching = (left, right) => !!left && !!right && left.start + left.frames === right.start;
+                const sameStretch = (left, right) => !!left.source && sourceKey(left) === sourceKey(right) && left.in + left.frames === right.in;
+                const attached = (left, right) => touching(left, right) && (model.continuesBefore(state.record, right.id) || sameStretch(left, right));
+                const before = track.clips[index - 1];
+                item.element.classList.toggle('fv-ed-joined-left', attached(before, clip));
                 item.element.classList.toggle('fv-ed-joined-right', attached(clip, track.clips[index + 1]));
-                if (visual === 'failed' && track.kind === 'video') item.status.replaceChildren(icon('warning'));
+                // On the picture track a continuation carries a link; a separate shot is told apart by being drawn apart.
+                const seam = track.id !== 'v1' || !touching(before, clip) ? null : model.continuesBefore(state.record, clip.id) ? 'continued' : sameStretch(before, clip) ? null : 'separate';
+                let mark = item.element.querySelector(':scope > .fv-ed-seam-mark');
+                if (seam === 'continued' && pixels(clip.frames) >= 26) {
+                    if (!mark) { mark = create('span', 'fv-ed-seam-mark'); mark.setAttribute('aria-hidden', 'true'); mark.dataset.kind = seam; mark.append(icon('link')); item.element.append(mark); }
+                } else mark?.remove();
+                item.element.classList.toggle('fv-ed-seamed', !!item.element.querySelector(':scope > .fv-ed-seam-mark'));
+                const failureText = visual === 'failed' ? actions.failureText?.(clip.id) || actions.reasonText?.(clip.reason) || clip.reason || t('Generation failed', '生成时出错') : '';
+                if (visual === 'failed') item.status.replaceChildren(icon('warning'), create('span', 'fv-ed-clip-failure-reason', failureText));
                 else item.status.replaceChildren();
-                const status = {planned: t('Not generated yet', '还没生成'), running: t('Generating', '正在生成'),
-                    done: t('Complete', '完成'), failed: t('Unsuccessful', '没成功')}[visual];
+                const status = {planned: actions.interrupted?.(clip) ? t('Interrupted', '上次中断') : t('Not generated yet', '还没生成'), running: t('Generating', '正在生成'),
+                    done: t('Complete', '完成'), failed: failureText}[visual];
                 const seconds = Math.round(clip.frames / model.FPS);
                 item.element.title = '';
-                item.element.setAttribute('aria-label', t(`${name}, clip ${index + 1}, ${seconds} s, ${status}`,
-                    `${name}，第 ${index + 1} 段，${seconds} 秒，${status}`));
+                const seamText = seam === 'continued' ? t(', continues the clip before', '，接续上一段') : seam === 'separate' ? t(', separate shot', '，独立镜头') : '';
+                item.element.setAttribute('aria-label', t(`${name}, clip ${index + 1}, ${seconds} s, ${status}${seamText}`,
+                    `${name}，第 ${index + 1} 段，${seconds} 秒，${status}${seamText}`));
                 // Pending replacements can retain their old media; state styling
                 // overlays it until the model reports that the new media is done.
                 item.media.hidden = visual !== 'done';
@@ -507,10 +561,13 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         heads.append(addAudio);
         addAudio.style.top = `${top}px`; addAudio.disabled = tracks.find(track => track.id === 'a2')?.clips.some(busy) || false;
         addAudio.textContent = twoAudio ? t('− Audio track', '－ 声音轨') : t('+ Audio track', '＋ 声音轨');
+        addAudio.dataset.sign = addAudio.textContent.slice(0, 1); // Phone widths show the sign alone.
         addAudio.title = '';
         addAudio.setAttribute('aria-label', addAudio.textContent);
         content.style.height = `${top - 6}px`; playhead.style.height = `${top - 24}px`;
         layout();
+        const failure = openFailure && clips.get(openFailure);
+        if (failure && model.clipState(failure.clip) === 'failed' && state.selection?.ids?.includes(openFailure)) failedPopover(failure);
         if (gesture?.type === 'move' && pointerEvent) updatePointer(pointerEvent);
     }
     function showGuide(frame) { guide.hidden = frame == null; if (frame != null) guide.style.left = `${pixels(frame)}px`; }
@@ -541,21 +598,32 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         tooltip.hidden = true; plannedLines.hidden = false; cachedPlan = ''; clearTimeout(estimateTimer); estimateToken++;
         for (const id of [...(gesture?.ids || []), ...(gesture?.rightPreviewIds || [])]) {
             const item = locate(id);
-            if (item) { item.element.classList.remove('fv-ed-dragging'); position(item.element, item.clip.start, item.clip.frames); }
+            if (item) { item.element.classList.remove('fv-ed-dragging'); item.element.style.transform = ''; position(item.element, item.clip.start, item.clip.frames); }
         }
         delete element.dataset.cursor; selectionBox.classList.remove('fv-ed-dragging', 'fv-ed-cannot-drop');
         plannedLines.querySelectorAll('[data-limited]').forEach(line => line.removeAttribute('data-limited'));
         renderSelection();
     }
     function failedPopover(item) {
-        const reason = create('p', '', actions.reasonText?.(item.clip.reason) || t('Could not generate', '没能生成'));
+        failedPopoverId = item.clip.id;
+        const reason = create('p', '', actions.failureText?.(item.clip.id) || actions.reasonText?.(item.clip.reason) || item.clip.reason || t('Generation failed', '生成时出错'));
+        const report = create('button', 'fv-ed-clip-report', t('Download diagnostic report', '下载诊断报告')); report.type = 'button';
+        report.onclick = event => { event.stopPropagation(); popover.hidden = true;
+            Promise.resolve(actions.downloadFailure?.(item.clip.id)).catch(error => actions.editError?.(error)); };
         const retry = create('button', '', t('Retry', '重试')); retry.type = 'button';
         retry.onclick = () => { popover.hidden = true;
-            Promise.resolve().then(() => actions.retry?.(item.clip.id)).catch(error => actions.editError?.(error)); };
-        popover.replaceChildren(reason, retry); popover.hidden = false;
+            Promise.resolve().then(() => actions.retry?.(item.clip.id)).catch(error => actions.editError?.(error, 'generate')); };
+        popover.replaceChildren(reason, report, retry); popover.hidden = false;
         const bounds = element.getBoundingClientRect(), clipBounds = item.element.getBoundingClientRect();
-        popover.style.left = `${clamp(clipBounds.left - bounds.left, 8, Math.max(8, bounds.width - 248))}px`;
-        popover.style.top = `${Math.min(clipBounds.bottom - bounds.top + 4, bounds.height - 96)}px`;
+        // The card is as wide as the clip it belongs to (never narrower than before, so its two buttons stay on one row) and sits against the clip's lower edge;
+        // where that would cover the track below, it opens upward from the clip's top when there is room.
+        const width = Math.min(Math.max(clipBounds.width, 280), bounds.width - 16);
+        popover.style.width = `${width}px`;
+        popover.style.left = `${clamp(clipBounds.left - bounds.left, 8, Math.max(8, bounds.width - width - 8))}px`;
+        const height = popover.getBoundingClientRect().height, below = clipBounds.bottom - bounds.top + 4, above = clipBounds.top - bounds.top - 4 - height;
+        const next = [...element.querySelectorAll('.fv-ed-track-row')].map(row => row.getBoundingClientRect().top - bounds.top).filter(top => top >= clipBounds.bottom - bounds.top - 1);
+        const room = next.length ? Math.min(...next) : bounds.height;
+        popover.style.top = `${Math.max(8, below + height <= room || above < 8 ? Math.min(below, bounds.height - height - 8) : above)}px`;
     }
     function clickSelection(event) {
         if (event.range) return;
@@ -642,6 +710,9 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         for (const value of [frame, frame + length]) points.push(Math.round(value / grid) * grid);
         return transportSnapPoints(state, points, pointerEvent);
     }
+    // A clip's end can be dragged longer only over hidden source, by generating more, or as a planned part.
+    const canGrow = clip => (clip.pending && !clip.source) || isText(clip) || speedEdited(clip) || clip.in + clip.frames < clip.length
+        || (clip.extend && actions.generationAvailable?.() !== false);
     // Only a part that continues another is held to the length of a continued part; a range being drawn never is.
     function boundaryLimits(clip = null) {
         const limits = actions.generationLimits?.() || {}, maxSeconds = limits.maxSeconds ?? model.RULES.maxSeconds;
@@ -691,25 +762,35 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
                 gesture.selection = {...original, start: aligned.frame};
             } else {
                 aligned = snap(frame, dragPoints(frame), state.zoom);
-                const end = original.start + original.frames, at = Math.round(aligned.frame / model.FPS) * model.FPS;
-                const start = gesture.edge === 'start' ? Math.min(end - 2 * model.FPS, at) : original.start;
-                const stop = gesture.edge === 'end' ? Math.max(start + 2 * model.FPS, at) : end;
-                gesture.selection = capRange({kind: 'range', start, frames: stop - start, tracks: original.tracks}, gesture.edge === 'start');
+                // The edge held still stays exactly where it is; the dragged one follows the pointer by whole seconds.
+                const end = original.start + original.frames, fixed = gesture.edge === 'start' ? end : original.start;
+                const drawn = rangeParameters(fixed, gesture.edge === 'start' ? Math.min(aligned.frame, end - 2 * model.FPS) : Math.max(aligned.frame, fixed), original.tracks);
+                gesture.selection = capRange(drawn, gesture.edge === 'start');
             }
             previewSelection = gesture.selection; showGuide(aligned.guide); renderSelection();
             hint(gesture.selection, event, false, gesture.type === 'rangeMove');
             if (gesture.type === 'rangeMove' && gesture.rangeBlocked) tooltip.hidden = true;
         } else if (gesture.type === 'range') {
             const aligned = snap(frame, points, state.zoom);
-            gesture.selection = capRange(rangeParameters(gesture.anchor, aligned.frame), aligned.frame < gesture.anchor);
+            // Where it was pressed, drawn to a clip edge, marker or the playhead nearby.
+            gesture.from ??= snap(gesture.anchor, points, state.zoom).frame;
+            const drawn = rangeParameters(gesture.from, aligned.frame);
+            // Drawn from a clip's end, the range starts exactly there.
+            if (gesture.flush != null && aligned.frame > gesture.flush) Object.assign(drawn, {start: gesture.flush,
+                frames: Math.max(2 * model.FPS, Math.round((aligned.frame - gesture.flush) / model.FPS) * model.FPS)});
+            gesture.selection = capRange(drawn, aligned.frame < gesture.from);
             previewSelection = gesture.selection; showGuide(aligned.guide);
             renderSelection(); hint(gesture.selection, event);
         } else if (gesture.type === 'move') {
             plannedLines.hidden = true;
             const desired = gesture.clip.start + frame - gesture.anchor;
             const result = moveParameters(gesture.clip, gesture.anchor, frame, dragPoints(desired, gesture.clip.frames), state.zoom);
+            result.track = isText(gesture.clip) ? pointerHit(event).track : null;
+            const pointedTrack = pointerTrackAt(event);
+            result.targetTrack = gesture.ids.length === 1 && ['a1', 'a2'].includes(gesture.track)
+                && ['a1', 'a2'].includes(pointedTrack) ? pointedTrack : undefined;
             gesture.result = result;
-            const track = state.record.tracks.find(row => row.id === gesture.track);
+            const track = state.record.tracks.find(row => row.id === (result.targetTrack || gesture.track));
             const drop = isText(gesture.clip) ? {hit: false} : insertionPoint(track.clips, result.frame, gesture.ids);
             showInsertion(drop.hit ? drop.frame : null); showGuide(result.guide);
             for (const id of gesture.rightPreviewIds || []) {
@@ -717,7 +798,10 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
             }
             gesture.rightPreviewIds = [];
             let preview, error, shifted = 0;
-            try { preview = model.move(state.record, gesture.id, result.frame); }
+            try {
+                if (textDropLocked(state.record, gesture.members, result.track)) throw new model.EditError('locked');
+                preview = model.move(state.record, gesture.id, result.frame, {targetTrack: result.targetTrack});
+            }
             catch (caught) { if (!(caught instanceof model.EditError)) throw caught; error = caught; }
             if (preview) for (const row of preview.tracks) for (const clip of row.clips) {
                 const item = locate(clip.id);
@@ -728,15 +812,26 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
             }
             const landing = preview ? model.find(preview, gesture.id).start : result.frame;
             element.dataset.cursor = error ? 'not-allowed' : 'grabbing';
+            const previewTracks = new Map(result.targetTrack ? preview?.tracks.flatMap(row => row.clips.map(clip => [clip.id, row.id])) : []);
             for (const id of gesture.ids) {
                 const item = locate(id); item.element.classList.add('fv-ed-dragging'); position(item.element, landing, item.clip.frames);
+                const row = previewTracks.get(id) || item.track;
+                item.element.style.transform = row === item.track ? '' : `translateY(${rows.get(row).top - rows.get(item.track).top}px)`;
             }
-            box(selectionBox, {start: landing, frames: gesture.clip.frames, tracks: gesture.ids.map(id => locate(id).track)});
+            box(selectionBox, {start: landing, frames: gesture.clip.frames, tracks: gesture.ids.map(id => previewTracks.get(id) || locate(id).track)});
             hint({start: landing, frames: gesture.clip.frames}, event, false, true);
             selectionBox.classList.toggle('fv-ed-cannot-drop', !!error);
             if (error) tooltip.hidden = true;
         } else if (gesture.type === 'edge') {
-            let result = edgeParameters(gesture.clip, gesture.edge, frame, points, state.zoom, {canExtend: actions.generationAvailable?.() !== false});
+            // Past the end of a clip that cannot grow there, the drag draws the next part from that end.
+            const clipEnd = gesture.clip.start + gesture.clip.frames;
+            if (gesture.edge === 'end' && frame > clipEnd && !canGrow(gesture.clip)) {
+                for (const id of [...gesture.ids, ...(gesture.rightPreviewIds || [])]) { const item = locate(id); if (item) position(item.element, item.clip.start, item.clip.frames); }
+                Object.assign(gesture, {type: 'range', anchor: clipEnd, flush: clipEnd, id: undefined, ids: [], clip: null, edge: null, rightPreviewIds: []});
+                cachedPoints = allPoints([]); tooltip.hidden = true; updatePointer(event); return;
+            }
+            let result = edgeParameters(gesture.clip, gesture.edge, frame, points, state.zoom,
+                {canExtend: actions.generationAvailable?.() !== false, maxFollowSeconds: boundaryLimits().maxFollowSeconds});
             if (result.kind === 'extend') result.frames = capRange({start: result.frame, frames: result.frames}, false, true).frames;
             if (result.kind === 'planned') {
                 let preview;
@@ -770,10 +865,11 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
                     const room = model.rightEdgeRoom(state.record, gesture.id, Math.max(0, growth), {generating: result.kind === 'extend'});
                     if (!room.blocked) return;
                     blocked = true;
-                    result = edgeParameters(gesture.clip, 'end', room.limit, [], state.zoom);
+                    result = edgeParameters(gesture.clip, 'end', room.limit, [], state.zoom, {maxFollowSeconds: boundaryLimits().maxFollowSeconds});
                     if (result.kind === 'extend') {
                         result.frames = Math.floor((room.limit - result.frame) / model.FPS) * model.FPS;
-                        if (result.frames < model.RULES.minSeconds * model.FPS) result = {kind: 'trim', edge: 'end', frame: result.frame, guide: null};
+                        // Less room than a continued part needs: the edge only trims.
+                        if (result.frames < model.continuedSeconds(0, boundaryLimits().maxFollowSeconds) * model.FPS) result = {kind: 'trim', edge: 'end', frame: result.frame, guide: null};
                     }
                     preview = edit(result);
                 }
@@ -814,7 +910,9 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
                 + (result.kind === 'extend' ? result.frames : 0);
             if (gesture.edge === 'end' && (growth > 0 || blocked)) {
                 clearTimeout(estimateTimer); estimateToken++;
-                tooltip.textContent = blocked ? '' : t(`+${Math.round(growth / model.FPS)} s`, `＋${Math.round(growth / model.FPS)} 秒`);
+                // A length below the shortest continued part shows that rule; release sets it to that length.
+                tooltip.textContent = blocked ? '' : result.raised ? t(`At least ${result.frames / model.FPS} s`, `至少 ${result.frames / model.FPS} 秒`)
+                    : t(`+${Math.round(growth / model.FPS)} s`, `＋${Math.round(growth / model.FPS)} 秒`);
                 tooltip.hidden = !!blocked;
                 selectionBox.classList.toggle('fv-ed-cannot-drop', !!blocked);
             }
@@ -836,21 +934,16 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         if (['range', 'rangeMove', 'rangeEdge', 'rangeBoundary'].includes(finished.type)) { state.select(finished.selection, {history: true}); return; }
         const result = finished.result;
         if (!result) return;
-        if (finished.type === 'move') attempt(t('Move', '移动'), record => model.move(record, finished.id, result.frame));
+        if (finished.type === 'move') attempt(t('Move', '移动'), record => {
+            if (textDropLocked(record, finished.members, result.track)) throw new model.EditError('locked');
+            return model.move(record, finished.id, result.frame, {targetTrack: result.targetTrack});
+        });
         else if (finished.type === 'plannedBoundary') attempt(t('Resize parts', '调整段长'), record => model.resizePlannedBoundary(record, finished.id, finished.neighbor.clip.id, result.frame, actions.generationLimits?.()));
         else if (result.kind === 'planned') attempt(t('Resize', '改长短'), record => model.resizePlanned(record, finished.id, finished.edge, result.frame, actions.generationLimits?.()));
         else if (result.kind === 'extend') {
-            if (actions.generationAvailable?.() === false) return;
             const frames = result.frame - finished.clip.start - finished.clip.frames + result.frames;
-            let next = null;
-            try { next = model.extendClip(state.record, finished.id, frames, actions.generationLimits?.() || {}); }
-            catch (error) { if (!(error instanceof model.EditError)) throw error; actions.editError?.(error); }
-            if (next) {
-                // The new parts stay selected through undo and redo, so Generate stays usable.
-                const clip = model.find(next, finished.id), start = clip.start + clip.frames;
-                const ids = next.tracks[0].clips.filter(c => c.pending === 'draft' && c.start >= start && c.start < start + result.frames)
-                    .flatMap(c => model.pair(next, c.id).map(member => member.id));
-                attempt(t('Extend', '拉长'), () => next, ids.length ? {selectionAfter: {kind: 'clip', ids}} : undefined);
+            if (extendClip(finished.id, frames) && result.raised) {
+                actions.notify?.(t(`Extended to ${result.frames / model.FPS} s.`, `已补到 ${result.frames / model.FPS} 秒。`));
             }
         } else attempt(t('Trim', '裁短'), record => model.trim(record, finished.id, finished.edge, result.frame));
         renderSelection();
@@ -882,6 +975,8 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         if (!autoFrame) autoFrame = requestAnimationFrame(autoScroll);
     }
     function dismissPopup(event) {
+        const head = heads.querySelector('.fv-ed-track-head[data-open]');
+        if (head) { event.preventDefault(); event.stopPropagation(); delete head.dataset.open; return true; }
         if (popover.hidden) return false;
         event.preventDefault(); event.stopPropagation(); popover.hidden = true; return true;
     }
@@ -956,16 +1051,27 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         }
         return added;
     }
+    const droppingFiles = event => actions.importFiles && !Array.from(event.dataTransfer?.types || []).includes(SOURCE_TYPE)
+        && Array.from(event.dataTransfer?.types || []).includes('Files');
     function dropOver(event) {
+        if (droppingFiles(event)) {
+            // Files from the computer: only the place is known until they are imported.
+            event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy';
+            const frame = snap(frameAt(event), transportSnapPoints(state, allPoints([]), event), state.zoom);
+            const track = state.record.tracks.find(row => row.id === trackAt(event));
+            showInsertion(insertionPoint(track?.clips || [], frame.frame).frame); insertion.classList.remove('fv-ed-blocked-insertion');
+            showGuide(frame.guide); tooltip.hidden = true;
+            return;
+        }
         if (!Array.from(event.dataTransfer?.types || []).includes(SOURCE_TYPE)) return;
         event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy';
         const frame = snap(frameAt(event), transportSnapPoints(state, allPoints([]), event), state.zoom);
-        const key = `${frame.frame}/${state.zoom}/${draggedSource ? JSON.stringify(draggedSource) : trackAt(event)}`;
+        const key = `${frame.frame}/${state.zoom}/${pointerTrackAt(event)}/${draggedSource ? JSON.stringify(draggedSource) : ''}`;
         if (key !== dropPreviewKey || sourcePreview?.record !== state.record) {
             clearSourcePreview();
             dropPreviewKey = key;
             if (draggedSource) try {
-                const preview = model.insertSource(state.record, {...draggedSource, at: frame.frame});
+                const preview = model.insertSource(state.record, {...draggedSource, at: frame.frame, targetTrack: audioTargetAt(draggedSource, event)});
                 const added = previewSourcePlacement(preview), sound = added.find(item => item.track !== 'v1');
                 const name = sound ? preview.tracks.length === 3
                     ? t(`Audio ${sound.track === 'a1' ? 1 : 2}`, `声音 ${sound.track === 'a1' ? 1 : 2}`) : t('Audio', '声音') : '';
@@ -976,7 +1082,7 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
                 dropPoint = {frame: frame.frame, error, label: null};
             }
             else {
-                const track = state.record.tracks.find(row => row.id === trackAt(event));
+                const track = state.record.tracks.find(row => row.id === pointerTrackAt(event));
                 dropPoint = insertionPoint(track?.clips || [], frame.frame);
             }
         }
@@ -992,14 +1098,21 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
     }
     function dropSource(event) {
         clearSourcePreview();
+        if (droppingFiles(event) && event.dataTransfer.files?.length) {
+            event.preventDefault(); event.stopPropagation();
+            const at = snap(frameAt(event), transportSnapPoints(state, allPoints([]), event), state.zoom).frame;
+            actions.importFiles([...event.dataTransfer.files], {at});
+            showInsertion(null); showGuide(null); dropPoint = null; dropPreviewKey = '';
+            return;
+        }
         const payload = sourcePayload(event.dataTransfer?.getData(SOURCE_TYPE));
         if (!payload) { showInsertion(null); showGuide(null); return; }
         event.preventDefault(); event.stopPropagation();
-        // Use the pointer position; the model chooses the audio track and shifts
-        // following clips. The insertion line is an indication, not an edit.
+        // Audio-only library drops honor the pointed row through normal insertion rules.
         const at = snap(frameAt(event), transportSnapPoints(state, allPoints([]), event), state.zoom).frame;
-        if (actions.insertSource) Promise.resolve(actions.insertSource({...payload, at}, {loadMetadata: true})).catch(error => actions.editError?.(error));
-        else attempt(t('Insert source', '放入素材'), record => model.insertSource(record, {...payload, at}), {clearRange: true});
+        const targetTrack = audioTargetAt(payload, event);
+        if (actions.insertSource) Promise.resolve(actions.insertSource({...payload, at, targetTrack}, {loadMetadata: true})).catch(error => actions.editError?.(error));
+        else attempt(t('Insert clip', '放入素材'), record => model.insertSource(record, {...payload, at, targetTrack}), {clearRange: true});
         showInsertion(null); showGuide(null); dropPoint = null; dropPreviewKey = ''; draggedSource = null;
     }
     function zoom(value, anchor = scroll.clientWidth / 2) {
@@ -1064,6 +1177,7 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
         clearSourcePreview();
         draggedSource = sourcePayload(event.dataTransfer?.getData(SOURCE_TYPE)); dropPreviewKey = '';
     });
+    on(document, 'pointerdown', closeHeads, true);
     on(document, 'dragend', () => { clearSourcePreview(); draggedSource = null; dropPreviewKey = ''; showInsertion(null); showGuide(null); });
     on(scroll, 'dragleave', event => { if (!scroll.contains(event.relatedTarget)) { clearSourcePreview(); dropPreviewKey = ''; showInsertion(null); showGuide(null); } });
     on(zoomOut, 'click', () => zoom(state.zoom / 1.25)); on(zoomIn, 'click', () => zoom(state.zoom * 1.25));
@@ -1097,7 +1211,29 @@ export function createTracks(host, {state, sources = {}, t = en => en, actions =
             showInsertion(null); insertion.classList.remove('fv-ed-blocked-insertion');
         }, 700);
     }
-    return {element, keyboard, menu, dismissPopup, flashBlocked, seekPlayhead,
+    function guideTarget(kind) {
+        const viewport = scroll.getBoundingClientRect();
+        const reveal = (left, width) => () => {
+            if (left < viewport.left + 12 || left + width > viewport.right - 12)
+                scroll.scrollLeft = Math.max(0, scroll.scrollLeft + left - viewport.left - 12);
+        };
+        if (kind === 'trim') {
+            const item = [...clips.values()].filter(item => item.clip.source && !isText(item.clip))
+                .sort((a, b) => (b.track === 'v1') - (a.track === 'v1') || b.clip.start - a.clip.start)[0];
+            if (!item) return null;
+            const node = item.element.querySelector('.fv-ed-trim-end');
+            const r = item.element.getBoundingClientRect(), left = r.right - 12;
+            return {node, rect: {left, right: left + 24, top: r.top, bottom: r.bottom, width: 24, height: r.height}, reveal: reveal(left, 24)};
+        }
+        const node = rows.get('v1')?.element;
+        if (!node) return null;
+        // Leave a small gap beyond all tracks, outside the trim hit area. At
+        // frame zero an empty project starts exactly at the timeline origin.
+        const end = model.duration(state.record), start = end ? Math.ceil(end / model.FPS + 12 / state.zoom) * model.FPS : 0;
+        const r = node.getBoundingClientRect(), left = content.getBoundingClientRect().left + pixels(start), width = 3 * state.zoom;
+        return {node, rect: {left, right: left + width, top: r.top, bottom: r.bottom, width, height: r.height}, reveal: reveal(left, width)};
+    }
+    return {element, keyboard, menu, dismissPopup, flashBlocked, seekPlayhead, extendClip, guideTarget,
         setSnapping(enabled) {
             if (typeof enabled !== 'boolean') return {ok: false, reason: 'snapping'};
             setTransportSnapping(state, enabled); cachedPoints = allPoints(gesture?.ids || []);

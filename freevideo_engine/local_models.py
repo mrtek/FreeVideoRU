@@ -16,7 +16,7 @@ MAX_ROOTS = 64
 MAX_LISTED = 4096  # Paths accepted before duplicates and nested folders are merged.
 
 
-def library_roots(values, *, keep_first=False):
+def library_roots(values, *, keep_first=False, skip_missing=False):
     """Normalize selected libraries without walking entire drives.
 
     The 64-library limit counts distinct folders: a folder named twice, or one
@@ -27,10 +27,14 @@ def library_roots(values, *, keep_first=False):
         raise ValueError('Invalid model library list')
     roots = []
     for value in values:
-        if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+        if not isinstance(value, str) or not value.strip() or len(value) > 4096 or '\0' in value:
             raise ValueError('Invalid model library path')
         path = resolved(Path(value).expanduser())
-        if not path.is_dir() or path == Path(path.anchor):
+        if path == Path(path.anchor):
+            raise ValueError('Choose an existing model folder, not an entire drive: ' + plain(path))
+        if not path.is_dir():
+            if skip_missing:
+                continue
             raise ValueError('Choose an existing model folder, not an entire drive: ' + plain(path))
         if path not in roots:
             roots.append(path)
@@ -42,6 +46,35 @@ def library_roots(values, *, keep_first=False):
             raise ValueError('Select at most 64 model libraries')
         roots = roots[:MAX_ROOTS]
     return [plain(path) for path in roots]
+
+
+def directory_choices(values):
+    """Validate preferences without requiring a mounted/existing library.
+
+    Keep the user's spelling; resolution is only for drive-root safety and
+    discovery. Missing directories must survive saving and reopening.
+    """
+    if not isinstance(values, list) or len(values) > MAX_LISTED:
+        raise ValueError('Invalid model library list')
+    choices = []
+    for value in values:
+        if not isinstance(value, str) or len(value) > 4096 or '\0' in value:
+            raise ValueError('Invalid model library path')
+        value = value.strip()
+        if not value:
+            continue
+        path = resolved(Path(value).expanduser())
+        if path == Path(path.anchor):
+            raise ValueError('Choose a model folder, not an entire drive: ' + plain(path))
+        if value not in choices:
+            choices.append(value)
+    # Count canonical distinct/nested paths just as library_roots does, even
+    # when a drive is currently disconnected.
+    roots = list(dict.fromkeys(resolved(Path(p).expanduser()) for p in choices))
+    roots = [p for p in roots if not any(parent in roots for parent in p.parents)]
+    if len(roots) > MAX_ROOTS:
+        raise ValueError('Select at most 64 model libraries')
+    return choices
 
 
 def scan_many(directories, rows, *, prior=None, callback=None):

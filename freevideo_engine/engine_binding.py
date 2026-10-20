@@ -9,6 +9,7 @@ import sys
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
+from . import subprocess_output
 from .monitoring import save
 from .long_paths import io_path, resolved, plain, plain_text, plain_errors
 from .runtime_alias import checked_real_path
@@ -110,7 +111,7 @@ def _bind(uv, python, source, run):
     command = [str(uv), 'pip', 'install', '--python', str(python), '--no-deps', '--no-build-isolation',
                '--reinstall-package', 'freevideo-engine', '-e', str(source)]
     try:
-        result = run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
+        result = subprocess_output.run_external(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=180, runner=run)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError('Editable install failed for %s: %s\n%s' % (python, error, _tail(error))) from error
     if result.returncode:
@@ -118,9 +119,9 @@ def _bind(uv, python, source, run):
                            (python, result.returncode, _tail(result)))
     uv_tail = _tail(result)
     try:
-        result = run([str(python), '-I', '-B', '-c',
+        result = subprocess_output.run_python([str(python), '-I', '-B', '-c',
                       'import freevideo_engine,sys;print(freevideo_engine.__file__)'],
-                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                     stdin=subprocess.DEVNULL, capture_output=True, timeout=30, runner=run)
         lines = (result.stdout or '').strip().splitlines()
         imported = Path(lines[-1]) if lines else None
         if (result.returncode or imported is None or not imported.is_absolute()

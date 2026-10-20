@@ -89,6 +89,9 @@ def _canonical_config(config, purpose):
     # The ordinary task's schedule has the same historical computation identity.
     if resolved_engine.get('adaln_task') in (None, engine.get('task', 't2va')):
         resolved_engine.pop('adaln_task', None)
+    # Runs without a step cache keep their historical identity; a cache changes the arithmetic.
+    if resolved_engine.get('step_cache') is None:
+        resolved_engine.pop('step_cache', None)
     if resolved_decoder.get('continuation') is None:
         resolved_decoder.pop('continuation', None)
     normalized_engine = _computation(resolved_engine)

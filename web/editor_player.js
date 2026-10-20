@@ -6,7 +6,8 @@ import {sourceKey, mediaURL} from './editor_store.js';
 import {clipPictureSize, createPictureGuide} from './editor_frame.js';
 import {createPlaybackClock} from './editor_transport_model.js';
 import {createAudioPreview} from './editor_audio.js';
-import {previewSpeed, speedSeek, speedAudioFrame, separateSpeedAudio} from './editor_speed.js';
+import {previewSpeed, speedAudioFrame, separateSpeedAudio} from './editor_speed.js';
+import {sourceFrame, percent} from './editor_speed_model.js';
 const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
 export function audioSeconds(clip, sourceFrame) {
     // The chain receipt counts samples at 32 kHz, even if the media is 48 kHz.
@@ -49,7 +50,7 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
     let active = 0, clipId = null, playing = false, disposed = false, raf = null, clockStart = 0, frameStart = 0, ticking = false, preview = null, previewSize = null, previewProject = null;
     let audioContext = null, textRenderer = null, chains = [], chainSignature = null, chainRequest = null, chainEpoch = 0;
     const failedChains = new Set(), entries = new Map();
-    let seekGeneration = 0;
+    let seekGeneration = 0, forcePosition = false, pictureView = null, processedSound = false;
     const chainSeconds = (chain, position) => Math.max(0, (position - chain.start) / 24 + (chain.offset || 0));
     const playback = createPlaybackClock();
     const gains = new WeakMap(), volumePreview = new Map();
@@ -66,21 +67,55 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
         }
         media.volume = Math.min(1, Math.max(0, value));
     }
-    function seekMedia(media, url, seconds, running, gain = 1) {
+    function startMedia(media) {
+        if (disposed || !media._editorRunning || !media.paused || media.seeking || media.readyState < 3 || media._editorPlay || media._editorPlayFailed) return;
+        const attempt = {url: media.dataset.source}; media._editorPlay = attempt;
+        const current = () => !disposed && media._editorRunning && media._editorPlay === attempt && media.dataset.source === attempt.url;
+        // A rejected play() is usually an interruption (a seek or load in flight), so the clip
+        // holds off for a moment and then tries again; only a source change or stop resets it sooner.
+        const rejected = () => {
+            if (!current()) return;
+            media._editorPlay = null; media._editorPlayFailed = true;
+            setTimeout(() => {
+                if (disposed || media.dataset.source !== attempt.url) return;
+                media._editorPlayFailed = false; startMedia(media);
+            }, 120);
+        };
+        try {
+            Promise.resolve(media.play()).then(() => {
+                if (!current()) { if (disposed || !media._editorRunning) media.pause(); return; }
+                media._editorPlay = null;
+            }, rejected);
+        } catch { rejected(); }
+    }
+    function seekMedia(media, url, seconds, running, gain = 1, force = forcePosition) {
         media.playbackRate *= Math.max(1, playback.rate); if (media.tagName === 'AUDIO') media.muted ||= playback.rate < 0;
         running = running && playback.rate > 0;
         const changed = media.dataset.source !== url;
-        if (changed) { media.pause(); media.dataset.source = url; media.src = url; media.load(); }
+        if (changed) { stopMedia(media); media.dataset.source = url; media.src = url; media._editorPlayFailed = false; media.load(); }
+        if (running && !media._editorRunning) media._editorPlayFailed = false;
         media._editorTime = Math.max(0, seconds); media._editorRunning = running;
         volume(media, gain);
-        if (media.readyState >= 1 && (speedSeek(media) || changed || !running || Math.abs(media.currentTime - seconds) > .08)) {
-            try { media.currentTime = Math.max(0, seconds); } catch {}
+        const drift = Math.abs(media.currentTime - media._editorTime);
+        // Forward speed uses the native media clock. Exact paused/reverse frames
+        // and explicit seeks still position precisely; ticks never cancel a seek.
+        if (media.readyState >= 1 && (force || !media.seeking) && drift > (changed || force || !running ? .000001 : .08)) {
+            try { media.currentTime = media._editorTime; } catch {}
         }
-        if (running) { if (media.paused) media.play().catch(() => {}); } else media.pause();
+        if (running) startMedia(media); else stopMedia(media);
     }
-    function stopMedia(media) { media.pause(); media._editorRunning = false; delete media.dataset.audioChain; }
+    function stopMedia(media) { if (!media.paused || media._editorPlay) media.pause(); media._editorPlay = null; media._editorRunning = false; delete media.dataset.audioChain; }
     function metadataHandler(media) {
-        media.onloadedmetadata = () => { if (disposed) return; try { media.currentTime = media._editorTime || 0; } catch {} if (media._editorRunning) media.play().catch(() => {}); };
+        media.onloadedmetadata = () => {
+            if (disposed) return;
+            if (!media.seeking && Math.abs(media.currentTime - (media._editorTime || 0)) > .000001) {
+                try { media.currentTime = media._editorTime || 0; } catch {}
+            }
+            startMedia(media);
+        };
+        const ready = () => { startMedia(media); if (media === videos[active]) showPicture(); };
+        media.addEventListener('seeked', ready);
+        media.addEventListener('canplay', ready);
     }
     [...videos, ...audio].forEach(metadataHandler);
     function failChain(media) {
@@ -218,6 +253,16 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
         }
         return result;
     }
+    function showPicture() {
+        if (disposed || !pictureView) return;
+        const {guide, picture} = pictureView, video = picture.video;
+        pictureGuide.update(guide);
+        // Keep the outgoing decoded picture while an incoming part is loading
+        // or seeking. Its slot is recycled only after the new picture is shown.
+        if (picture.clip && picture.playing && !picture.preview && (video.seeking || video.readyState < 3)) return;
+        videos.forEach(value => value.classList.toggle('fv-ed-visible', !!picture.clip && value === video));
+        picturePreview.update(picture);
+    }
     function render() {
         if (disposed) return;
         refreshChains();
@@ -239,17 +284,18 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
         const source = clip?.source && sources.get(sourceKey(clip.source));
         const hasPicture = !!source?.video && !source.missing;
         const fallbackSize = record.size_mode === 'fixed' || record.tracks[0].clips.some(c => c.source) ? record : {width: 1344, height: 768};
-        pictureGuide.update({size: previewSize || (hasPicture && clipPictureSize(clip, sources)) || fallbackSize, record, clip,
-            preview: !!preview, playing});
+        const guide = {size: previewSize || (hasPicture && clipPictureSize(clip, sources)) || fallbackSize, record, clip,
+            preview: !!preview, playing};
         if (!hasPicture) {
             clipId = null; videos.forEach(video => { video.classList.remove('fv-ed-visible'); stopMedia(video); });
         } else if (clipId !== clip.id) {
             const url = mediaURL(api, source.video);
-            if (videos[1 - active].dataset.source === url) active = 1 - active;
+            if (clipId !== null || videos[1 - active].dataset.source === url) active = 1 - active;
             clipId = clip.id;
         }
         const linked = hasPicture ? [...map.values()].find(row => row.clip.id === clip.link) : null;
         const processedAudio = audioPreview.render({record, position, playing: playing && playback.rate > 0, playbackRate: playback.rate});
+        processedSound = !!processedAudio;
         // The joined sound is the plain forward path only: sound edits, changed speed and
         // backward playback keep their own routes and the original sound.
         const plainSpeed = id => !separateSpeedAudio(model.find(record, id));
@@ -261,10 +307,13 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
         const separate = originalSeparate || linkedChain;
         if (hasPicture) {
             const video = videos[active], speedPlayback = previewSpeed(video, clip, playing, linked?.clip); video.muted = !linked || separate || playback.rate < 0 || speedPlayback.muted;
+            video._timelineClip = clip;
+            delete video.dataset.preparedClip;
             seekMedia(video, mediaURL(api, source.video), (videoRow.frame + (playing && playback.rate > 0 ? 0 : .5)) / 24, speedPlayback.running && map.get('v1')?.clip.id === clip.id, clipVolume(linked?.clip));
-            videos.forEach((value, index) => { value.classList.toggle('fv-ed-visible', index === active); if (index !== active) stopMedia(value); });
+            videos.forEach((value, index) => { if (index !== active) stopMedia(value); });
         }
-        picturePreview.update({clip: hasPicture ? clip : null, size: hasPicture && clipPictureSize(clip, sources), video: videos[active], preview: !!preview, playing});
+        pictureView = {guide, picture: {clip: hasPicture ? clip : null, size: hasPicture && clipPictureSize(clip, sources), video: videos[active], preview: !!preview, playing}};
+        showPicture();
         let slot = 0;
         const usedChains = new Set();
         for (const [track, row] of map) {
@@ -283,6 +332,7 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
             if (carriedByVideo || slot >= audio.length) continue;
             const url = mediaURL(api, metadata.audio); if (!url) continue;
             const media = audio[slot++], speed = previewSpeed(media, row.clip, playing); delete media.dataset.audioChain; media.muted = speed.muted;
+            media._timelineClip = row.clip;
             seekMedia(media, url, audioSeconds(row.clip, speedAudioFrame(row.clip, shown - row.clip.start)), speed.running, clipVolume(row.clip));
         }
         while (slot < audio.length) stopMedia(audio[slot++]);
@@ -295,19 +345,61 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
         }
         const next = record.tracks[0].clips.find(value => value.start >= (clip ? clip.start + clip.frames : position) && value.source);
         const metadata = next && sources.get(sourceKey(next.source));
-        if (metadata?.video && !metadata.missing) {
+        if (metadata?.video && !metadata.missing && (!hasPicture || videos[active].matches('.fv-ed-visible'))) {
             const idle = videos[1 - active]; idle.muted = true;
-            if (idle.dataset.source !== mediaURL(api, metadata.video)) seekMedia(idle, mediaURL(api, metadata.video), next.in / 24, false);
+            const url = mediaURL(api, metadata.video), seconds = sourceFrame(next, 0) / 24;
+            const prepared = JSON.stringify([next.id, url, seconds]);
+            if (idle.dataset.preparedClip !== prepared) {
+                seekMedia(idle, url, seconds, false, 1, true); idle.dataset.preparedClip = prepared;
+            }
         }
         textRenderer?.();
+        forcePosition = false;
+    }
+    function mediaFrame() {
+        // Edited sound and reverse playback retain their existing clocks. For
+        // native forward playback, wall time must not outrun emitted media and
+        // force repeated seeks or a false joined-sound drift failure.
+        if (playback.rate !== 1 || processedSound) return null;
+        const usable = media => media._editorRunning && !media.error && !media._editorPlayFailed && typeof media.duration === 'number';
+        const ready = media => media.readyState >= 3 && !media.seeking && (!media.paused || media.ended);
+        for (const media of chainAudio.values()) if (usable(media) && ['starting', 'active'].includes(media._attempt?.mode)
+            && entries.get(media._chain.track) === media._attempt && ready(media))
+            return media.ended ? media._chain.start + media._chain.frames
+                : media._chain.start + (media.currentTime - (media._chain.offset || 0)) * 24;
+        const original = [...audio.filter(media => !media.muted), videos[active]];
+        for (const media of original) {
+            const clip = media._timelineClip;
+            if (!usable(media) || !clip || clip.reverse) continue;
+            // A shortened proxy or stale duration receipt must not pin the
+            // transport forever beyond the media's physical end.
+            if (media._editorTime >= media.duration && media.currentTime < media._editorTime - .001) return null;
+            if (!ready(media)) continue;
+            const start = media.tagName === 'AUDIO' ? audioSeconds(clip, clip.in) : clip.in / 24;
+            if (start < 0) continue;
+            const position = clip.start + ((media.currentTime - start) * 24 - (clip.speed_phase || 0) / 100) / (percent(clip) / 100);
+            return media.ended && position < clip.start + clip.frames - .01 ? null : position;
+        }
+        // A native decoder buffering at a new entry keeps its requested frame.
+        // Failed or missing media continues through the ordinary fallback.
+        return original.some(usable) ? state.playhead : null;
     }
     function tick(now) {
         if (!playing || disposed) return;
+        const emitted = mediaFrame();
+        if (emitted !== null && Number.isFinite(emitted)) {
+            clockStart = now; frameStart = Math.max(state.playhead, Math.floor(emitted + .0001)); playback.reset(clockStart, frameStart);
+        }
         const total = model.exportFrames(state.record), {frame: position, stop} = playback.advance(now, total);
         const target = stop && playback.rate > 0 && !playback.range ? Math.max(0, total - 1) : position;
-        // A loop that starts over is a jump like a user's: the joined sound starts again from there.
         // A loop that starts over is a jump like a user's: the joined sound and the clock start again from there.
-        ticking = (target - state.playhead) * playback.rate >= 0; state.seek(target); ticking = false; render();
+        const previous = state.playhead, start = Math.min(total, playback.range?.start ?? 0), end = Math.min(total, playback.range?.end ?? total);
+        const raw = frameStart + Math.floor(Math.max(0, now - clockStart) * 24 / 1000) * playback.rate;
+        const wrapped = playback.loop && end > start && (playback.rate > 0 ? raw >= end : raw < start);
+        ticking = !wrapped && (target - previous) * playback.rate >= 0; state.seek(target); ticking = false;
+        if (wrapped && target === previous) {
+            resetEntries(); forcePosition = true; render(); clockStart = performance.now(); frameStart = target; playback.reset(clockStart, frameStart);
+        }
         if (stop) { pause(); return; }
         raf = requestAnimationFrame(tick);
     }
@@ -319,20 +411,23 @@ export function createEditorPlayer(host, transport, {state, sources, api, t, err
         clearPreview();
         const total = model.exportFrames(state.record), restart = !playback.range && !playback.loop && playback.rate > 0 && state.playhead >= Math.max(0, total - 1);
         state.seek(playback.begin(restart ? 0 : state.playhead, total));
-        resetEntries(); playing = true; clockStart = performance.now(); frameStart = state.playhead; render(); raf = requestAnimationFrame(tick);
+        resetEntries(); playing = true; frameStart = state.playhead; render();
+        // Preview preparation can include a decode and layout. Start the clock
+        // after that work so its cost is not charged as already-played frames.
+        clockStart = performance.now(); raf = requestAnimationFrame(tick);
         playback.reset(clockStart, frameStart);
     }
-    function pause() { playing = false; playback.rate = 1; resetEntries(); cancelAnimationFrame(raf); allMedia().forEach(stopMedia); render(); }
+    function pause() { playing = false; playback.rate = 1; resetEntries(); forcePosition = true; cancelAnimationFrame(raf); allMedia().forEach(stopMedia); render(); }
     playButton.onclick = () => playing ? pause() : play();
     const unsubscribe = state.subscribe(event => {
         if (event.type === 'selection') { if (pictureEdit.panelOpen && pictureEdit.selected()) clearPreview(); render(); return; }
         if (event.type !== 'playhead' && event.type !== 'record') return;
         if (preview && preservePreview()) previewProject = pictureLayout(state.record);
         else if (event.type === 'playhead' || previewProject !== pictureLayout(state.record)) clearPreview();
-        if (!ticking) resetEntries();
-        if (playing && !ticking) { clockStart = performance.now(); frameStart = state.playhead; }
-        if (playing && !ticking) playback.reset(clockStart, frameStart);
+        if (!ticking) { resetEntries(); forcePosition = true; }
+        if (playing && !ticking) frameStart = state.playhead;
         render();
+        if (playing && !ticking) { clockStart = performance.now(); playback.reset(clockStart, frameStart); }
     });
     const stopPictureEdit = pictureEdit.subscribe(() => {
         // Draft geometry updates in picturePreview; only a changed preview part

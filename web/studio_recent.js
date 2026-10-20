@@ -90,10 +90,12 @@ export function createRecentVideos(t, {body, onSelect}) {
     };
     window.addEventListener('freevideo-result', completed);
     window.addEventListener('freevideo-library-deleted', deleted);
+    window.addEventListener('freevideo-library-restored', refresh);
     return {element, toggle, refresh, setSelected, dispose() {
         disposed = true; request?.abort(); thumbnails.disconnect();
         clearTimeout(resizeTimer); body.classList.remove('fv-recent-resizing');
         window.removeEventListener('freevideo-result', completed);
         window.removeEventListener('freevideo-library-deleted', deleted);
+        window.removeEventListener('freevideo-library-restored', refresh);
     }};
 }

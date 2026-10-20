@@ -16,11 +16,21 @@ ACTIVE = ('queued', 'running', 'cancelling')
 CHAIN_STATES = (*ACTIVE, 'cancelled', 'failed', 'interrupted', 'done')
 BLOCK_STATES = ('pending', 'queued', 'running', 'done', 'cancelled', 'failed', 'interrupted')
 OUTPUT_STATES = ('none', 'pending', 'joining', 'done', 'failed')
+# pending: split before the first part; given: the request gave one text per part; none: nothing to split.
+SPLIT_STATES = ('pending', 'running', 'done', 'failed', 'given', 'none')
+SPLIT_REASONS = {
+    'model_missing': 'The prompt model is not installed, so every part used the whole description.',
+    'busy': 'The prompt model was busy, so every part used the whole description.',
+    'memory': 'There was not enough memory to split the description, so every part used the whole description.',
+    'unusable': 'The description could not be split into parts, so every part used the whole description.',
+    'unavailable': 'Splitting is not available here, so every part used the whole description.',
+    'failed': 'Splitting the description failed, so every part used the whole description.',
+}
 # Parts one video may be continued through: the first part and four continuations.
 MAX_PARTS = 5
 
 
-def reference(value):
+def reference(value, queue=False):
     if value is None or isinstance(value, str) and value:
         return value
     if isinstance(value, dict) and set(value) == {'work'}:
@@ -31,6 +41,12 @@ def reference(value):
                     and '..' not in posix.parts and '..' not in windows.parts
                     and posix.suffix.lower() == '.mp4'):
                 return deepcopy(value)
+    if queue and isinstance(value, dict) and set(value) == {'chain', 'block'}:
+        if (isinstance(value['chain'], str) and re.fullmatch(r'c-[0-9a-f]{12}', value['chain'])
+                and isinstance(value['block'], str) and value['block']):
+            return deepcopy(value)
+    if queue:
+        raise ValueError('References must be block IDs, relative MP4 work paths, or queued chain outputs')
     raise ValueError('References must be block IDs or relative MP4 work paths without ..')
 
 
@@ -63,7 +79,10 @@ def validate(payload):
         raise ValueError('Invalid extra data or client ID')
     if ('blocks' in payload) == ('seconds' in payload):
         raise ValueError('Specify blocks or seconds, not both')
-    planned = None
+    queue = payload.get('queue', False)
+    if type(queue) is not bool:
+        raise ValueError('Queue must be a bool')
+    planned = split = None
     join = payload.get('join', 'seconds' in payload)
     if type(join) is not bool:
         raise ValueError('Join must be a bool')
@@ -81,9 +100,19 @@ def validate(payload):
             raise ValueError('Text must be a string')
         if type(seed) is not int or seed < 0:
             raise ValueError('A nonnegative integer seed is required')
+        # Each part plays its own share of the description; one text for all parts replays the story
+        # from the start in every part. Without texts the runner splits it before the first part.
+        texts = payload.get('texts')
+        if texts is not None and (not isinstance(texts, list) or len(texts) != len(planned['blocks'])
+                                  or any(not isinstance(row, str) or not row.strip() for row in texts)):
+            raise ValueError('Texts must give one description for each planned part')
         rows = [dict(id='b%s' % (index + 1), after='b%s' % index if index else source,
-                     frames=row['frames'], text=text, seed=seed + index)
+                     frames=row['frames'], text=texts[index] if texts else text, seed=seed + index)
                 for index, row in enumerate(planned['blocks'])]
+        if len(rows) > 1:
+            split = dict(state='given' if texts else 'pending' if text.strip() else 'none', reason=None)
+    elif 'texts' in payload:
+        raise ValueError('Texts are given with seconds; blocks carry their own text')
     else:
         rows = payload['blocks']
     if not isinstance(rows, list) or not 1 <= len(rows) <= chain_plan.MAX_BLOCKS:
@@ -98,7 +127,7 @@ def validate(payload):
         part = row.get('part', identity)
         if not isinstance(part, str):
             raise ValueError('Block part must be a string')
-        after, before = reference(row.get('after')), reference(row.get('before'))
+        after, before = reference(row.get('after'), queue), reference(row.get('before'), queue)
         text, frames = row.get('text'), row.get('frames')
         if not isinstance(text, str) or len(text) > 20000:
             raise ValueError('Block text must be a string of at most 20000 characters')
@@ -143,7 +172,9 @@ def validate(payload):
                   updated=now, state='queued', client_id=client,
                   snapshot=dict(prompt=deepcopy(prompt), extra_data=deepcopy(extra)), blocks=blocks,
                   plan=planned, join=join, output=None, output_state='pending' if join else 'none',
-                  output_error=None, output_blocks=0)
+                  output_error=None, output_blocks=0, split=split)
+    if queue:
+        record['queue'] = True
     try:
         json.dumps(record, allow_nan=False)
     except (ValueError, TypeError, OverflowError) as error:
@@ -166,7 +197,8 @@ def summary(record):
     return dict({key: deepcopy(record[key]) for key in
                  ('version', 'id', 'node', 'created', 'updated', 'state',
                   'join', 'output', 'output_state', 'output_error', 'output_blocks')},
-                output_seams=deepcopy(record.get('output_seams')),
+                output_seams=deepcopy(record.get('output_seams')), split=deepcopy(record.get('split')),
+                redo_of=deepcopy(record.get('redo_of')),
                 count=len(blocks), done=sum(row['state'] == 'done' for row in blocks),
                 current=current, elapsed_seconds=sum(row['seconds'] or 0 for row in blocks if row['state'] == 'done'),
                 last_report_id=record.get('last_report_id') or next((row['report_id'] for row in reversed(blocks)
@@ -174,7 +206,14 @@ def summary(record):
 
 
 def detail(record):
-    return dict(summary(record), blocks=deepcopy(record['blocks']), plan=deepcopy(record['plan']))
+    value = dict(summary(record), blocks=deepcopy(record['blocks']), plan=deepcopy(record['plan']),
+                 generation_size={key: record['snapshot']['prompt'][record['node']]['inputs'].get(key)
+                                  for key in ('width', 'height')})
+    if (record.get('split') or {}).get('state') == 'done':
+        # Split parts repeat words put there by code; the page lists and edits only each part's own.
+        from .prompt_vlm.rules import own_words
+        value['part_words'] = own_words([str(row['inputs'].get('text', '')) for row in record['blocks']])
+    return value
 
 
 def save(directory, record):
@@ -224,10 +263,23 @@ def load_all(directory, limit=200, *, identity=None):
             if (type(record['output_blocks']) is not int or not 0 <= record['output_blocks'] <= len(record['blocks'])
                     or record['output'] is None and record['output_blocks'] != 0):
                 raise ValueError('Invalid chain output block count')
+            split = record.setdefault('split', None)
+            if split is not None and (not isinstance(split, dict) or set(split) != {'state', 'reason'}
+                                      or split['state'] not in SPLIT_STATES
+                                      or split['reason'] is not None and split['reason'] not in SPLIT_REASONS):
+                raise ValueError('Invalid chain split')
+            if split is not None and split['state'] == 'running':
+                split['state'] = 'pending'  # Stopped while splitting: split again when resumed.
             seams = record.get('output_seams')
             if seams is not None and (not isinstance(seams, dict) or set(seams) != {'expected', 'kept'}
                                       or any(type(value) is not int or value < 0 for value in seams.values())):
                 raise ValueError('Invalid chain seam count')
+            redo = record.get('redo_of')
+            if redo is not None and (not isinstance(redo, dict) or set(redo) != {'chain', 'block'}
+                                     or not isinstance(redo['chain'], str)
+                                     or not re.fullmatch(r'c-[0-9a-f]{12}', redo['chain'])
+                                     or not isinstance(redo['block'], str) or not redo['block']):
+                raise ValueError('Invalid chain redo source')
             if record.get('join_final_state', 'done') not in ('done', 'cancelled', 'failed', 'interrupted'):
                 raise ValueError('Invalid chain join final state')
             if record['plan'] is not None:
@@ -250,7 +302,7 @@ def load_all(directory, limit=200, *, identity=None):
                                continuation=None, skip_frames=0, skip_audio_samples=0)
             snapshot = record['snapshot']
             normalized = validate(dict(node=record['node'], client_id=record['client_id'], **snapshot,
-                blocks=[{key: row[key] for key in ('id', 'part', 'after', 'before', 'fill', 'context')}
+                queue=record.get('queue', False), blocks=[{key: row[key] for key in ('id', 'part', 'after', 'before', 'fill', 'context')}
                         | row['inputs']
                         for row in record['blocks']], join=record['join']))
             if record['state'] not in CHAIN_STATES:

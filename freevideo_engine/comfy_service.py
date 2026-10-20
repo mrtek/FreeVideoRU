@@ -293,7 +293,10 @@ def start_proxy(record, *, listen, port, upstream, token_file, tls, hop_secret=N
         env[ENV] = hop_secret
     for name in ('PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV'):
         env.pop(name, None)
+    from .proxy import bypass_local
+    env = bypass_local(env, listen)
     log = folder(record['engine']) / 'access-proxy.log'
+    log.parent.mkdir(parents=True, exist_ok=True)
     with log.open('ab') as output:
         return processes.popen(command, cwd=record['engine'], env=env, stdin=subprocess.DEVNULL,
                                stdout=output, stderr=subprocess.STDOUT, start_new_session=True, supervise=True)
@@ -541,14 +544,29 @@ def host_url(scheme, address, port):
     return '%s://%s:%d' % (scheme, '[%s]' % address if ':' in address else address, port)
 
 
+def qr_lines(link):
+    """The link as a terminal QR code for a phone camera; nothing when it cannot be drawn."""
+    if not link:
+        return []
+    try:
+        from . import qr_code
+        return qr_code.terminal_lines(link)
+    except (ImportError, ValueError):
+        return []
+
+
 def describe(root, state, *, browser_opened=False, out=say):
     url = state['url'] + '/?freevideo=launch'
     access = state.get('access')
     if access:
         secret = token(root)
         out('FreeVideo is running. Open it from another computer with:')
-        for address in addresses(state.get('listen', '')):
-            out('  %s/?freevideo=launch&token=%s' % (host_url(access['scheme'], address, access['port']), secret))
+        links = ['%s/?freevideo=launch&token=%s' % (host_url(access['scheme'], address, access['port']), secret)
+                 for address in addresses(state.get('listen', ''))]
+        for link in links:
+            out('  ' + link)
+        for line in qr_lines(links[0] if links else ''):
+            out('  ' + line)
         out('Anyone with this link can use FreeVideo on this computer; freevideo server --new-token replaces it.')
         if access['scheme'] == 'http':
             out('The connection is not encrypted. Use it on a network you trust, add --tls-cert/--tls-key, or use an SSH tunnel.')

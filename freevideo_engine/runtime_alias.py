@@ -149,6 +149,10 @@ class _WinAPI:
     def __init__(self):
         dll = ctypes.WinDLL('kernel32', use_last_error=True)
         declarations = {
+            'GetACP': ([], _DWORD),
+            'WideCharToMultiByte': ([_DWORD, _DWORD, ctypes.c_wchar_p, ctypes.c_int,
+                                     ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                     ctypes.POINTER(_BOOL)], ctypes.c_int),
             'CreateDirectoryW': ([ctypes.c_wchar_p, ctypes.c_void_p], _BOOL),
             'CreateFileW': ([ctypes.c_wchar_p, _DWORD, _DWORD, ctypes.c_void_p,
                              _DWORD, _DWORD, _HANDLE], _HANDLE),
@@ -255,6 +259,22 @@ class _Backend:
                 return _registry_long_paths()
             except (ImportError, AttributeError, OSError, ValueError):
                 return False
+
+    def ansi_path(self, path):
+        """Whether the system code page spells this path without substitution."""
+        try:
+            api = _win_api()
+            code_page = api.GetACP()
+            if code_page == 65001:
+                return True
+            substituted = _BOOL()
+            # WC_NO_BEST_FIT_CHARS: even a similar character names a different file.
+            api.check(api.WideCharToMultiByte(code_page, 0x400, str(path), -1,
+                                            None, 0, None, ctypes.byref(substituted)))
+            return not substituted.value
+        except (AttributeError, OSError, ValueError, TypeError, ctypes.ArgumentError):
+            # Not knowing is no reason for a short folder: the length decides, as it did.
+            return True
 
     def locations(self):
         return [Path(plain(value, windows=True)) / 'FV' for key in ('ProgramData', 'LOCALAPPDATA')
@@ -497,7 +517,8 @@ def _longest(root, suffixes=()):
     return _manifest_longest(str(path), info.st_mtime_ns, info.st_size, suffixes)
 
 
-def needs_view(root, longest=None) -> bool:
+def needs_view(root, longest=None, spelling_only=False) -> bool:
+    """spelling_only: only a folder the system code page cannot spell, never one that is merely long."""
     if not _backend.windows():
         return False
     root = _ordinary(resolved(checked_real_path(root)))
@@ -505,6 +526,13 @@ def needs_view(root, longest=None) -> bool:
         return False
     if os.environ.get('FREEVIDEO_RUNTIME_ALIAS') == '1':
         return True
+    # The kernel compiler reads its cache folder and finds its own headers through the system's
+    # ANSI code page. A folder that code page cannot spell is one it cannot use, whatever its
+    # length; the short folder is plain letters.
+    if not _backend.ansi_path(root):
+        return True
+    if spelling_only:
+        return False
     # An installation that runs from where it is keeps doing so; only one beyond its budget is
     # given the short folder.
     if longest is None and system_long_paths():

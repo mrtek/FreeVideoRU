@@ -20,6 +20,11 @@ import re
 from statistics import median
 
 TOKEN_UNIT = 72576.
+# Every generated query attends to the reference rows, so a reference video
+# row costs one token plus this many more per canvas-sized unit of tokens
+# (B200: linear in the row count, 1.4x at 960x544 and 1.85x at 1664x960);
+# canvases past the measured size keep the largest measured weight.
+REFERENCE_VIDEO_PAIR_WEIGHT = 4.
 DEFAULT_INTERVAL = [.45, 2.2]
 STAGES = ('encode', 'load', 'pass1', 'upscale', 'pass2', 'decode_save')
 PARAMS_PATH = Path(__file__).with_name('stage_estimate_params.json')
@@ -90,6 +95,36 @@ def _apple(h):
     return 'Apple' in _gpu(h) or h.get('os') == 'Darwin'
 
 
+APPLE_TIERS = ('base', 'Pro', 'Max', 'Ultra')
+
+
+def _apple_factors(h, p):
+    """(step, decode) multipliers for the Apple chip; (1, 1) is the M4 Max fit.
+
+    Only some chips have a report. A generation with no report takes the nearest
+    older generation that has one (the nearest newer one if there is none older),
+    so a guess errs long; the first measured step then corrects it. Inside the
+    generation used, a tier with no report steps down to the next lower tier, and
+    a tier lower than all of them is slower by a fixed ratio.
+    """
+    table = (p.get('apple') or {}).get('chip_factors')
+    found = re.search(r'\bM(\d+)(?:\s+(Pro|Max|Ultra))?', _gpu(h))
+    if not table or not found:
+        return 1., 1.
+    chips = {int(g): v for g, v in table['chips'].items()}
+    generation, tier = int(found.group(1)), found.group(2) or 'base'
+    if generation not in chips:
+        older = [g for g in chips if g < generation]
+        generation = max(older) if older else min(chips, key=lambda g: abs(g-generation))
+    own = chips[generation]
+    rank = APPLE_TIERS.index(tier)
+    for r in range(rank, -1, -1):
+        if APPLE_TIERS[r] in own:
+            return tuple(own[APPLE_TIERS[r]])
+    lowest = own[min(own, key=APPLE_TIERS.index)]
+    return tuple(x*float(table['lower_tier_slowdown']) for x in lowest)
+
+
 def speed(h, p, spec_only=False):
     key = _gpu(h)
     if _apple(h):
@@ -124,6 +159,15 @@ def canvases(r):
         first = dict(full, width=32*uw*m, height=32*uh*m)
     else:
         first = dict(full)
+    # two_pass.plan() samples a first pass under SMALL_FIRST_PASS_PIXELS (138,240) at the target
+    # size, except when the first pass itself is wanted (a preview or the upscale of one).
+    if (not sg.get('first') and two and r.get('flow') not in ('preview', 'upscale')
+            and first != full and first['width']*first['height'] < 138240):
+        return full, full, full
+    if not sg.get('first') and two and min(w, h) >= 512 and r.get('upscale_factor', 2) != 2:
+        # A smaller factor starts larger; the size check above is on the 2x first pass, as in plan().
+        from .two_pass import first_canvas
+        first = first_canvas(full, r['upscale_factor'])[0]
     second = dict(full, **(sg.get('second') or {}))
     decode = first if r.get('flow') == 'preview' else full
     return first, second, decode
@@ -174,16 +218,22 @@ def stream_features(h, r, i):
     return [1.] + tiers + [f*laptop]
 
 
+def _reference_rows(h, r, x):
+    # Measured on NVIDIA only; the Apple fit keeps one row per reference token.
+    weight = 1. if _apple(h) else 1. + REFERENCE_VIDEO_PAIR_WEIGHT*min(x, 1.)
+    return (weight*float(_num(r, 'reference_video_tokens', 0.))
+            + float(_num(r, 'reference_audio_tokens', 0.)))
+
+
 def step_parts(h, r, i, p):
     canvas = canvases(r)[i-1]
     x = token_count(canvas)/TOKEN_UNIT
     # Reference tokens affect the actual attention sequence (policy.py:697).
     # No guessed duration is substituted when unavailable.
-    ref = float(_num(r, 'reference_video_tokens', 0.)) + float(_num(r, 'reference_audio_tokens', 0.))
-    x += ref/TOKEN_UNIT
+    x += _reference_rows(h, r, x)/TOKEN_UNIT
     if _apple(h):
         b, c = p['apple']['step_bc']
-        return p['apple']['step_fixed'], x*(b+c*x)
+        return p['apple']['step_fixed'], x*(b+c*x)*_apple_factors(h, p)[0]
     b, c = p['step']['bc_normalized']
     s = _dot(stream_features(h, r, i), p['step']['s'])
     return max(0., s), x*(b+c*x)/speed(h, p)
@@ -266,7 +316,7 @@ def _raw_base(h, r, flags, p, factor=1., mode='compute', factor_pass=1):
     for name in ['video_decode', 'decode']:
         if _apple(h):
             a, d = p['apple'][name]
-            value = a+m*d*factor
+            value = a+m*d*factor*_apple_factors(h, p)[1]
         else:
             a, d, stream = p[name]['coef']
             ram = p[name]['ram16_multiplier'] if ram_tier(h)==0 else 1.
@@ -308,8 +358,8 @@ def _area(r):
 def _physical_transfer(h, r, p, measured, coef):
     b = p['step']['bc_normalized'][0]
     c, ss = coef[0], coef[1:]
-    ref = float(_num(r, 'reference_video_tokens', 0.)) + float(_num(r, 'reference_audio_tokens', 0.))
-    x = [(token_count(g)+ref)/TOKEN_UNIT for g in canvases(r)[:2]]
+    x = [token_count(g)/TOKEN_UNIT for g in canvases(r)[:2]]
+    x = [v+_reference_rows(h, r, v)/TOKEN_UNIT for v in x]
     s = [_dot(stream_features(h, r, i), ss) for i in [1, 2]]
     if _apple(h):
         s1, comp1 = step_parts(h, r, 1, p)
@@ -351,7 +401,7 @@ def _decode_value(h,r,p,name,method,factor=1.,slowdown=1.,warm2=None,live=False)
     if _apple(h):
         d=canvases(r)[2]; m=d['width']*d['height']*d['frames']/1e6
         a,b=p['apple'][name]
-        return a+m*b*factor
+        return a+m*b*factor*_apple_factors(h,p)[1]
     spec = p['v2']['decode'][name]
     if method in ['log_prior','log_live']:
         use_live = method=='log_live' and live
@@ -417,7 +467,7 @@ def _interval(name,value,p,kind='prior',wide=False):
 
 def _warnings(h,r,p):
     out=[]
-    if _apple(h):out.append('Apple backend has one physical-machine report; external prior accuracy is unvalidated.')
+    if _apple(h):out.append('Apple prior rests on a few physical-machine reports; chips without one borrow the nearest generation.')
     if _gpu_item(h,p) is None:out.append('Unseen GPU: supplied dense tensor rate or G=1 fallback; wide uncertainty.')
     if not (r.get('sampling_geometry') or {}).get('first'):out.append('Sampling geometry inferred from current H3 engine rules.')
     if any(r.get(f'pass{i}_resident_blocks') is None for i in [1,2]):out.append('Missing planned transformer residency: coarse VRAM fallback.')
@@ -430,12 +480,19 @@ def predict_prior(hardware, request, cold_flags, params=None):
 
     video_decode is a diagnostic SUBSET of decode: never add it to total.
     Input hardware RAM/VRAM use GiB. pcie_bandwidth_gbs is decimal GB/s.
-    request uses schema names plus optional pass1_resident_blocks, reference_seconds.
+    request uses schema names plus optional pass1_resident_blocks, reference_seconds,
+    step_cache (the effective first-pass cache).
     Cold flags may include pass1/2_canvas_compiled and pass1/2_compile_cold.
     Unknown flags must be None, never inferred from future observed first steps.
     """
     p=_params(params)
     v,d=_raw(hardware,request,cold_flags or {},p)
+    if request.get('step_cache'):
+        # The fit has only plain passes; a step cache shortens the first pass alone.
+        from .tiers import sampling_share
+        d['step_cache_share']=sampling_share(request['step_cache'])
+        v['pass1']*=d['step_cache_share']
+        _sum_total(v)
     wide=_apple(hardware) or _gpu_item(hardware,p) is None
     return _decode_save({'stages':{k:_interval(k,x,p,wide=wide) for k,x in v.items() if k!='total'},
         'total':_interval('total',v['total'],p,wide=wide), 'diagnostics':d,

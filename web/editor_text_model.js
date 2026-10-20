@@ -48,7 +48,7 @@ export function readTextProject(raw, parseMedia) {
             check(typeof c.text === 'string' && Array.from(c.text).length <= TEXT_LIMIT && !/[\u0000-\u0008\u000b-\u001f\u007f\ud800-\udfff]/u.test(c.text));
             check(['source','pending','link','part','job','reason'].every(k => c[k] == null) && (c.extend === undefined || c.extend === false) && (c.versions === undefined || (Array.isArray(c.versions) && c.versions.length === 0)));
             check((c.in === undefined || c.in === 0) && (c.length === undefined || c.length === c.frames));
-            check(!['volume', 'fit', 'splice', 'target_frames', 'text_by', 'ref', 'take', 'made_text'].some(k => c[k] !== undefined));
+            check(!['volume', 'fit', 'splice', 'target_frames', 'text_by', 'ref', 'note', 'take', 'made_text'].some(k => c[k] !== undefined));
             const clip = {id: c.id, start: c.start, frames: c.frames, in: 0, length: c.frames, source: null, link: null,
                 text: c.text, part: null, pending: null, reason: null, job: null, extend: false, versions: [], text_kind: track.kind};
             check(track.kind !== 'subtitle' || c.text_style === undefined);
@@ -65,6 +65,9 @@ export function readTextProject(raw, parseMedia) {
 export function assertUnlocked(record, ids) {
     check(!record.tracks.some(t => t.locked && t.clips.some(c => ids.includes(c.id))), 'locked');
 }
+// Timeline moves keep their original lanes, but text cannot land over a locked overlay lane.
+export const textDropLocked = (record, clips, trackId) => clips.some(isText)
+    && record.tracks.some(track => track.id === trackId && isTextTrack(track) && track.locked);
 export function addText(record, {kind = 'text', at = 0, text = '', style, frames = kind === 'subtitle' ? 48 : 72} = {}) {
     check(['text', 'subtitle'].includes(kind));
     const next = model.serialize(record); let row = next.tracks.find(t => t.kind === kind);
@@ -98,17 +101,34 @@ export function activeText(record, frame) {
     return record.tracks.filter(t => isTextTrack(t) && !t.hidden).sort((a,b) => (a.kind === 'text' ? -1 : 1) - (b.kind === 'text' ? -1 : 1))
         .flatMap(t => t.clips.filter(c => c.start <= frame && c.start+c.frames > frame).map(c => ({...c, style: styleOf(record,c), opacity: c.text_kind === 'text' && styleOf(record,c).fade ? Math.min(1,(frame-c.start+.5)/7.2,(c.start+c.frames-frame-.5)/7.2) : 1})));
 }
-export function parseSRT(text) {
+export function parseSRT(text, result = {}) {
     check(typeof text === 'string' && text.length <= 4*1024*1024, 'srt');
     const blocks = text.replace(/^\ufeff/, '').replace(/\r\n?/g,'\n').trim().split(/\n\s*\n/);
-    check(blocks.length > 0 && blocks.length <= 500, 'srt'); let end = 0;
-    return blocks.map(block => {
-        const lines = block.split('\n'); if (/^\d+$/.test(lines[0])) lines.shift();
-        const match = /^(\d{2,3}):([0-5]\d):([0-5]\d)[,.](\d{3}) --> (\d{2,3}):([0-5]\d):([0-5]\d)[,.](\d{3})$/.exec(lines.shift()); check(match && lines.length, 'srt');
-        const time = i => Math.round((Number(match[i])*3600+Number(match[i+1])*60+Number(match[i+2])+Number(match[i+3])/1000)*24);
-        const start = time(1), stop = time(5); check(start >= end && stop > start && stop <= 1e7, 'srt'); end = stop;
-        return {at:start, frames:stop-start, text:lines.join('\n'), kind:'subtitle'};
-    });
+    const entries = []; let skipped = 0, trimmed = 0;
+    for (const block of blocks) {
+        let entry;
+        try {
+            const lines = block.split('\n'); if (/^\d+$/.test(lines[0])) lines.shift();
+            const match = /^(\d{2,3}):([0-5]\d):([0-5]\d)[,.](\d{3}) --> (\d{2,3}):([0-5]\d):([0-5]\d)[,.](\d{3})$/.exec(lines.shift()); check(match && lines.length, 'srt');
+            const time = i => Math.round((Number(match[i])*3600+Number(match[i+1])*60+Number(match[i+2])+Number(match[i+3])/1000)*24);
+            const start = time(1), stop = time(5), content = lines.join('\n');
+            check(stop > start && stop <= 1e7 && Array.from(content).length <= TEXT_LIMIT && !/[\u0000-\u0008\u000b-\u001f\u007f\ud800-\udfff]/u.test(content), 'srt');
+            entry = {at:start, frames:stop-start, text:content, kind:'subtitle'};
+        } catch { skipped++; continue; }
+        // Keep readable cues in file order, shortening or removing earlier overlaps.
+        while (entries.length && entries.at(-1).at + entries.at(-1).frames > entry.at) {
+            const previous = entries.at(-1); previous.frames = entry.at - previous.at; trimmed++;
+            if (previous.frames > 0) break;
+            entries.pop();
+        }
+        entries.push(entry);
+    }
+    if (skipped) console.warn(`FreeVideo SRT import skipped ${skipped} unreadable blocks.`);
+    if (trimmed) console.warn(`FreeVideo SRT import trimmed ${trimmed} overlapping subtitles.`);
+    check(entries.length > 0, 'srt');
+    result.truncated = entries.length > 500;
+    if (result.truncated) console.warn('FreeVideo SRT import kept only the first 500 subtitles.');
+    return entries.slice(0, 500);
 }
 // An import replaces every subtitle already there, in one edit that one undo reverses.
 export function importSRT(record, text) {

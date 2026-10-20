@@ -4,10 +4,13 @@ import math
 import re
 import secrets
 from . import schema as contract
+from .length import single_frame_limit
 
 QUALITY, ASPECTS = contract.QUALITY, contract.ASPECTS
 KINDS = tuple(contract.KINDS)
 FRAMES = ('first', 'last')
+# A part that continues a video carries at most this many reference pictures, and no other reference media.
+CONTINUED_PICTURES = 3
 MAX_SEED = contract.generate()['properties']['seed']['maximum']
 JOB_ID = re.compile(contract.JOB['pattern'].strip('^$'))
 LIBRARY_ID = re.compile(contract.SAVED['pattern'].strip('^$'))
@@ -22,6 +25,22 @@ class SpecError(ValueError):
 
 def fail(path, message):
     raise SpecError(contract.diagnostic(path, message, None))
+
+
+def import_name(name):
+    """Timeline imports accept video/audio content, with no HTTP filesystem paths."""
+    from ..comfy_assets import media_kind
+    problems = contract.issues(contract.import_upload()['properties']['name'], name, '/name')
+    if problems:
+        raise SpecError(problems)
+    try:
+        if media_kind(name) not in ('video', 'audio'):
+            raise ValueError
+    except ValueError:
+        error = SpecError(contract.diagnostic('/name', 'a supported video or audio filename', None))
+        error.code = 'invalid_media'
+        raise error from None
+    return name
 
 
 # Field checks for values no route schema describes: screenplays and filming records.
@@ -65,13 +84,13 @@ def new_id():
     return 'j' + secrets.token_hex(6)
 
 
-def media_item(value, path, *, image=False, frame_default=None):
+def media_item(value, path, *, image=False, frame_default=None, early=False):
     if isinstance(value, str):
         value = {'file': value}
     value = dict(value) if isinstance(value, dict) else value
     if isinstance(value, dict) and frame_default is not None and any(k in value for k in ('from_job', 'library')):
         value.setdefault('frame', frame_default)
-    errors = contract.issues(contract.media(image, local=True), value, path)
+    errors = contract.issues(contract.media(image, local=True, early=early), value, path)
     if errors:
         raise SpecError(errors)
     return value
@@ -123,13 +142,31 @@ def canvas_size(value):
 
 
 def sampling(value):
+    from .. import tiers
+    mac = tiers.on_mac()
     quality = value.get('quality', contract.generate()['properties']['quality']['default'])
     two, base, refine = QUALITY[quality]
     custom = value.get('sampling', {})
+    if two and custom.get('two_pass') is False and 'base_steps' not in custom:
+        # One pass always samples 20 steps unless the caller gives its own count.
+        base = 20
     two, base, refine = custom.get('two_pass', two), custom.get('base_steps', base), custom.get('refine_steps', refine)
+    note = None
+    if two:
+        from ..two_pass import one_pass_note
+        # Only the 8-step first pass goes two-pass; any other count is one pass, said once in the answer.
+        note = one_pass_note(base)
+        two = two and note is None
+    # A level's step cache and upscale factor stay only with that level's own plan; custom sampling
+    # runs every step and upscales 2x.
+    own = QUALITY[quality] == (two, base, refine)
+    cache = tiers.step_cache(quality, mac) if own else None
+    factor = tiers.upscale_factor(quality, mac) if own and two else 2
     if custom:
-        quality = next((k for k, v in QUALITY.items() if v == (two, base, refine)), 'custom')
-    return dict(quality=quality, two_pass=two, base_steps=base, refine_steps=refine)
+        quality = tiers.name_for(base, two, refine, cache, mac, factor) or 'custom'
+    return dict(quality=quality, two_pass=two, base_steps=base, refine_steps=refine,
+                **({'step_cache': cache} if cache else {}), **({'upscale_factor': factor} if factor != 2 else {}),
+                **({'sampling_note': note} if note else {}))
 
 
 def generation_media(value):
@@ -137,8 +174,21 @@ def generation_media(value):
         return {}
     result = {role: media_item(value[role], '/media/' + role, image=True) for role in FRAMES if value.get(role) is not None}
     if value.get('references'):
-        result['references'] = [media_item(v, '/media/references/%d' % i) for i, v in enumerate(value['references'])]
+        result['references'] = [media_item(v, '/media/references/%d' % i, early=True) for i, v in enumerate(value['references'])]
     return result
+
+
+def still_picture(item):
+    """A reference that is one picture: a frame of a video, or a picture file."""
+    if isinstance(item, str):
+        item = {'file': item}
+    if not isinstance(item, dict):
+        return False
+    if 'frame' in item:
+        return True
+    from ..comfy_assets import EXTENSIONS
+    source = item.get('file') or item.get('path')
+    return isinstance(source, str) and source.lower().endswith(tuple(EXTENSIONS['image']))
 
 
 def task(media):
@@ -149,12 +199,13 @@ def task(media):
     return 'i2va' if 'first' in media else 'l2va' if 'last' in media else 't2va'
 
 
-def saved_length(canvas, seconds, continued=False):
-    """Frames and seconds of the saved video. One generation keeps its aligned canvas; a longer video is
-    made in blocks and joined to exactly the planned whole seconds. A continuation saves only what it adds."""
+def saved_length(canvas, spec):
+    """Saved length: one generation keeps its aligned canvas; multiple blocks are joined to the planned
+    whole seconds. A continuation saves only what it adds."""
     from ..chain_plan import PlanError, plan
+    continued = bool(spec.get('continue_from'))
     try:
-        planned = plan(seconds, continued=continued)
+        planned = plan(spec['seconds'], max_frames=single_frame_limit(spec), continued=continued)
     except PlanError:
         return canvas['frames'], canvas['seconds']
     if planned['single'] and not continued:
@@ -162,7 +213,7 @@ def saved_length(canvas, seconds, continued=False):
     return planned['frames'], planned['frames'] / canvas['fps']
 
 
-def normalize(value):
+def normalize(value, *, port=None):
     # Local Python callers retain local media refs. HTTP validates its stricter
     # (content-only) schema first; the client adapts local refs before transport.
     contract.validate_job(value, local=True)
@@ -180,9 +231,8 @@ def normalize(value):
             from ..geometry import geometry
             width, height = canvas_size(original)
             canvas = geometry(width, height, seconds=value['seconds'])
-            frames, output_seconds = saved_length(canvas, value['seconds'], bool(value.get('continue_from')))
             result.update(prompt=value['prompt'], width=width, height=height, seconds=float(value['seconds']),
-                          frames=frames, output_seconds=output_seconds, seed_random=value['seed'] is None,
+                          seed_random=value['seed'] is None,
                           seed=secrets.randbelow(MAX_SEED + 1) if value['seed'] is None else value['seed'],
                           preview=value['preview'], media=generation_media(value.get('media')), **sampling(value))
             result['task'] = task(result['media'])
@@ -190,8 +240,13 @@ def normalize(value):
                 result['continue_from'] = dict(value['continue_from'])
             if value['first_frame_reference']:
                 result['first_frame_reference'] = True
+            if value.get('part_prompts'):
+                result['part_prompts'] = list(value['part_prompts'])
             result['loras'] = [dict(name=row, strength=1.) if isinstance(row, str) else {'strength': 1., **row}
                                for row in value['loras']]
+            if port is not None:
+                result['single_max_frames'] = single_frame_limit(result, port=port)
+            result['frames'], result['output_seconds'] = saved_length(canvas, result)
     elif kind == 'assemble':
         result['clips'] = []
         for row in value['clips']:
@@ -211,8 +266,24 @@ def normalize(value):
                 item['video'] = media_item({k: v for k, v in video.items() if k != 'frames'} if isinstance(video, dict) else video, '/questions/video')
             result['questions'].append(item)
         result.update({k: value[k] for k in ('format', 'max_tokens', 'system') if k in value})
+    elif kind == 'image':
+        width, height = ((value['width'], value['height']) if 'width' in value else
+                         contract.IMAGE_ASPECTS[value.get('aspect', '1:1')])
+        result.update(prompt=value['prompt'], width=width, height=height,
+                      images=[item if isinstance(item, str) else item['file'] for item in value.get('images', [])])
+        if value.get('seed') is not None:
+            result['seed'] = value['seed']
+        if value.get('people'):
+            result['people'] = [dict(image=person['image'], x=person.get('x', .5), height=person.get('height', .62),
+                                     feet=person.get('feet', .9), **({'name': person['name']} if person.get('name') else {}))
+                                for person in value['people']]
+            if value.get('scene_image'):
+                result['scene_image'] = value['scene_image']
     elif kind == 'export':
         result.update(editor_project=value['editor_project'], revision=value['revision'])
+    elif kind == 'listen':
+        result.update(editor_project=value['editor_project'], revision=value['revision'], mode=value['mode'],
+                      language=value.get('language', 'auto'), **{k: value[k] for k in ('lines', 'range') if k in value})
     elif kind == 'image_edit':
         result.update(image=value['image'], revision=value['revision'])
     else:
@@ -223,6 +294,8 @@ def normalize(value):
 
 def comfy_prompt(spec, node, *, prompt, assets, refine_from=''):
     """The ComfyUI API-format graph for one generate job; media are files in ComfyUI input."""
+    from ..lora_triggers import apply_triggers
+    prompt = apply_triggers(prompt, spec.get('loras', []))
     inputs = dict(text=prompt, width=spec['width'], height=spec['height'], seconds=spec['seconds'],
                   seed=spec['seed'], two_pass=spec['two_pass'], base_steps=spec['base_steps'],
                   refine_steps=spec['refine_steps'], force_regenerate=spec['force_regenerate'],
@@ -230,6 +303,10 @@ def comfy_prompt(spec, node, *, prompt, assets, refine_from=''):
     if spec.get('first_frame_reference'):
         # Every part of the video carries it; the part that continues nothing ignores it.
         inputs['first_frame_reference'] = True
+    if spec.get('step_cache'):
+        inputs['step_cache'] = spec['step_cache']
+    if spec.get('upscale_factor', 2) != 2 and spec['two_pass'] and not spec['preview']:
+        inputs['upscale_factor'] = '%g' % spec['upscale_factor']
     graph = {node: {'class_type': 'FreeVideoGenerate', 'inputs': inputs,
                     '_meta': {'title': 'FreeVideo · ' + (spec.get('label') or 'Agent job')}}}
     if assets:
@@ -238,7 +315,8 @@ def comfy_prompt(spec, node, *, prompt, assets, refine_from=''):
         inputs['media'] = [node + 'm', 0]
     if spec.get('loras'):
         graph[node + 'l'] = {'class_type': 'FreeVideoLoRAStack',
-                             'inputs': {'adapters': json.dumps([dict(r, enabled=True) for r in spec['loras']])},
+                             'inputs': {'adapters': json.dumps([dict(r, enabled=True) for r in spec['loras']
+                                                               if r.get('enabled', True)])},
                              '_meta': {'title': 'FreeVideo · LoRAs'}}
         inputs['loras'] = [node + 'l', 0]
     return graph

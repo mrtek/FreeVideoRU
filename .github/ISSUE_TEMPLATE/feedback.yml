@@ -1,0 +1,18 @@
+name: Feedback / 反馈
+description: Tell us what could be better / 说说哪里可以做得更好
+labels: ["feedback"]
+body:
+  - type: textarea
+    id: feedback
+    attributes:
+      label: What could be better? / 哪里可以做得更好？
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / 版本
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic info (optional) / 诊断信息（选填）

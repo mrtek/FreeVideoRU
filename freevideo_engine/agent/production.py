@@ -71,8 +71,40 @@ def _compiled(play, shot):
     return drama.prompt(play, shot)
 
 
-def plan(request):
-    """Return {'request': normalized copy, 'preview': {'shots': [...], 'total': N}}."""
+# What a screenplay shot and a line may say; anything else would be ignored without a word.
+SHOT_FIELDS = ('id', 'seconds', 'action', 'idea', 'prompt', 'camera', 'framing', 'sound', 'music', 'takes', 'seed',
+               'continue', 'first', 'references', 'cast', 'lines')
+LINE_FIELDS = ('who', 'line', 'how', 'language')
+
+
+def _rule(row):
+    """A screenplay problem as a rule about its field; the pointer already travels in path.
+
+    A leading pointer in the text would read as a local path once paths are removed."""
+    if isinstance(row.get('allowed'), str):
+        rule = row['allowed']
+        return rule if rule.startswith('must') else 'must be ' + rule
+    return re.sub(r'^/\S*\s+', '', row['message']) if isinstance(row.get('message'), str) else 'is not valid'
+
+
+def _fields(play, problems):
+    for i, shot in enumerate(play.get('shots') or [] if isinstance(play, dict) else []):
+        if not isinstance(shot, dict):
+            continue
+        rows = [('/screenplay/shots/%d/' % i, key, SHOT_FIELDS) for key in shot if key not in SHOT_FIELDS]
+        for j, line in enumerate(shot.get('lines') if isinstance(shot.get('lines'), list) else []):
+            if isinstance(line, dict):
+                rows += [('/screenplay/shots/%d/lines/%d/' % (i, j), key, LINE_FIELDS)
+                         for key in line if key not in LINE_FIELDS]
+        for prefix, key, known in rows:
+            name = str(key).replace('~', '~0').replace('/', '~1')
+            problems.append(dict(path=prefix + name, message='is not a field here; use ' + ', '.join(known)))
+
+
+def plan(request, *, fields=True):
+    """Return {'request': normalized copy, 'preview': {'shots': [...], 'total': N}}.
+
+    fields=False rechecks a saved screenplay, which may predate the unknown-field rule."""
     problems = []
     if not isinstance(request, dict):
         _invalid([dict(path='', message='A production request must be an object')])
@@ -83,7 +115,9 @@ def plan(request):
         drama.check(play)
     except drama.Screenplay as error:
         play_ok = False
-        problems.extend(dict(path='/screenplay' + p['path'], message=p['message']) for p in error.problems)
+        problems.extend(dict(path='/screenplay' + p['path'], message=_rule(p)) for p in error.problems)
+    if fields:
+        _fields(play, problems)
     count = request.get('takes_per_shot', 1)
     count_ok = _count(count, '/takes_per_shot', problems)
     director = request.get('director', 'agent')
@@ -232,11 +266,10 @@ def _schedule(state, shot, count, by, note=None, *, automatic=False):
         job.pop('media', None)
         if job['project'] is None:
             job.pop('project')
-        if not shot['continues']:
-            if source.get('first') is not None:
-                job['media'] = {'first': deepcopy(source['first'])}
-            elif 'references' in source:
-                job['media'] = {'references': deepcopy(source['references'])}
+        if source.get('first') is not None and not shot['continues']:
+            job['media'] = {'first': deepcopy(source['first'])}
+        elif source.get('references'):
+            job['media'] = {'references': deepcopy(source['references'])}
         jobs.append(dict(take=None, job=None, generation=None, seed=None, state='queued', automatic=automatic,
                          stale=False, continues_take=None, note=note, by=by, library_id=None, seconds=None,
                          cancel_requested=False, error=None, spec=job))
@@ -548,7 +581,8 @@ def reshoot(state, shot, *, by, note=None, changes=None, takes=1, reason=None, n
     source = draft['screenplay']['shots'][row['index'] - 1]
     source.update(deepcopy(changes or {}))
     # Recheck the complete effective screenplay, transactionally.
-    plan(dict(screenplay=draft['screenplay'], takes_per_shot=draft['takes_per_shot'], director=draft['director']))
+    plan(dict(screenplay=draft['screenplay'], takes_per_shot=draft['takes_per_shot'], director=draft['director']),
+         fields=False)
     _schedule(draft, row, takes, by, note)
     draft['cancelled'], draft['current_join'] = False, None
     _decision(draft, now, by, 'reshoot', shot, reason=reason)
@@ -687,7 +721,8 @@ def view(state):
         latest = next((t for t in reversed(shot['takes']) if 'cast_reference' in t), {})
         row.update(cast_reference=latest.get('cast_reference'), cast_omitted=deepcopy(latest.get('cast_omitted', [])),
                    cast_voice_omitted=deepcopy(latest.get('cast_voice_omitted', [])),
-                   cast_missing=deepcopy(latest.get('cast_missing', [])))
+                   cast_missing=deepcopy(latest.get('cast_missing', [])),
+                   cast_pictures_each=latest.get('cast_pictures_each'))
         row['takes'] = []
         for take in shot['takes']:
             item = {key: deepcopy(take[key]) for key in ('take', 'job', 'generation', 'seed', 'state', 'stale',

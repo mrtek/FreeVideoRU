@@ -28,7 +28,7 @@ def installed_versions(python):
     # an isolated venv with the standard Lib/site-packages layout.
     directory = Path(python).parent.parent / 'Lib' / 'site-packages'
     return {dist.metadata['Name'].lower(): dist.version
-            for dist in importlib.metadata.distributions(path=[str(directory)])
+            for dist in importlib.metadata.distributions(path=[str(io_path(directory))])
             if dist.metadata['Name']}
 
 
@@ -39,7 +39,7 @@ def fetch(row, root, family, networking, env, ui, check):
         names = list(row['sources'])
     candidates = [(name, row['sources'][name]) for name in names if name in row['sources']]
     key = 'download-' + row['filename']
-    name = 'PyTorch' if row['package'] == 'torch' else row['package']
+    name = 'Runtime components'
     source = ''
     ui.begin(key, 'Download PyTorch + CUDA', detail=row['filename'])
     success = False

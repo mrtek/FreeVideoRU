@@ -126,6 +126,9 @@ def residual_host_headroom(canvas=None):
     rows = (sum(canvas.get(key, 0) for key in
                 ('video_tokens', 'reference_video_tokens', 'reference_audio_tokens'))
             if canvas is not None else 72576)
+    if canvas is not None and canvas.get('early_reference') is not None:
+        from .two_pass import placement_tokens
+        rows = placement_tokens(canvas)
     return int(2**30 * max(1., rows / 72576))
 
 

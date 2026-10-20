@@ -1,3 +1,4 @@
+import {continuationUpscale} from './sampling_effort.js';
 export const EXTEND_PROPERTY = 'freevideo_extend';
 export const EXTEND_TEXT = Object.freeze({
     action: ['Extend', '接着生成'],
@@ -8,8 +9,8 @@ export const EXTEND_TEXT = Object.freeze({
 });
 export const extendText = (t, key) => t(...EXTEND_TEXT[key]);
 
-// The saved video of a continuation holds only what it adds, so the result card and the library keep this entry
-// closed until the joined whole video is made; the editor's own extension is unaffected.
+// Only the legacy in-studio continuation entry waits for a joined whole video.
+// Result cards and Creations continue on the editor timeline independently.
 export const EXTEND_ENTRY_OPEN = false;
 export function canExtend(record) {
     return Boolean(record?.video && /\.mp4$/i.test(record.video) && !record.preview
@@ -25,9 +26,21 @@ export function extendVideoURL(record) {
 
 export async function extendSourceExists(api, record) {
     if (!canExtend(record)) return false;
-    try { return (await api.fetchApi(extendVideoURL(record), {method: 'HEAD'})).ok; }
-    catch { return false; }
+    const url = extendVideoURL(record);
+    try {
+        if ((await api.fetchApi(url, {method: 'HEAD', signal: AbortSignal.timeout(10000)})).ok) return true;
+    } catch { /* HEAD can fail even when the browser can still read the video. */ }
+    try {
+        const response = await api.fetchApi(url, {method: 'GET', headers: {Range: 'bytes=0-0'},
+            signal: AbortSignal.timeout(10000)});
+        // A server may ignore Range. Release its stream without downloading the video.
+        await response.body?.cancel().catch(() => {});
+        return response.ok;
+    } catch { return false; }
 }
+
+export const videoUnavailableText = t => t('This video cannot be opened. If you moved the file, refresh the page.',
+    '视频打不开，如果移动过文件，请刷新页面。');
 
 export async function readExtendRecord(api, record) {
     if (record.geometry?.width && record.geometry?.height && (record.geometry.seconds || record.geometry.frames)) return record;
@@ -44,7 +57,7 @@ export async function readExtendRecord(api, record) {
 }
 
 export function createExtendState(node, read, write) {
-    const keys = ['width', 'height', 'seconds', 'two_pass', 'preview', 'base_steps', 'refine_steps'];
+    const keys = ['width', 'height', 'seconds', 'two_pass', 'preview', 'base_steps', 'refine_steps', 'step_cache', 'upscale_factor'];
     return {
         get source() { return node.properties?.[EXTEND_PROPERTY]?.source || null; },
         enter(record) {
@@ -62,10 +75,13 @@ export function createExtendState(node, read, write) {
             seconds = Math.floor(seconds * 1000 + 1e-6) / 1000;
             const source = structuredClone(record); source.geometry = {...g, seconds};
             node.properties[EXTEND_PROPERTY] = {source, previous};
+            const v = previous.values;
             for (const [key, value] of Object.entries({width: g.width, height: g.height,
                 seconds: Math.min(60, seconds), text: '', preview: false,
-                // A continuation always runs the Light plan: two passes, 8 + 3 steps.
-                two_pass: true, base_steps: 8, refine_steps: 3})) write(key, value);
+                // A continuation always runs two passes, 8 + 3 steps, no step cache: Light, or Medium when that is the level.
+                two_pass: true, base_steps: 8, refine_steps: 3, step_cache: 'none',
+                ...(v.upscale_factor !== undefined
+                    ? {upscale_factor: continuationUpscale(v.base_steps, v.two_pass, v.refine_steps, v.step_cache, v.upscale_factor)} : {})})) write(key, value);
             node.properties.freevideo_seconds = seconds;
             node.properties.freevideo_aspect = 'custom';
             node.properties.freevideo_pixels = g.width * g.height / 1024 ** 2;
@@ -88,17 +104,18 @@ export function extendSnapshot(snapshot, node, source, {multiple = false} = {}) 
     if (!source) return snapshot;
     const copy = structuredClone(snapshot), inputs = copy.output[String(node)].inputs;
     inputs.width = source.geometry.width; inputs.height = source.geometry.height;
+    const factor = continuationUpscale(inputs.base_steps ?? 8, inputs.two_pass, inputs.refine_steps ?? 3, inputs.step_cache, inputs.upscale_factor);
     inputs.preview = false; inputs.refine_from = ''; inputs.two_pass = true;
-    for (const [key, value] of [['base_steps', 8], ['refine_steps', 3]]) if (key in inputs) inputs[key] = value;
+    for (const [key, value] of [['base_steps', 8], ['refine_steps', 3], ['step_cache', 'none'], ['upscale_factor', factor]]) if (key in inputs) inputs[key] = value;
     // A continuation takes no first or last frame and no pre-encoded conditioning.
     for (const key of ['first', 'last', 'conditioning']) delete inputs[key];
     if (multiple) delete inputs.continue_from; else inputs.continue_from = source.video;
     // The predecessor's tail replaces the draft's first frame.
     const media = copy.output[String(inputs.media?.[0])];
     if (media?.class_type === 'FreeVideoMedia') {
-        // The continuation's own last frames stand in for every first, last and reference item.
+        // The continuation's own last frames stand in for connected media; the panel's pictures (characters, references)
+        // go with it, and the engine keeps up to three of them (continuation.PICTURES_MAX).
         for (const key of Object.keys(media.inputs)) if (key !== 'assets') delete media.inputs[key];
-        if (media.inputs.assets) media.inputs.assets = '[]';
     }
     return copy;
 }

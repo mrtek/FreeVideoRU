@@ -1,27 +1,42 @@
-import { createErrorPanel, errorText } from './error_panel.js';
+import { createErrorPanel, errorText, createErrorReport, adviceFor } from './error_panel.js';
+import { installNativeErrorGuard } from './native_errors.js';
+import { installTranslateGuard } from './translate_guard.js';
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { openEditorView } from './editor_loader.js';
+import { beginWorkspaceRestore, finishWorkspaceRestore, waitForLauncherRestore } from './workspace_restore.js';
 import { openStudio, loraPanel, loraWarning, promptGuide } from "./studio.js";
-import { createGenerationProgress, referenceTrimText, thermalText, encoderFileText, encoderFilePath } from './generation_progress.js';
+import { createGenerationProgress, referenceTrimText, thermalText, sharedGpuText, encoderFileText, encoderFilePath } from './generation_progress.js';
 import { createProgressConnection } from './progress_connection.js';
 import { notifyCompatibility } from './compatibility.js';
 import { startUpdateChecks } from './updates.js';
-import { installNavigation, refreshNavigation, preferredView } from './view_navigation.js';
-import { attachReferencePicker, referenceItems, syncReferencePrompt, referenceInputs } from './prompt_references.js';
+import { startWhiteboxWorker } from './whitebox_worker.js';
+import { startDoneNotify, askDesktopPermission, DESKTOP_SETTING } from './done_notify.js';
+import { installNavigation, refreshNavigation, preferredView, collapseWorkspaces } from './view_navigation.js';
+import { isLaunchVisit } from './launch_visit.js';
+import { openFreeVideoWorkflow } from './launcher.js';
+import { agentInterfaceEnabled } from './agent_connect.js';
+import { attachReferencePicker, referenceItems, syncReferencePrompt, referenceInputs, mediaRows } from './prompt_references.js';
+import { expandCast } from './cast_mention.js';
 import { outputDownloadURL } from './output_download.js';
 import { shareButton } from './share.js';
 import { reportFileName } from './report_issue.js';
-import { rememberPromptDraft, savePromptDraft } from './prompt_draft.js';
-import { regenerateResult, upscaleResult } from './studio_queue.js';
+import { rememberPromptDraft, savePromptDraft, trackPromptDraft, watchPromptHistory, promptHistoryRestoring } from './prompt_draft.js';
+import { cleanOptionalWidgets, cleanOptionalPrompt, optionalInputValue } from './optional_inputs.js';
+import { regenerateResult, createSecondPassQueue, enableNode } from './studio_queue.js';
+import { secondPassAction } from './result_actions.js';
 import { openImageEditor, icon } from './image_editor.js';
+import { imageGenerationSupported } from './image_generation.js';
+import { createCastLibrary } from './cast_library.js';
+import { uploadMedia } from './media_upload.js';
+import { issueButton } from './issue_button.js';
 
 import { t as text, isZh as cn } from './i18n.js';
 const style = document.createElement("style");
 style.textContent = `
 .fv-panel{box-sizing:border-box;width:100%;height:100%;padding:16px;background:var(--fv-card);color:var(--fv-ink);border:1px solid var(--fv-border);border-radius:var(--fv-r-md,12px);font:13px/1.6 var(--fv-font);overflow:auto;color-scheme:dark}
 .fv-panel *{box-sizing:border-box}.fv-toolbar,.fv-row,.fv-links{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.fv-panel .fv-links{justify-content:center}.fv-panel[data-freevideo=result]>.fv-note{text-align:center}
+.fv-panel .fv-links{justify-content:center}.fv-panel[data-freevideo=result]>.fv-note{text-align:center;text-wrap:balance}
 .fv-panel .fv-toolbar{padding:4px 0 8px}.fv-panel .fv-stats{text-align:center}.fv-panel .fv-stat{padding:10px 3px;border-radius:var(--fv-r-md,12px);background:var(--fv-raised)}
 .fv-panel .fv-stats[hidden]{display:none}
 .fv-panel .fv-connected{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap;margin:10px 0}.fv-panel .fv-connection{border:1px solid var(--fv-border);border-radius:var(--fv-r-sm,8px);padding:5px 9px;background:var(--fv-selected);color:var(--fv-accent);font-size:var(--fv-micro,12px)}
@@ -29,6 +44,7 @@ style.textContent = `
 .fv-panel[data-freevideo=result]{display:flex;flex-direction:column;justify-content:center}.fv-panel[data-freevideo=result]:has(>.fv-generation-progress:not([hidden])){justify-content:flex-start}.fv-panel .fv-connected-card{text-align:center;padding:28px 12px;border:1px solid var(--fv-border);border-radius:var(--fv-r-md,12px);color:var(--fv-muted);background:var(--fv-raised)}
 .fv-panel button,.fv-panel select,.fv-panel a{box-sizing:border-box;min-height:var(--fv-h-sm,32px);border:1px solid var(--fv-border);border-radius:var(--fv-r-sm,8px);background:var(--fv-raised);color:var(--fv-ink);padding:5px 10px;font:inherit;font-weight:var(--fv-medium,500);cursor:pointer;text-decoration:none}
 .fv-panel button:hover,.fv-panel a:hover{background:var(--fv-hover)}.fv-panel button:disabled{opacity:.45;cursor:wait}
+.fv-menu-failure{width:min(460px,calc(100vw - 32px));height:auto}.fv-menu-failure::backdrop{background:#0009}
 .fv-panel select{max-width:170px}.fv-note{color:var(--fv-muted);font-size:var(--fv-micro,12px);margin:8px 0;white-space:pre-wrap}.fv-error{color:var(--fv-danger)}
 .fv-mode{font-size:var(--fv-micro,12px);color:var(--fv-accent)}
 .fv-panel[data-freevideo=media]>.fv-mode{display:inline-block;margin:4px 0 2px;padding:2px 8px;border-radius:var(--fv-r-xs,3px);background:var(--fv-selected);font-weight:var(--fv-medium,500)}.fv-card{border:1px solid var(--fv-border);border-radius:var(--fv-r-md,12px);padding:10px;margin-top:10px;background:var(--fv-raised)}
@@ -54,15 +70,30 @@ function viewURL(file, type = "input") {
         filename: file.slice(split + 1), subfolder: split < 0 ? "" : file.slice(0, split), type,
     }));
 }
+const MEDIA_EXTENSIONS = {
+    image: ["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+    video: ["mp4", "mov", "webm", "mkv", "m4v"],
+    audio: ["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"],
+};
+const extensionOf = name => name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+const acceptList = kinds => kinds.flatMap(kind => MEDIA_EXTENSIONS[kind]).map(ext => "." + ext).join(",");
+function mediaKindOrNull(name) {
+    const ext = extensionOf(name);
+    return Object.keys(MEDIA_EXTENSIONS).find(kind => MEDIA_EXTENSIONS[kind].includes(ext)) ?? null;
+}
 function mediaKind(name) {
-    const ext = name.split(".").pop().toLowerCase();
-    if (["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"].includes(ext)) return "image";
-    if (["mp4", "mov", "webm", "mkv", "m4v"].includes(ext)) return "video";
-    if (["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"].includes(ext)) return "audio";
-    throw new Error(text("Choose an image, video or audio file", "请选择图片、视频或音频文件"));
+    const kind = mediaKindOrNull(name);
+    if (!kind) throw new Error(text("Choose an image, video or audio file", "请选择图片、视频或音频文件"));
+    return kind;
+}
+function skippedNote(names) {
+    const found = [...new Set(names.map(extensionOf).filter(Boolean).map(ext => "." + ext))], kinds = found.slice(0, 3);
+    const more = found.length > 3, n = names.length;
+    return text(`Skipped ${n} unsupported file${n === 1 ? "" : "s"}${kinds.length ? ` (${kinds.join(", ")}${more ? " and more" : ""})` : ""}`,
+        `已跳过 ${n} 个不支持的文件${kinds.length ? `（${kinds.join("、")}${more ? " 等" : ""}）` : ""}`);
 }
 
-const referenceHelp = () => text('When one input receives several images, each counts as one reference.', '一个接口接入多张图片时，每张各算一个参考素材。');
+const referenceHelp = () => text('Each reference image counts as one media item.', '每张参考图片各占一个素材名额。');
 // Input names stay English like every other node's; the panel's chips are translated.
 const referenceSocket = index => `Reference image ${index + 1}`;
 const referenceLabel = index => text(`Reference image ${index + 1}`, `参考图片 ${index + 1}`);
@@ -105,10 +136,13 @@ function mediaPanel(node, mount = null) {
     const mode = el("div", "", "fv-mode");
     const cards = el("div"), connections = el("div", undefined, "fv-connected");
     const picker = el("input"); picker.type = "file"; picker.multiple = true;
-    picker.accept = "image/*,video/*,audio/*"; picker.hidden = true;
+    picker.accept = acceptList(["image", "video", "audio"]); picker.hidden = true;
     const add = button(text("Upload files", "上传文件"), text("Upload images, video or audio", "上传图片、视频或音频"), () => picker.click());
+    const generateImage = button(text('Generate with AI', 'AI 生成'), text('Generate with AI', 'AI 生成'), () => newImage());
+    generateImage.prepend(document.createRange().createContextualFragment(icon('generate')));
+    generateImage.hidden = !imageGenerationSupported();
     const audioPicker = el('input'); audioPicker.type = 'file'; audioPicker.multiple = true;
-    audioPicker.accept = 'audio/*,.wav,.mp3,.flac,.ogg,.m4a,.aac,.opus'; audioPicker.hidden = true;
+    audioPicker.accept = acceptList(["audio"]); audioPicker.hidden = true;
     const addAudio = button(text('Reference audio', '参考音频'),
         text('Add a voice, music or rhythm reference (its first 15 seconds at most are used)', '添加音色、音乐或节奏参考（最多使用前 15 秒）'), () => audioPicker.click());
     const audioHelp = el('div', '', 'fv-note'); audioHelp.hidden = true;
@@ -117,7 +151,9 @@ function mediaPanel(node, mount = null) {
         const option = el("option", label); option.value = value; role.append(option);
     }
     role.value = 'reference';
-    toolbar.append(add, addAudio, role, picker, audioPicker); panel.append(toolbar, mode, note, audioHelp, connections, cards);
+    toolbar.append(add, generateImage, addAudio, role, picker, audioPicker); panel.append(toolbar, mode, note, audioHelp, connections, cards);
+    const cast = createCastLibrary({api, text, viewURL, uploadOne});
+    panel.prepend(cast.element);
     const read = () => {
         const rows = JSON.parse(serialized.value || "[]");
         if (!Array.isArray(rows) || rows.length > 32) throw new Error(text("Use at most 32 media items", "最多使用 32 个素材"));
@@ -140,10 +176,7 @@ function mediaPanel(node, mount = null) {
     };
     // One file into ComfyUI's input folder, through FreeVideo's streaming upload.
     async function uploadOne(file) {
-        const body = new FormData(); body.append('file', file);
-        const response = await api.fetchApi('/freevideo/media/upload', {method: 'POST', body});
-        const result = await response.json(); if (!response.ok) throw new Error(result.error || response.statusText);
-        return result;
+        return uploadMedia(api, file);
     }
     // An agent's edit leaves its editor document beside the picture: open that, so people continue its layers.
     async function agentEdit(file) {
@@ -168,7 +201,7 @@ function mediaPanel(node, mount = null) {
         try {
             outcome = await openImageEditor({source, name: source, target: videoSize(), edit: original.edit || agent?.edit || null, role: original.role,
                 t: text, resolve: viewURL, upload: uploadOne, library, tool});
-        } catch (error) { message(text('The image could not be opened for editing.', '这张图片无法打开编辑。'), true); return; }
+        } catch (error) { message(text('This image cannot be edited right now; choose an image again.', '图片暂时无法编辑，可重新选择图片。'), true); return; }
         if (!outcome) return;
         // The cards may have changed meanwhile; find this one again by its file.
         const rows = read(), at = rows.findIndex(row => row.file === file);
@@ -184,11 +217,31 @@ function mediaPanel(node, mount = null) {
             const result = await uploadOne(new File([outcome.blob], outcome.name, {type: outcome.blob.type}));
             const latest = read(), index = latest.findIndex(row => row.file === file);
             if (index < 0) return;
-            latest[index] = {...latest[index], file: result.file, source, edit: outcome.edit}; update(latest);
-            message(text(`Saved the edited image, ${outcome.width}×${outcome.height}. The original is kept.`,
-                `已保存编辑后的图片（${outcome.width}×${outcome.height}），原图保留。`));
+            const hasOriginal = outcome.edit.layers.some(layer => layer.id === 'base');
+            latest[index] = {...latest[index], file: result.file, ...(hasOriginal ? {source} : {}), edit: outcome.edit}; update(latest);
+            message(hasOriginal ? text('The edited image is saved, and the original is kept.',
+                '编辑后的图片已保存，原图已保留。') : '');
         } catch (error) { message(error.message, true); }
         finally { node.isUploading = false; add.disabled = false; addAudio.disabled = false; }
+    }
+    async function newImage() {
+        if (node.isUploading || read().length >= 32) return;
+        const library = read().filter(row => mediaKind(row.file) === 'image')
+            .map(row => ({file: row.file, label: (row.source || row.file).split('/').pop()}));
+        let outcome;
+        try {
+            outcome = await openImageEditor({target: videoSize(), role: role.value, t: text,
+                resolve: viewURL, upload: uploadOne, library});
+        } catch { message(text('This image cannot be edited right now; choose an image again.', '图片暂时无法编辑，可重新选择图片。'), true); return; }
+        if (!outcome?.blob || read().length >= 32) return;
+        node.isUploading = true; add.disabled = addAudio.disabled = generateImage.disabled = true;
+        try {
+            const result = await uploadOne(new File([outcome.blob], outcome.name, {type: outcome.blob.type}));
+            const latest = read();
+            latest.push({file: result.file, role: role.value, enabled: true, edit: outcome.edit});
+            update(latest);
+        } catch (error) { message(error.message, true); }
+        finally { node.isUploading = false; add.disabled = addAudio.disabled = generateImage.disabled = false; }
     }
     function restoreImage(file) {
         const rows = read(), at = rows.findIndex(row => row.file === file);
@@ -206,13 +259,19 @@ function mediaPanel(node, mount = null) {
         try { rows = read(); } catch (error) { message(error.message, true); return; }
         const active = rows.filter(row => row.enabled !== false);
         const linked = name => node.inputs?.find(i => i.name === name)?.link != null;
+        // A Generate node that continues a video takes these keyframes as pictures, so they may sit beside references.
+        const continuing = (node.outputs?.[0]?.links || []).some(id => {
+            const target = node.graph?.getNodeById(node.graph?.links[id]?.target_id);
+            return target?.type === 'FreeVideoGenerate' && (target.freevideoContinues?.()
+                || optionalInputValue('continue_from', target.widgets?.find(w => w.name === 'continue_from')?.value) !== '');
+        });
         const first = active.filter(row => row.role === "first").length + Number(linked('first'));
         const last = active.filter(row => row.role === "last").length + Number(linked('last'));
         const audioRefs = active.filter(row => row.role === 'reference' && mediaKind(row.file) === 'audio').length + Number(linked('reference_audio'));
         const refs = active.filter(row => row.role === "reference").length + referenceInputs.filter(linked).length + Number(linked('reference_audio'));
         audioHelp.hidden = !audioRefs;
-        audioHelp.textContent = text('Use <Audio 1>, <Audio 2>, … in your prompt to guide the generated voice, music or rhythm. A clip is cut to the generated length, up to 15 seconds. Set accompanying images to Reference.',
-            '在提示词中用 <Audio 1>、<Audio 2> 等标签引导生成的音色、音乐或节奏。片段只取与生成视频等长的部分，最长 15 秒；搭配的图片请选择“参考”用途。');
+        audioHelp.textContent = text('Use <Audio 1>, <Audio 2> in your prompt to guide voice, music or rhythm; up to the first 15 s is used. Set accompanying images to Reference.',
+            '在提示词里用 <Audio 1>、<Audio 2> 参考音色、音乐或节奏，最多取前 15 秒；搭配的图片选“参考”。');
         connections.replaceChildren();
         for (const [name, label] of [['first', text('First frame', '首帧')], ['last', text('Last frame', '尾帧')], ...referenceInputs.map((name, index) => [name, referenceLabel(index)]), ['reference_audio', text('Reference audio', '参考音频')]]) {
             if (!linked(name)) continue;
@@ -222,15 +281,15 @@ function mediaPanel(node, mount = null) {
             chip.title = source?.title || source?.type || label; connections.append(chip);
         }
         mode.textContent = refs ? text("Reference video · experimental", "参考生成 · 实验性") : first && last ? text("First + last frame", "首尾帧生成") : first ? text("Image to video", "图生视频") : last ? text("Last frame to video", "尾帧生成") : text("Text to video · media is optional", "文生视频 · 素材可留空");
-        message(refs > 32 ? text(`There are ${refs} references and the limit is 32. Remove some before generating.`, `参考素材有 ${refs} 个，超过了 32 个的上限，请减少后再生成。`) : refs && (first || last) ? text("Choose keyframes or references. Disable unused cards.", "首尾帧与参考模式不能混用，请关闭本次不用的素材。") : first > 1 || last > 1 ? text("Keep only one first frame and one last frame enabled.", "首帧和尾帧各只能启用一张图片。") : text("Connect IMAGE / AUDIO outputs on the left, or drop / paste files here.", "可连接左侧 IMAGE / AUDIO 输入，或拖入、粘贴文件。"), Boolean(refs > 32 || refs && (first || last) || first > 1 || last > 1));
+        message(refs > 32 ? text('There are more than 32 references; remove some before generating.', '参考素材超过 32 个，可移除部分后再生成。') : continuing && active.filter(row => row.role === 'reference' && mediaKind(row.file) === 'image').length > 3 ? text('When continuing, only the first 3 images are used.', '接续时只用前 3\u00a0张图片。') : (first || last) && continuing ? text("When continuing a video, the first and last frames are used as references.", "接续视频时，首尾帧会用作参考图。") : refs && (first || last) ? text("Choose keyframes or references. Disable unused cards.", "首尾帧与参考模式不能混用，请关闭本次不用的素材。") : first > 1 || last > 1 ? text("Keep only one first frame and one last frame enabled.", "首帧和尾帧各只能启用一张图片。") : text("Drop or paste files, or connect images and audio on the left.", "可拖入、粘贴文件，或连接左侧的图片和音频。"), Boolean(refs > 32 || refs && (first || last) && !continuing || first > 1 || last > 1));
         if (!rows.length && !connections.childElementCount) cards.append(el("div", text("Leave empty for text to video.", "留空则为文生视频。"), "fv-empty"));
-        if (!rows.length && connections.childElementCount) cards.append(el('div', text('Media will come from the connected nodes.\nNo upload is needed.', '素材由已连接的节点提供。\n无需上传文件。'), 'fv-connected-card'));
+        if (!rows.length && connections.childElementCount) cards.append(el('div', text('Media comes from the connected inputs; no upload is needed.', '素材来自已连接的输入，无需上传。'), 'fv-connected-card'));
         rows.forEach((row, index) => {
             const card = el("div", undefined, "fv-card"); card.dataset.enabled = String(row.enabled !== false);
             const top = el("div", undefined, "fv-row");
             const enabled = el("input"); enabled.type = "checkbox"; enabled.checked = row.enabled !== false;
             enabled.setAttribute("aria-label", text("Use media", "使用素材")); enabled.onchange = () => { rows[index].enabled = enabled.checked; update(rows); };
-            const label = el("span", (row.source || row.file).split("/").pop(), "fv-file"); label.title = row.file;
+            const label = el("span", row.cast?.name || (row.source || row.file).split("/").pop(), "fv-file"); label.title = row.file;
             const select = el("select"); select.setAttribute("aria-label", text("Media role", "素材用途"));
             const kind = mediaKind(row.file);
             for (const [value, title] of (kind === "image" ? [["reference", text("Reference", "参考")], ["first", text("First frame", "首帧")], ["last", text("Last frame", "尾帧")]] : [["reference", text("Reference", "参考")]])) {
@@ -259,8 +318,8 @@ function mediaPanel(node, mount = null) {
                         const off = Math.abs(Math.log((preview.naturalWidth / preview.naturalHeight) / (size.width / size.height))) > .02;
                         if (!off || !preview.isConnected) return;
                         const note = el("div", undefined, "fv-shape-note");
-                        note.append(el("span", text(`Its shape differs from the video (${size.width}×${size.height}); the edges are cropped when generating.`,
-                            `比例与视频（${size.width}×${size.height}）不同，生成时会居中裁掉多出的部分。`)),
+                        note.append(el("span", text('Different aspect ratio from the video; it will be center-cropped.',
+                            '和视频比例不同，会居中裁剪。')),
                             button(text("Adjust crop", "调整裁剪"), text("Choose what the video keeps", "选择视频保留的画面"), () => editImage(row.file, "crop")));
                         wrap.after(note);
                     }, {once: true});
@@ -269,15 +328,23 @@ function mediaPanel(node, mount = null) {
                 preview.controls = true; preview.preload = "metadata"; if (kind === "video") { preview.muted = true; preview.playsInline = true; }
                 card.append(preview);
             }
+            let showLength = () => {};
+            if (kind === "video") {
+                const sound = el("label", undefined, "fv-sound"); const box = el("input"); box.type = "checkbox"; box.checked = row.sound !== false;
+                box.onchange = () => { if (box.checked) delete rows[index].sound; else rows[index].sound = false; showLength(); update(rows); };
+                sound.append(box, el("span", text("Use the video's sound", "使用视频声音"))); card.append(sound);
+            }
             if (kind !== "image") {
                 // References are cut to the generated length (at most 15 s); say so before the run.
+                // A video used without its sound has no audio to cut.
                 const length = el("div", "", "fv-note"); length.hidden = true; card.append(length);
-                preview.onloadedmetadata = () => {
-                    if (!(preview.duration > 15.05) || !Number.isFinite(preview.duration)) return;
-                    length.textContent = text(`${preview.duration.toFixed(1)} s: cut to the generated length when used, at most the first 15 s`,
-                        `时长 ${preview.duration.toFixed(1)} 秒：生成时按视频时长截取前段，最多前 15 秒`);
-                    length.hidden = false;
+                showLength = () => {
+                    const long = preview.duration > 15.05 && Number.isFinite(preview.duration);
+                    length.hidden = !long || row.sound === false || rows[index]?.sound === false;
+                    if (long) length.textContent = text(`Audio length: ${preview.duration.toFixed(1)} s; uses up to the first 15 s within the video length.`,
+                        `音频长 ${preview.duration.toFixed(1)} 秒，最多取前 15 秒且不超过视频时长。`);
                 };
+                preview.onloadedmetadata = () => showLength();
             }
             const controls = el("div", undefined, "fv-row");
             const move = delta => { const target = index + delta; if (target < 0 || target >= rows.length) return; [rows[index], rows[target]] = [rows[target], rows[index]]; update(rows); };
@@ -293,19 +360,26 @@ function mediaPanel(node, mount = null) {
     let uploading = false;
     serialized.serializeValue = () => {
         if (node.isUploading) throw new Error(text("Wait for media uploads to finish before running", "请等待素材上传完成后再生成"));
-        return serialized.value;
+        // The run takes only what it uses (and which character a picture belongs to); the editing data of a picture stays in the workflow.
+        try { return JSON.stringify(read().map(({file, role, enabled, cast, sound}) => ({file, role, enabled, ...(sound === false && mediaKindOrNull(file) === 'video' ? {sound: false} : {}), ...(typeof cast?.id === 'string' && cast.id ? {cast: {id: cast.id}} : {})}))); } catch { return serialized.value; }
     };
     async function upload(files) {
         if (node.isUploading || !files.length) return;
+        const chosen = Array.from(files);
+        const usable = chosen.filter(file => mediaKindOrNull(file.name));
+        const skipped = chosen.filter(file => !mediaKindOrNull(file.name)).map(file => file.name);
         uploading = true; node.isUploading = true; add.disabled = true; addAudio.disabled = true;
         try {
-            for (const [index, file] of Array.from(files).entries()) {
-                const rows = read(); if (rows.length >= 32) throw new Error(text("Use at most 32 media items", "最多使用 32 个素材"));
+            for (const [index, file] of usable.entries()) {
+                if (read().length >= 32) throw new Error(text("Use at most 32 media items", "最多使用 32 个素材"));
                 const kind = mediaKind(file.name);
-                message(`${text("Uploading", "正在上传")} ${index + 1}/${files.length} · ${file.name}`);
+                message(`${text("Uploading", "正在上传")} ${index + 1}/${usable.length} · ${file.name}`);
                 const result = await uploadOne(file);
+                // Read again after the wait: another place may have changed the list meanwhile.
+                const rows = read(); if (rows.length >= 32) throw new Error(text("Use at most 32 media items", "最多使用 32 个素材"));
                 rows.push({file: result.file, role: kind === "image" ? role.value : "reference", enabled: true}); update(rows);
             }
+            if (skipped.length) message(skippedNote(skipped), !usable.length);
         } catch (error) { message(error.message, true); }
         finally { uploading = false; node.isUploading = false; add.disabled = false; addAudio.disabled = false; picker.value = ""; audioPicker.value = ''; }
     }
@@ -314,7 +388,7 @@ function mediaPanel(node, mount = null) {
     panel.ondragover = event => { event.preventDefault(); event.stopPropagation(); };
     panel.ondrop = event => { event.preventDefault(); event.stopPropagation(); upload(event.dataTransfer.files); };
     panel.onpaste = event => { if (event.clipboardData?.files.length) { event.preventDefault(); event.stopPropagation(); upload(event.clipboardData.files); } };
-    const dispose = () => window.removeEventListener('freevideo-media', changed);
+    const dispose = () => { window.removeEventListener('freevideo-media', changed); cast.destroy(); };
     if (mount) { mount.append(panel); render(); return dispose; }
     node.freevideoCreateMediaEditor = target => mediaPanel(node, target);
     node.addDOMWidget("freevideo_media", "freevideo_media", panel, {serialize: false, getMinHeight: () => 300, getMaxHeight: () => 520});
@@ -426,6 +500,7 @@ function resultPanel(node) {
         // before the public version added sampling-step widgets.
         const base = this.widgets?.find(w => w.name === 'base_steps');
         if (base && typeof base.value === 'boolean') base.value = 8;
+        cleanOptionalWidgets(this);
         // Workflows saved with the earlier 8 + 2 default move to the 8 + 3 default once.
         if (!args[0]?.properties?.freevideo_refine_v3) {
             const refine = this.widgets?.find(w => w.name === 'refine_steps');
@@ -442,13 +517,13 @@ function resultPanel(node) {
         const size = onGPU ? ` · ${(value.gpu_bytes_after / 2 ** 30).toFixed(1)} GiB` : '';
         const percent = ` · ${Math.min(100, Math.floor(100 * value.done_bytes / value.bytes))}%`;
         note.textContent = value.purpose === 'upscale'
-            ? (value.state === 'reading' ? text('Preparing the files the second pass reads', '正在预读二采要用的模型文件') + percent
-                : value.state === 'ready' ? text('Second-pass files warmed · no VRAM reserved', '二采要用的模型文件已预热 · 不占用显存') : '')
-            : value.state === 'loading' ? text('Preparing text encoder on GPU in background', '正在后台预加载文本编码器到 GPU') + size
-            : value.state === 'partial' ? text('Text encoder partially prepared on GPU', '文本编码器已部分预加载到 GPU') + size
-            : value.state === 'reading' ? text('Preparing encoder files', '正在预读编码器文件') + percent
-            : value.state === 'ready' ? (onGPU ? text('Text encoder ready on GPU', '文本编码器已在 GPU 就绪') + size
-                : text('Encoder files warmed · no VRAM reserved', '编码器文件已预热 · 不占用显存')) : '';
+            ? (value.state === 'reading' ? text('Preparing model files', '正在准备模型文件') + percent
+                : value.state === 'ready' ? text('Model files ready', '模型文件已就绪') : '')
+            : value.state === 'loading' ? text('Preparing the prompt model', '正在准备提示词模型') + size
+            : value.state === 'partial' ? text('Prompt model still preparing', '提示词模型仍在准备') + size
+            : value.state === 'reading' ? text('Preparing the prompt model', '正在准备提示词模型') + percent
+            : value.state === 'ready' ? (onGPU ? text('Prompt model ready', '提示词模型已就绪') + size
+                : text('Prompt model ready', '提示词模型已就绪')) : '';
         node.freevideoPrewarm = note.textContent;
         window.dispatchEvent(new CustomEvent('freevideo-prewarm', {detail: {node: node.id, label: note.textContent}}));
     };
@@ -463,7 +538,7 @@ function resultPanel(node) {
         stats.hidden = !!value.result_cache_hit;
         const number = (value, scale, unit) => Number.isFinite(value) && value >= 0 ? `${(value / scale).toFixed(1)} ${unit}` : "—";
         const unified = value.memory_model === 'unified';
-        for (const [label, shown] of [[text("Sampling", "采样"), number(value.sample_seconds, 1, "s")], [text("Request total", "请求总计"), number(value.request_seconds, 1, "s")], [unified ? text("Unified memory", "统一内存总量") : text("VRAM peak", "显存峰值"), number(unified ? value.unified_total_bytes : value.vram_peak_bytes, 2 ** 30, "GiB")], [unified ? text("Process RAM peak", "进程内存峰值") : text("RAM peak", "内存峰值"), number(value.ram_peak_bytes, 2 ** 30, "GiB")]]) {
+        for (const [label, shown] of [[text("Generation", "生成用时"), number(value.sample_seconds, 1, "s")], [text("Total time", "总用时"), number(value.request_seconds, 1, "s")], [unified ? text("Unified memory", "统一内存总量") : text("Peak VRAM", "最高显存"), number(unified ? value.unified_total_bytes : value.vram_peak_bytes, 2 ** 30, "GiB")], [unified ? text("Process peak RAM", "进程最高内存") : text("Peak RAM", "最高内存"), number(value.ram_peak_bytes, 2 ** 30, "GiB")]]) {
             const stat = el("div", undefined, "fv-stat"); stat.append(el("strong", shown), el("span", label)); stats.append(stat);
         }
         const links = el("div", undefined, "fv-links");
@@ -475,16 +550,12 @@ function resultPanel(node) {
             links.append(link);
         }
         links.append(shareButton(value, text));
-        links.append(el("span", value.result_cache_hit ? text("Reused previous result", "已复用上次结果") : value.conditioning_cache_hit ? text("Input cache reused", "已复用输入缓存") : text("Inputs encoded", "已编码输入"), "fv-mode"));
+        links.append(el("span", value.result_cache_hit ? text("Reused previous result", "已复用上次结果") : value.conditioning_cache_hit ? text("Previous inputs reused", "已使用上次的输入") : text("Inputs ready", "输入已准备好"), "fv-mode"));
         if (value.preview) {
-            const upscale = el('button', text('Run second pass', '继续二采')); upscale.type = 'button';
-            upscale.title = text('Continue from this preview: latent upscale, the second pass and a full-resolution decode.', '从这个预览接着跑：潜空间放大、二采，再以全分辨率解码。');
-            upscale.onclick = async () => {
-                upscale.disabled = true;
-                try { await node.freevideoUpscaleResult(value); upscale.textContent = text('Queued', '已加入队列'); }
-                catch (error) { upscale.disabled = false; node.freevideoShowFailure(error); }
-            };
-            links.append(upscale);
+            links.append(secondPassAction(text, async () => {
+                try { await node.freevideoUpscaleResult(value); }
+                catch (error) { node.freevideoShowFailure(error); throw error; }
+            }));
         }
         if (value.result_cache_hit) {
             const again = el('button', text('Regenerate', '重新生成')); again.type = 'button';
@@ -497,8 +568,10 @@ function resultPanel(node) {
         }
         panel.append(stats, links, progress.stall, progress.report);
         for (const row of value.reference_trims || []) panel.append(el("div", referenceTrimText(row, text), "fv-note fv-trim-note"));
-        if (value.low_memory && !value.result_cache_hit) resultNotes.push(el("div", text('This video used the low-memory mode for this GPU, so it took longer than usual. A lower resolution or a shorter video runs faster.', '这段视频使用了省显存方式，所以比平时慢。降低分辨率或缩短时长会更快。'), "fv-note"));
+        if (value.low_memory && !value.result_cache_hit) resultNotes.push(el("div", text('Generation was slow; try a lower resolution or shorter video.', '生成较慢，可降低分辨率或缩短时长后再试。'), "fv-note"));
         if (value.thermal && !value.result_cache_hit) resultNotes.push(el("div", thermalText(value.thermal, text), "fv-note"));
+        const shared = value.shared_gpu && !value.result_cache_hit ? sharedGpuText(value.shared_gpu, text) : '';
+        if (shared) resultNotes.push(el("div", shared, "fv-note"));
         if (value.encoder_file) {
             const note = el("div", encoderFileText(value.encoder_file, text), "fv-note");
             const path = encoderFilePath(value.encoder_file);
@@ -507,21 +580,13 @@ function resultPanel(node) {
         }
         panel.append(...resultNotes);
         warn();
-        panel.title = (unified
-            ? text("Unified memory: device capacity. Process RAM is not total GPU memory, ", "统一内存为设备总量；进程内存不代表 GPU 内存总占用，")
-            : text("VRAM: engine allocator peak. RAM: measured request processes, ", "显存为引擎分配器峰值，内存为请求进程实测，")) + (value.ram_metric || "unknown");
         fitPanel();
     };
-    node.freevideoUpscaleResult = async value => {
-        if (node.freevideoUpscaling) return;
-        node.freevideoUpscaling = true;
-        try { return await upscaleResult(api, node.id, value, () => app.graphToPrompt()); }
-        finally { node.freevideoUpscaling = false; }
-    };
+    node.freevideoUpscaleResult = createSecondPassQueue(api, () => node.id, async () => { enableNode(node); return cleanOptionalPrompt(await app.graphToPrompt()); });
     node.freevideoRegenerateResult = async value => {
         if (node.freevideoRegenerating) return;
         node.freevideoRegenerating = true;
-        try { return await regenerateResult(api, node.id, value, () => app.graphToPrompt()); }
+        try { return await regenerateResult(api, node.id, value, async () => { enableNode(node); return cleanOptionalPrompt(await app.graphToPrompt()); }); }
         finally { node.freevideoRegenerating = false; }
     };
     const executed = node.onExecuted;
@@ -533,6 +598,42 @@ function resultPanel(node) {
 }
 
 let configuringGraph = false;
+let configuration = 0;
+const watchedGraphs = new WeakSet();
+function captureWorkflow(graph) {
+    if (!graph || graph !== app.graph || promptHistoryRestoring(app)) return;
+    watchPromptHistory(api, app);
+    const tracker = app.extensionManager?.workflow?.activeWorkflow?.changeTracker;
+    // Current ComfyUI and older installations expose different names.
+    (tracker?.captureCanvasState || tracker?.checkState)?.call(tracker);
+}
+function trackCreationDraft(node) {
+    trackPromptDraft(node, () => captureWorkflow(node.graph), () => app.extensionManager?.workflow?.activeWorkflow?.path);
+}
+function watchCreationGraph(graph) {
+    if (!graph || watchedGraphs.has(graph)) return;
+    watchedGraphs.add(graph);
+    const changed = graph.on_change;
+    let queued = false;
+    graph.on_change = function (...args) {
+        const result = changed?.apply(this, args);
+        if (!configuringGraph && graph === app.graph && !queued) {
+            queued = true;
+            const revision = configuration;
+            queueMicrotask(() => {
+                queued = false;
+                if (configuringGraph || graph !== app.graph || revision !== configuration || promptHistoryRestoring(app)) return;
+                // graph.change() only redraws. Capture the finished edit, including
+                // properties and the asynchronous media/LoRA panel updates.
+                captureWorkflow(graph);
+                for (const node of graph._nodes || []) {
+                    if (node.comfyClass === 'FreeVideoGenerate' || node.type === 'FreeVideoGenerate') rememberPromptDraft(api, node);
+                }
+            });
+        }
+        return result;
+    };
+}
 function syncPrompts(reset = false) {
     if (configuringGraph && reset !== true) return;
     for (const node of app.graph?._nodes || []) if (node.type === 'FreeVideoGenerate') syncReferencePrompt(node, text, reset === true);
@@ -555,16 +656,53 @@ const progressConnection = createProgressConnection(api, message => {
     window.dispatchEvent(new CustomEvent('freevideo-progress', {detail: message}));
 });
 
+const isGenerate = node => node?.comfyClass === 'FreeVideoGenerate' || node?.type === 'FreeVideoGenerate';
+const isFreeVideoNode = id => /^FreeVideo/.test(String(app.graph?.getNodeById(id)?.comfyClass || app.graph?.getNodeById(id)?.type || ''));
+// Only the launcher, a click or a key brings a workspace over a page; a restored tab alone never does.
+const launchVisit = isLaunchVisit(globalThis.location?.search, globalThis.sessionStorage);
+let userActed = false;
+for (const type of ['pointerdown', 'keydown']) globalThis.addEventListener?.(type, () => { userActed = true; }, {capture: true, once: true});
+
+let menuFailure;
+async function openFromMenu() {
+    menuFailure?.close();
+    try {
+        const node = (app.graph?._nodes || []).find(isGenerate) || await openFreeVideoWorkflow();
+        if (!node) throw new Error('FreeVideo workflow unavailable');
+        showStudio(node);
+    } catch (error) {
+        console.warn('FreeVideo menu:', error);
+        const message = text('Could not complete. Try again.', '没有完成，请重试');
+        const dialog = el('dialog', undefined, 'fv-panel fv-menu-failure'); menuFailure = dialog;
+        dialog.setAttribute('aria-label', 'FreeVideo');
+        const actions = el('div', undefined, 'fv-row');
+        actions.append(issueButton(text, () => ({where: ['Open FreeVideo', '打开 FreeVideo'], message})),
+            button(text('Close', '关闭'), '', () => dialog.close()));
+        dialog.append(el('p', message), actions);
+        dialog.onclose = () => { dialog.remove(); if (menuFailure === dialog) menuFailure = null; };
+        document.body.append(dialog); dialog.showModal();
+    }
+}
+
+const desktopNoticeEnabled = () => (app.extensionManager?.setting?.get?.(DESKTOP_SETTING) ?? app.ui?.settings?.getSettingValue?.(DESKTOP_SETTING)) === true;
+
 app.registerExtension({
     name: "FreeVideo.UnifiedMedia",
-    beforeConfigureGraph() { configuringGraph = true; },
+    settings: [{id: DESKTOP_SETTING, name: text('Desktop notification when done', '完成时发桌面通知'),
+        type: 'boolean', defaultValue: false, onChange: value => { if (value) askDesktopPermission(); }}],
+    // The one entry that stays in ComfyUI's own menu, whatever workflow is in front.
+    commands: [{id: 'FreeVideo.Open', label: 'FreeVideo', function: openFromMenu}],
+    menuCommands: [{path: ['Extensions'], commands: ['FreeVideo.Open']}],
+    beforeConfigureGraph() { configuringGraph = true; configuration++; },
     async setup() {
         // One failing part must not take the others down; health.js shows what failed.
-        for (const [where, start] of [['progress', () => progressConnection.start()], ['navigation', () => installNavigation(showStudio)],
-            ['updates', startUpdateChecks]]) {
+        for (const [where, start] of [['progress', () => progressConnection.start()], ['navigation', () => installNavigation(showStudio, agentInterfaceEnabled(api), {openWorkflow: openFreeVideoWorkflow})],
+            ['updates', startUpdateChecks], ['done-notify', () => startDoneNotify({api, text, desktop: desktopNoticeEnabled, isFreeVideoNode})],
+            ['whitebox', () => startWhiteboxWorker({api})]]) {
             try { start(); } catch (error) { health({type: 'error', where, error}); }
         }
         window.addEventListener('pagehide', () => savePromptDraft(api, true));
+        void savePromptDraft(api); // Retry this tab's outbox after an interrupted save.
         window.FreeVideoUI = {...window.FreeVideoUI, ready: true};
         await notifyCompatibility();
     },
@@ -605,26 +743,56 @@ app.registerExtension({
                     force.type = 'hidden'; force.computeSize = () => [0, -4]; force.draw = () => {};
                     force.value = false; force.serializeValue = () => false;
                 }
+                // Characters mentioned with @ travel as <Subject N> plus their definitions; the draft keeps the typed names.
+                const prompt = this.widgets?.find(w => w.name === 'text');
+                if (prompt) { const owner = this; prompt.serializeValue = () => expandCast(prompt.value, mediaRows(owner), {continued: Boolean(owner.freevideoContinues?.())}).text; }
                 const quality = this.widgets?.find(w => w.name === 'two_pass');
                 if (quality) {
                     quality.label = text('Two-pass acceleration', '二次采样加速');
-                    quality.tooltip = text('Usually faster: generate at a lower resolution, then upscale and finish sampling at the target size.', '通常更快：先以低分辨率生成，再放大到目标分辨率完成采样，缩短生成时间。');
+                    quality.tooltip = text('Usually faster: generates at a lower resolution, then upscales and refines.', '通常更快：先用低分辨率生成，再放大细化。');
                 }
                 for (const [name, en, zh] of [['base_steps', 'First-pass steps', '一采步数'], ['refine_steps', 'Second-pass steps', '二采步数']]) {
                     const steps = this.widgets?.find(w => w.name === name);
                     if (steps) {
                         steps.label = text(en, zh);
-                        steps.tooltip = text('Changing sampling steps may reduce generation quality. Defaults: 8 + 3. Other second-pass counts must be fewer than first-pass steps.',
-                            '修改采样步数可能降低生成质量。默认一采 8 步、二采 3 步；其他二采步数需小于一采步数。');
+                        steps.tooltip = text('Changing sampling steps may lower generation quality. Default: 8 first-pass and 3 second-pass steps. Two-pass acceleration runs only with 8 first-pass steps. Other step counts use a single pass. Other second-pass counts must be fewer than first-pass steps.',
+                            '修改采样步数可能降低生成质量。默认一采 8 步、二采 3 步；只有一采为 8 步时才会使用二次采样加速，其他步数只采样一遍；其他二采步数需小于一采步数。');
                     }
                 }
-                const prompt = this.widgets?.find(w => w.name === 'text');
-                if (prompt) {
-                    // Every edit, in the creation panel or on the node, is the draft the launcher reopens.
-                    const node = this, callback = prompt.callback;
-                    prompt.callback = function (...args) { if (!configuringGraph) rememberPromptDraft(api, node); return callback?.apply(this, args); };
-                    prompt.inputEl?.addEventListener?.('input', () => rememberPromptDraft(api, node));
+                if (cn) {
+                    // Reuse product wording; leave untranslated names with no established Chinese copy.
+                    for (const [name, label, tooltip] of [
+                        ['width', '宽度'],
+                        ['height', '高度'],
+                        ['seconds', '时长（秒）'],
+                        ['seed', '种子'],
+                        ['force_regenerate', '重新生成', '跳过已保存结果的缓存。'],
+                        ['preview', '先出预览', '先出半分辨率预览，满意后在结果里点“继续二采”，成片与直接生成一致。'],
+                        ['refine_from', '继续二采', '从这个预览继续生成全分辨率视频。'],
+                        ['continue_from', '接着生成'],
+                        ['frames', '帧数'],
+                        ['first_frame_reference', '首帧参考', '减小漂移'],
+                        ['step_cache', '步间缓存', '复用相近采样步之间的计算，更快完成，结果会有细微变化。'],
+                        ['upscale_factor', '放大倍数', '二次采样时成片相对首遍的放大倍数。'],
+                    ]) {
+                        const widget = this.widgets?.find(w => w.name === name);
+                        if (widget) {
+                            widget.label = label;
+                            if (tooltip) widget.tooltip = tooltip;
+                        }
+                    }
                 }
+                for (const widget of this.widgets || []) {
+                    // Node and creation-panel edits use the same named draft.
+                    const node = this, callback = widget.callback;
+                    widget.callback = function (...args) {
+                        const result = callback?.apply(this, args);
+                        if (!configuringGraph) rememberPromptDraft(api, node);
+                        return result;
+                    };
+                    widget.inputEl?.addEventListener?.('input', () => { if (!configuringGraph) rememberPromptDraft(api, node); });
+                }
+                trackCreationDraft(this);
                 resultPanel(this);
                 this.addWidget('button', text('Open creative workspace', '打开创作面板'), null, () => showStudio(this), {serialize: false});
                 const removed = this.onRemoved;
@@ -637,19 +805,44 @@ app.registerExtension({
     afterConfigureGraph() {
         syncPrompts(true);
         configuringGraph = false;
+        for (const node of app.graph?._nodes || []) {
+            if (node.comfyClass !== 'FreeVideoGenerate' && node.type !== 'FreeVideoGenerate') continue;
+            trackCreationDraft(node);
+        }
+        watchCreationGraph(app.graph);
+        // The host activates the target workflow after afterConfigureGraph.
+        requestAnimationFrame(() => watchPromptHistory(api, app));
         progressConnection.reset();
         progressConnection.refresh();
         refreshNavigation();
         const rememberedView = preferredView();
-        if ((app.graph?.extra?.freevideo_studio || rememberedView === 'editor') && rememberedView !== 'nodes') {
-            const node = app.graph._nodes.find(n => n.comfyClass === 'FreeVideoGenerate' || n.type === 'FreeVideoGenerate');
-            if (node) requestAnimationFrame(() => {
-                const studio = showStudio(node);
-                if (studio && rememberedView === 'editor') {
-                    void openEditorView(node, {studio, onFailure: error => health({type: 'error', where: 'editor', error})});
+        const node = (app.graph?._nodes || []).find(isGenerate);
+        // The user's own workflow is shown as it is. A FreeVideo workflow opens its workspace once the
+        // launcher or the user asked for it, never on its own for a tab restored with the page. The startup
+        // cover follows this same decision and is always released here when the workspace will not open.
+        const opens = !!node && app.graph?.extra?.freevideo_studio && rememberedView !== 'nodes' && (launchVisit || userActed);
+        if (!opens) { finishWorkspaceRestore(); if (!node) collapseWorkspaces(); return; }
+        const opening = rememberedView === 'editor' ? beginWorkspaceRestore() : null, epoch = configuration;
+        requestAnimationFrame(async () => {
+            const launch = waitForLauncherRestore(); if (launch) await launch;
+            if (epoch !== configuration) return;
+            if (!opening) { showStudio(node); return; }
+            try {
+                const handle = await openEditorView(node, {isCurrent: () => epoch === configuration,
+                    onProjectLoaded: record => opening.setName(record.name),
+                    onFailure: error => health({type: 'error', where: 'editor', error})});
+                if (epoch !== configuration) return;
+                if (handle) { opening.cover(); await handle.ready; }
+                else {
+                    const studio = showStudio(node), status = studio?.querySelector?.('.fv-status');
+                    if (status) {
+                        const message = text('Could not complete. Try again.', '没有完成，请重试');
+                        status.dataset.error = 'true'; status.textContent = message;
+                        status.append(issueButton(text, () => ({where: ['Open editor', '打开剪辑'], message})));
+                    }
                 }
-            });
-        }
+            } finally { if (epoch === configuration) opening.finish(); }
+        });
     },
     onNodeOutputsUpdated(outputs) {
         for (const [id, output] of Object.entries(outputs)) {
@@ -665,11 +858,20 @@ api.addEventListener('executed', event => {
         node.freevideoShowResult({...output, freevideo_summary: [{...output.freevideo_summary[0], request_id: prompt_id}]});
     }
 });
+api.addEventListener('execution_start', () => {
+    // A workflow of the user's own is running: nothing of ours stays over it.
+    if (!(app.graph?._nodes || []).some(isGenerate)) collapseWorkspaces();
+});
 api.addEventListener('freevideo_prewarm', event => {
     const value = event.detail;
     if (value) app.graph?.getNodeById(value.node)?.freevideoShowPrewarm?.(value);
 });
 
+installTranslateGuard({chinese: cn});
+installNativeErrorGuard({api, app, describe: detail => {
+    const {advice} = adviceFor(createErrorReport(detail, {stage: 'execution', graph: app.graph}), text);
+    return [advice.title, advice.summary].filter(Boolean).join('\n');
+}});
 api.addEventListener('execution_error', event => {
     // An upstream loader/media node can stop FreeVideo before its own node is
     // entered. Retain that error even while the creative workspace is closed.

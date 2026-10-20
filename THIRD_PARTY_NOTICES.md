@@ -4,6 +4,7 @@ FreeVideo code uses [Apache-2.0](LICENSE). Its dependencies and models retain th
 
 | Component | License |
 | --- | --- |
+| [Three.js](https://threejs.org/) r160, © 2010–2023 three.js authors (bundled whitebox renderer) | [MIT](web/vendor/three/LICENSE) |
 | Qt, PySide6 and Shiboken6 | LGPL-3.0; [component notices](freevideo_engine/launcher/licenses/NOTICE.txt) |
 | PyInstaller bootloader | GPL-2.0 with the bootloader exception |
 | CPython / psutil | PSF / BSD-3-Clause |
@@ -13,6 +14,7 @@ FreeVideo code uses [Apache-2.0](LICENSE). Its dependencies and models retain th
 | [VDN-H3 and H3 model weights](https://huggingface.co/OpenVDN/vdn-minimax-h3-edge/blob/main/LICENSE) | MiniMax H3 Community License |
 | [MiniMax H3 latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) | [MIT](freevideo_engine/licenses/latent-upscaler-MIT.txt) |
 | [FreeToken](https://github.com/FlashML-org/FreeToken) prompt VLM operators, [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) optional weights | [Apache-2.0](freevideo_engine/licenses/FreeToken-Apache-2.0.txt) |
+| [Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) Turbo image generation models, including Qwen3-VL-8B and VAE (optional download; [notice](freevideo_engine/image_gen/licenses/NOTICE.txt) installed with the models), © 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved. | [Qwen RESEARCH LICENSE AGREEMENT](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/LICENSE) |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 1.13.8 speech runtime, built by FreeVideo without text-to-speech, ALSA and PortAudio (modified build; `__init__.py` edited; source snapshot 11afbd00 kept by FreeVideo; optional download for automatic subtitles, [build note](freevideo_engine/licenses/sherpa-onnx-build-NOTE.txt)). Includes statically linked kaldi-native-fbank, kaldi-decoder, kaldifst, OpenFst, simple-sentencepiece (Apache-2.0), KissFFT (BSD-3-Clause), pybind11 (BSD-3-Clause), nlohmann/json (MIT), hclust-cpp and Darts-clone (BSD-2-Clause), ThreadPool (Zlib). The Windows build also contains msvcp140.dll and msvcp140_1.dll (Microsoft Visual C++ 2022 runtime 14.44.35211, © Microsoft Corporation), unmodified and redistributed as permitted by Microsoft for its redistributable files. | Apache-2.0 |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) 1.28.2 (CPU), © Microsoft Corporation; its third-party notices are shipped inside the sherpa-onnx wheel | MIT |
 | [Eigen](https://gitlab.com/libeigen/eigen) 5.0.1, compiled into sherpa-onnx and ONNX Runtime; source: https://gitlab.com/libeigen/eigen/-/tree/5.0.1 | MPL-2.0 |

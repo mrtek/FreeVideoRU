@@ -170,6 +170,8 @@ def own_environment(root, value):
     runtime through that folder, as the environment it was started with did:
     what it starts with the inherited environment imports and loads from there.
     """
+    from .triton_compat import own_temporary_environment
+    own_temporary_environment(Path(plain(root)) / 'engine')
     from .execution_paths import execution_environment
     return execution_environment(environment(root, value))
 
@@ -240,7 +242,7 @@ def initialize(root, progress=lambda **kw: None):
 
 
 def connect(root, value, machine, progress=lambda **kw: None, cancelled=None, *, url='http://127.0.0.1:8188',
-            on_controller=None, previous=None):
+            on_controller=None, previous=None, lan_access=False, lan_port=None):
     """Use the existing ComfyUI connection/startup behavior without installing.
 
     previous: the controller of an earlier attempt, whose ComfyUI may still run.
@@ -252,10 +254,6 @@ def connect(root, value, machine, progress=lambda **kw: None, cancelled=None, *,
         # launcher source it was imported with backs one, as in any installation.
         deploy(comfy, machine['source'], machine['root'])
     controller = Controller(machine['source'], child_environment=lambda: environment(root, value))
-    if previous is not None and previous.owns_server():
-        # A ComfyUI this launcher started for an earlier attempt, e.g. one that
-        # came up without FreeVideo: connecting restarts it instead of asking to.
-        controller.server, controller.server_log = previous.server, previous.server_log
     controller.shortcut_root = Path(plain(root))
     if not machine['gpu_uuid'].startswith(('GPU-', 'MIG-')):
         raise ValueError('The CUDA device did not provide a valid GPU identity; rerun the GPU check.')
@@ -266,9 +264,17 @@ def connect(root, value, machine, progress=lambda **kw: None, cancelled=None, *,
         controller.cancelled = cancelled
         if cancelled.is_set():
             raise RuntimeError('Startup cancelled')
+    if previous is not None and previous.owns_server():
+        # A ComfyUI this launcher started for an earlier attempt, e.g. one that
+        # came up without FreeVideo: connecting restarts it instead of asking to.
+        controller.server, controller.server_log = previous.server, previous.server_log
+        if isinstance(previous, Controller):
+            for name in ('server_address', 'server_url', 'access_proxy', 'access_configuration', 'access_links', 'access_polled'):
+                setattr(controller, name, getattr(previous, name))
+            previous.server = previous.access_proxy = None
     controller.selection = dict(ready=True, root=plain(comfy), engine=machine['root'],
         source=machine['source'], python=machine['python'], url=url,
-        portable=False, separate=False)
+        portable=False, separate=False, lan_access=lan_access is True, lan_port=lan_port)
     controller.restore_terminal(machine['root'])
     if on_controller:
         on_controller(controller)

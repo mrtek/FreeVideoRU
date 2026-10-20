@@ -204,6 +204,15 @@ def spoken_lines(scene):
     return lines
 
 
+def split_source(text):
+    """Description, sound sections and spoken lines, using only the prompt's text."""
+    sound = re.search(r'(?m)^[ \t]*overall_soundscape[ \t]*:', text)
+    scene, soundscape = (text[:sound.start()], text[sound.start():]) if sound else (text, '')
+    tagged = re.findall(r'<(?:d|en|zh|ja|ko|cn)>\s*(.*?)\s*</(?:d|en|zh|ja|ko|cn)>', scene, re.S)
+    lines = [line for line in tagged if plain(line)] + spoken_lines(scene)
+    return scene, soundscape, list(dict.fromkeys(lines))
+
+
 def dialogue(text, scene):
     """Turn the user's spoken lines that came back quoted into H3 dialogue, verbatim.
 
@@ -402,3 +411,263 @@ def validate_answers(answers, value):
         if 'error' in answer and answer['error'] not in ('invalid_json', 'context_length'):
             raise ValueError('invalid_output')
     return answers
+
+
+# Long videos: one description per part --------------------------------------------------------------------
+# Every part of a long video is generated from its own text. Handing each part the whole description makes
+# the model play the story from the start again in every part: the opening pause, the first line and the
+# first action come back after each seam. Each part instead gets the shared look and sound plus only what
+# happens during its own seconds.
+#
+# The small local model only sorts the events: spoken lines become placeholders it places, and the shared
+# description, the sound sections and the words themselves are put back by code, so they cannot drift.
+SPLIT_MAX_PARTS = 8
+# Asking for no pause, or for everything in progress to keep going, makes the model keep talking past the
+# seam with invented words; the plain sentence keeps the picture going without that.
+CONTINUE = 'Continuing from the previous moment.'
+SPEAKER = re.compile(r'(?:\(S\d+(?:,S\d+)*\)\s*)?<d>(\[[A-Za-z]+\])?\s*([^<\n]{1,400}?)\s*</d>')
+
+
+def split_request(value):
+    if not isinstance(value, dict) or set(value) - {'text', 'seconds', 'mode', 'continued'}:
+        raise ValueError('invalid_request')
+    text, seconds = value.get('text'), value.get('seconds')
+    if type(value.get('continued', False)) is not bool:
+        raise ValueError('invalid_request')
+    if not isinstance(text, str) or not text.strip() or len(text) > 12000:
+        raise ValueError('invalid_prompt')
+    if (not isinstance(seconds, list) or not 2 <= len(seconds) <= SPLIT_MAX_PARTS or
+            any(type(s) not in (float, int) or not math.isfinite(s) or not 1 <= s <= 60 for s in seconds)):
+        raise ValueError('invalid_duration')
+    return dict(mode='split', text=text, seconds=[float(s) for s in seconds],
+                continued=value.get('continued', False))
+
+
+def speech_seconds(words):
+    """Rough speaking time: about 2.6 English words or 4.5 CJK characters a second."""
+    cjk = len(re.findall(r'[぀-ヿ㐀-鿿가-힯]', words))
+    return round(cjk / 4.5 + len(re.findall(r'[A-Za-z0-9À-ɏ]+', words)) / 2.6, 1)
+
+
+def part_source(text):
+    """(body, sound sections, lines): the description with each spoken line as [L1], [L2], ...
+
+    H3 prompts keep their sound sections apart; they describe the whole video and are repeated as written.
+    """
+    body, sound = text.strip(), ''
+    found = re.search(r'(?m)^overall_soundscape:', body)
+    if body.startswith('integrated_multimodal_description:') and found:
+        body, sound = body[:found.start()].strip(), body[found.start():].strip()
+        body = body[len('integrated_multimodal_description:'):].strip()
+        body = re.sub(r'^\[Shot 1\]\s*', '', body)
+    lines = []
+    def tagged(match):
+        lines.append(match.group(0))
+        return '[L%d]' % len(lines)
+    body = SPEAKER.sub(tagged, body)
+    spoken = set(spoken_lines(body))
+    def quoted(match):
+        words = next(group for group in match.groups() if group is not None).strip()
+        if words not in spoken:
+            return match.group(0)
+        lines.append(match.group(0))
+        return '[L%d]' % len(lines)
+    if spoken:
+        body = QUOTED.sub(quoted, body)
+    numbers = [int(n) for n in re.findall(r'\[L(\d+)\]', body)]
+    if numbers != list(range(1, len(lines) + 1)):
+        raise ValueError('invalid_prompt')
+    return body, sound, lines
+
+
+def split_instruction(value):
+    count = len(value['seconds'])
+    rows, start = [], 0.
+    for i, length in enumerate(value['seconds'], 1):
+        rows.append(f'Part {i}: {start:.0f}-{start + length:.0f} s')
+        start += length
+    opening = 'continues an earlier video' if value.get('continued') else 'is the opening'
+    return f"""A long video is made of {count} parts generated one after another; each part continues where the
+previous one ended. Sort the user's description into what stays the same and what happens in each part:
+{chr(10).join(rows)}
+Shared: who is in the scene and how they look, the place, the lighting, the camera, the style and the
+background sound. Copy these words from the description. Leave out every action, event, change, every [L]
+marker and all talking: how someone speaks belongs next to their marker.
+Part N: only what happens during that part, in the order of the description, so each action happens
+once. Part 1 {opening}; each later part picks up where the previous part ended. When the story is
+shorter than the video, the later parts go on with small, calm, silent actions instead of repeating it.
+The markers [L1], [L2], ... stand for spoken lines; their speaking time is given. Put each marker in
+exactly one part, in order, where it is said, as "he says [L2]" or "她说 [L2]"; spread them so each
+part's speech fits its seconds. Do not write any other speech: nobody talks, keeps talking or goes
+on speaking except at a marker.
+Example for a 2-part video. Description: A girl in a yellow raincoat stands on a wooden pier at dawn,
+filmed in a wide shot, gulls crying. She waves and shouts [L1], runs to the end of the pier and jumps
+into the sea. Speaking time: [L1] 2 s
+Shared: A girl in a yellow raincoat on a wooden pier at dawn, filmed in a wide shot, gulls crying.
+Part 1: She waves and shouts [L1], then starts running along the pier.
+Part 2: She reaches the end of the pier and jumps into the sea.
+Write in the language of the description. Answer with exactly these lines and nothing else:
+Shared: ...
+{chr(10).join(f'Part {i}: ...' for i in range(1, count + 1))}"""
+
+
+def split_user_text(value):
+    body, _, lines = part_source(value['text'])
+    text = f'Description of the whole {sum(value["seconds"]):.0f}-second video:\n{body}'
+    if lines:
+        text += '\n\nSpeaking time: ' + ', '.join('[L%d] %.0f s' % (i, max(1, speech_seconds(line)))
+                                                 for i, line in enumerate(lines, 1))
+    return text
+
+
+def split_answer(text, count):
+    if not isinstance(text, str):
+        raise ValueError('invalid_output')
+    text = text.strip().strip('`').strip()
+    found = list(re.finditer(r'(?m)^[ \t*#]*(Shared|Part[ \t]+(\d+))[ \t*]*[:：]', text))
+    names = [m.group(2) or 'shared' for m in found]
+    if names != ['shared'] + [str(i) for i in range(1, count + 1)] or text[:found[0].start()].strip(' \t\n*#'):
+        raise ValueError('invalid_output')
+    ends = [m.start() for m in found[1:]] + [len(text)]
+    values = [' '.join(text[m.end():end].split()).strip('* ') for m, end in zip(found, ends)]
+    return values[0], values[1:]
+
+
+def place_lines(body, lines, seconds):
+    """Spoken lines to parts, in order, when the model did not place them.
+
+    A line starts halfway between where an even spread of the speech puts it and where it stands in the
+    story between the first and the last line; a line that would run into the next part starts early enough to fit.
+    """
+    total, lengths = sum(seconds), [max(1., speech_seconds(line)) for line in lines]
+    ends = [sum(seconds[:i + 1]) for i in range(len(seconds))]
+    gap = max(0., total - sum(lengths)) / len(lines)
+    first = body.index('[L1]')
+    span = max(1, body.index('[L%d]' % len(lines)) - first)  # Scenery after the last line is not story time.
+    placed, clock = [], 0.
+    for index, length in enumerate(lengths):
+        even = sum(lengths[:index]) + index * gap
+        story = (body.index('[L%d]' % (index + 1)) - first) / span * total
+        start = max(clock, min((even + story) / 2, total - sum(lengths[index:])))
+        part = next((n for n, end in enumerate(ends) if start < end), len(ends) - 1)
+        opening = ends[part - 1] if part else 0.
+        if start + length > ends[part] and part < len(ends) - 1:
+            if ends[part] - length >= max(clock, opening):
+                start = ends[part] - length
+            elif start - opening > seconds[part] / 2:  # A long line starting early in a part stays there.
+                part, start = part + 1, max(start, ends[part])
+        placed.append(part)
+        clock = start + length
+    return placed
+
+
+def spoken(line, words):
+    """A line put back by code: H3 lines carry their own speaker tag; plain quotes need a speech verb."""
+    if '<d>' in line:
+        return line
+    return ('说：' if language(words) in ('Chinese', 'Japanese') else 'says: ') + line
+
+
+def validate_split(text, value, *, strict=False):
+    """Part texts built from the model's sorting; every spoken line kept once, in order.
+
+    A part with nothing new carries on from the previous one; a misplaced line is placed by speaking time.
+    Only an answer without the expected layout or a usable shared description fails; strict also
+    fails when the model did not place every line once and in order, so it can be asked again.
+    """
+    body, sound, lines = part_source(value['text'])
+    shared, events = split_answer(text, len(value['seconds']))
+    shared = ' '.join(re.sub(r'\[L\d+\]', '', shared).split())
+    if not 20 <= len(shared) <= 4000:
+        raise ValueError('invalid_output')
+    seen, cleaned = {plain(shared), plain(body)}, []
+    for event in events:
+        key = plain(re.sub(r'\[L\d+\]', '', event))
+        if len(event) > 4000 or not key or key in seen or key in plain(shared):
+            key = ''
+        seen.add(key)
+        cleaned.append(event if key else ' '.join(re.findall(r'\[L\d+\]', event)))
+    events = cleaned
+    placed = [int(n) for event in events for n in re.findall(r'\[L(\d+)\]', event)]
+    if placed != list(range(1, len(lines) + 1)) and strict:
+        raise ValueError('invalid_output')
+    if placed != list(range(1, len(lines) + 1)):
+        # The model lost or reordered a line: keep its events, place the lines by time.
+        events = [' '.join(re.sub(r'\s*\[L\d+\]\s*[:：,，]?', ' ', event).split()).rstrip(':：,，') for event in events]
+        for number, part in enumerate(place_lines(body, lines, value['seconds']), 1):
+            events[part] = (events[part] + ' [P%d]' % number).strip()
+    def restore(words):
+        # [L] stands where the model put a line in its own words; [P] where code placed it.
+        return re.sub(r'\[([LP])(\d+)\]', lambda m: (lines[int(m.group(2)) - 1] if m.group(1) == 'L'
+                                                      else spoken(lines[int(m.group(2)) - 1], shared)), words)
+    parts = []
+    for index, event in enumerate(events):
+        if index == 0 and not re.sub(r'\[[LP]\d+\]', '', event).strip():
+            # Nothing sorted into the opening: it is the user's own description, without later lines.
+            mine = set(re.findall(r'\[[LP](\d+)\]', event))
+            words = re.sub(r'\[L(\d+)\]', lambda m: m.group(0) if m.group(1) in mine else '', body)
+            words = restore(' '.join(words.split()))
+        else:
+            words = ' '.join(([CONTINUE] if index or value.get('continued') else []) + [shared] +
+                             ([restore(event)] if event else []))
+        if sound:
+            words = 'integrated_multimodal_description: [Shot 1] ' + words + '\n\n' + sound
+        parts.append(words)
+    return parts
+
+
+SOUND_SECTIONS = re.compile(r'\n\n(?:overall_soundscape|non_diegetic_music):')
+SENTENCE_END = '.。!！?？'
+
+
+def own_words(texts):
+    """Where each split part's own events stand in its text: [start, end] in UTF-16 units, or None.
+
+    The continuation sentence, the shared description, subject definitions, LoRA trigger words and sound
+    sections are put there by code and are the same in every part; the page shows and edits only the rest.
+    The shared description is what the parts start with in common, up to a sentence end before a space.
+    """
+    starts, ends = [], []
+    for text in texts:
+        found = SOUND_SECTIONS.search(text)
+        ends.append(found.start() if found else len(text))
+        at = text.find(CONTINUE + ' ')
+        starts.append(at + len(CONTINUE) + 1 if at >= 0 else None)
+    # The opening part has no continuation sentence; what stands before it elsewhere comes first there too.
+    lead = next((texts[i][:at - len(CONTINUE) - 1] for i, at in enumerate(starts) if at is not None), None)
+    if lead is not None and starts and starts[0] is None and texts[0].startswith(lead):
+        starts[0] = len(lead)
+    known = [texts[i][at:ends[i]] for i, at in enumerate(starts) if at is not None and at <= ends[i]]
+    if len(known) < 2:
+        return [None] * len(texts)
+    common = known[0]
+    for words in known[1:]:
+        common = common[:next((i for i, (a, b) in enumerate(zip(common, words)) if a != b), min(len(common), len(words)))]
+    shared = next((k for k in range(len(common), 19, -1) if common[k - 1] in SENTENCE_END
+                   and all(len(words) == k or words[k] == ' ' for words in known)), None)
+    if shared is None:
+        return [None] * len(texts)
+    def units(text, index):
+        return len(text[:index].encode('utf-16-le')) // 2
+    spans = []
+    for text, at, end in zip(texts, starts, ends):
+        if at is None or at > end or not text[at:end].startswith(common[:shared]):
+            spans.append(None)
+            continue
+        begin = at + shared + 1
+        # A part with nothing of its own shows the shared description it repeats.
+        spans.append([units(text, at), units(text, end)] if begin >= end
+                     else [units(text, begin), units(text, end)])
+    return spans
+
+
+def validate_parts(parts, value):
+    """Worker output shape for a split job: one non-empty text per part."""
+    if (not isinstance(parts, list) or len(parts) != len(value['seconds'])
+            or any(not isinstance(part, str) or not 40 <= len(part) <= 20000 for part in parts)):
+        raise ValueError('invalid_output')
+    return parts
+
+
+SPLIT_RETRY = ('Answer again with exactly one "Shared:" line and the "Part N:" lines, every [L] marker exactly once '
+               'and in order, and no marker in Shared.')

@@ -1,5 +1,5 @@
 /* Share the studio shell and header geometry; only the editor rows differ. */
-.fv-studio.fv-editor{display:grid;grid-template-columns:264px minmax(0,1fr);grid-template-rows:auto minmax(272px,1fr) 40px var(--fv-ed-generation-row,56px) 40px minmax(var(--fv-ed-tracks-min,174px),clamp(174px,calc(100dvh - 704px),236px));animation:none}
+.fv-studio.fv-editor{--fv-ed-generation-row:max-content;display:grid;grid-template-columns:264px minmax(0,1fr);grid-template-rows:auto minmax(max(96px,calc(272px - var(--fv-ed-description-growth,0px))),1fr) 40px var(--fv-ed-generation-row,56px) 40px minmax(var(--fv-ed-tracks-min,174px),clamp(174px,calc(100dvh - 704px),236px));animation:none}
 .fv-studio.fv-editor[data-generation-ready=false]{--fv-ed-generation-row:0px}
 @media(min-width:1280px){.fv-studio.fv-editor[data-adjust-available=true]{grid-template-columns:264px minmax(0,1fr) 264px}}
 .fv-editor *{box-sizing:border-box}
@@ -19,6 +19,8 @@
 .fv-editor .fv-ed-icon{height:32px;width:32px;min-height:32px;flex:none;padding:0;font-size:22px;background:transparent;border-color:transparent}
 .fv-ed-glyph{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}.fv-ed-name>span{overflow:hidden;text-overflow:ellipsis}
 .fv-ed-export-box{height:100%;display:flex;gap:12px;align-items:center;min-width:0}
+.fv-editor .fv-ed-export-box>.fv-ed-export-main{height:32px;min-height:32px;padding:0 16px;border:0;border-radius:8px;background:var(--fv-accent,#6db8fa);color:#0f1722;font-weight:600}
+.fv-editor .fv-ed-export-box>.fv-ed-export-main:hover{background:var(--fv-accent-hover,#91cbff);color:#0f1722}
 .fv-ed-export-hint{max-height:100%;overflow:auto;font-size:12px;color:var(--fv-muted)}
 .fv-ed-save-warning{max-height:100%;overflow:auto;font-size:12px;color:var(--fv-danger);min-width:0}.fv-ed-save-warning:not([hidden])+.fv-ed-export-hint{display:none}
 .fv-editor .fv-ed-library{grid-column:1;grid-row:2/4;border-right:1px solid var(--fv-border);padding:12px;overflow:auto;min-height:0;scrollbar-width:thin;scrollbar-color:var(--fv-border) transparent}
@@ -42,6 +44,7 @@
 .fv-ed-audio-icon{font-size:26px;color:var(--fv-muted)}
 .fv-editor .fv-ed-import{width:100%;height:auto;aspect-ratio:16/9;border:1px dashed var(--fv-border);border-radius:6px;background:transparent;color:var(--fv-muted);padding:0}
 .fv-ed-library-message{font-size:12px;color:var(--fv-muted);line-height:1.6}
+.fv-ed-source-card .fv-issue-button{font-size:11px;min-height:28px;max-width:100%}
 .fv-editor .fv-ed-preview{grid-column:2;grid-row:2;min-width:0;min-height:0;display:grid;place-items:center;padding:16px;overflow:hidden;background:var(--fv-bg);container-type:size}
 .fv-ed-picture{position:relative;width:min(100cqw,calc(100cqh * var(--fv-ed-width,16) / var(--fv-ed-height,9)));aspect-ratio:var(--fv-ed-width,16)/var(--fv-ed-height,9);background:#000;border-radius:8px;overflow:hidden}
 .fv-ed-picture[data-empty=true]{background:var(--fv-card);border:1px dashed color-mix(in srgb,var(--fv-ink) 28%,transparent)}
@@ -60,10 +63,32 @@
 .fv-ed-transport{grid-column:2;grid-row:3;display:flex;align-items:center;justify-content:center;gap:12px}
 .fv-editor .fv-ed-play{width:36px;height:36px;border-radius:50%;padding:0;background:transparent}
 .fv-ed-time{font-size:13px;font-variant-numeric:tabular-nums;font-family:ui-monospace,monospace;min-width:100px}
-.fv-ed-genbar{grid-column:1/-1;grid-row:4;display:flex;align-items:center;gap:12px;padding:0 16px;border-top:1px solid var(--fv-border);border-bottom:1px solid var(--fv-border);background:var(--fv-card);min-width:0}
+.fv-ed-genbar{grid-column:1/-1;grid-row:4;display:flex;align-items:center;gap:12px;min-height:56px;padding:9px 16px;border-top:1px solid var(--fv-border);border-bottom:1px solid var(--fv-border);background:var(--fv-card);min-width:0}
 .fv-ed-genbar .fv-ed-description{width:auto}
 .fv-ed-clip[data-state=running] .fv-block-progress.fv-ed-block-progress{display:grid}
-.fv-ed-gen-hint{font-size:13px;color:var(--fv-muted);flex:1;min-width:0}
+.fv-ed-gen-hint{display:flex;font-size:13px;color:var(--fv-muted);flex:1;min-width:0;overflow:hidden;white-space:pre}
+.fv-ed-gen-part{flex:none}
+.fv-ed-gen-stage,.fv-ed-gen-time{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.fv-ed-gen-stage{flex:0 1000 auto}
+.fv-ed-gen-time{flex:none;max-width:100%}
+.fv-ed-genbar[data-mode=selected] .fv-ed-gen-hint{flex:none}
+.fv-ed-genbar[data-mode=running] .fv-ed-gen-hint{order:1;flex:none}
+.fv-ed-genbar[data-mode=running]>button:not(.fv-ed-generate){order:2}
+.fv-ed-gen-note{font-size:13px;color:var(--fv-ink);flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fv-ed-gen-note[hidden]{display:none}
+.fv-ed-gen-note:has(.fv-issue-button){white-space:normal;overflow:visible}
+.fv-ed-gen-note .fv-issue-button,.fv-ed-library-message .fv-issue-button{margin-left:8px}
+.fv-ed-genbar .fv-request-assets{order:-2;flex:1 1 100%;min-width:0;font-size:12px;line-height:1.5}
+.fv-ed-genbar .fv-request-assets[hidden]{display:none}
+.fv-editor:has(.fv-ed-gen-failure:not([hidden])){--fv-ed-generation-row:max-content}
+.fv-ed-genbar:has(.fv-ed-gen-failure:not([hidden])){flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+.fv-editor .fv-ed-gen-failure{display:block;flex:1 0 100%;min-width:0}
+.fv-ed-failure-actions{justify-content:flex-start;width:100%}
+.fv-ed-failure-reason{flex:1 1 220px;min-width:0;color:var(--fv-warning);overflow-wrap:anywhere}
+/* While the failed block's card is open it already says this; the line keeps its place so the timeline does not move. */
+.fv-editor:has(.fv-ed-clip-popover:not([hidden])) .fv-ed-gen-failure .fv-ed-failure-actions{visibility:hidden}
+.fv-ed-gen-failure .fv-report-tip{width:100%}
+.fv-ed-basic-progress[data-state=waiting] .fv-ed-basic-percent{font-weight:500;color:var(--fv-muted)}
 .fv-ed-description{flex:1;width:0}
 .fv-ed-first-frame{display:flex;align-items:center;gap:8px;flex:none;font-size:13px;white-space:nowrap}
 .fv-ed-first-frame[hidden]{display:none}
@@ -73,6 +98,32 @@
 .fv-ed-first-frame input:checked::before{transform:translateX(10px)}
 .fv-ed-first-frame:has(input:disabled){opacity:.4}
 .fv-ed-description:disabled{opacity:.4}
+.fv-ed-genbar{position:relative}
+.fv-ed-refs{display:flex;align-items:center;gap:6px;flex:none}
+.fv-ed-refs[hidden],.fv-ed-ref-menu[hidden]{display:none}
+.fv-ed-ref-notice{position:absolute;bottom:calc(100% + 8px);max-width:min(560px,calc(100% - 24px));border:1px solid var(--fv-border);background:var(--fv-card);padding:10px 14px;border-radius:8px;z-index:9;color:var(--fv-ink);pointer-events:none}
+.fv-ed-ref-notice[hidden]{display:none}
+.fv-ed-ref-notice .fv-issue-button{pointer-events:auto;margin-left:8px}
+.fv-ed-ref-chips{display:flex;align-items:center;gap:6px;max-width:min(240px,32vw);overflow-x:auto;scrollbar-width:thin;scrollbar-color:var(--fv-border) transparent;padding:1px}
+.fv-ed-ref-chips:empty{display:none}
+/* A strip that scrolls fades at the hidden end(s); one that fits is untouched. */
+@property --fv-ref-fade-start{syntax:'<length>';inherits:false;initial-value:0px}
+@property --fv-ref-fade-end{syntax:'<length>';inherits:false;initial-value:0px}
+@keyframes fv-ref-fade{from{--fv-ref-fade-start:0px;--fv-ref-fade-end:16px}1%,99%{--fv-ref-fade-start:16px;--fv-ref-fade-end:16px}to{--fv-ref-fade-start:16px;--fv-ref-fade-end:0px}}
+@supports (animation-timeline:scroll()){.fv-ed-ref-chips{animation:fv-ref-fade linear both;animation-timeline:scroll(self inline);mask-image:linear-gradient(90deg,transparent,#000 var(--fv-ref-fade-start),#000 calc(100% - var(--fv-ref-fade-end)),transparent)}}
+.fv-ed-ref-add,.fv-ed-ref-chip{flex:none;width:30px;height:30px;padding:0;border:1px solid var(--fv-border);border-radius:8px;background:transparent;color:var(--fv-muted);font:16px/1 var(--fv-font);cursor:pointer;overflow:hidden;position:relative}
+.fv-ed-ref-chip{border-color:transparent;background:var(--fv-bg)}
+.fv-ed-ref-add:not(:disabled):not([aria-disabled=true]):hover,.fv-ed-ref-add[aria-expanded=true],.fv-ed-ref-chip:not(:disabled):not([aria-disabled=true]):hover{border-color:var(--fv-accent);color:var(--fv-ink)}
+.fv-ed-ref-add:disabled,.fv-ed-ref-chip:disabled,.fv-ed-ref-add[aria-disabled=true],.fv-ed-ref-chip[aria-disabled=true]{opacity:.4;cursor:default}
+.fv-ed-ref-thumb{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--fv-muted)}
+.fv-ed-ref-thumb img{display:block;width:100%;height:100%;object-fit:cover}
+.fv-ed-ref-menu{position:absolute;bottom:calc(100% - 4px);min-width:180px;max-width:260px;padding:6px;background:var(--fv-card);border:1px solid var(--fv-border);border-radius:8px;z-index:12;display:flex;flex-direction:column;font:13px var(--fv-font)}
+.fv-ed-ref-menu>button{display:block;width:100%;height:32px;padding:0 10px;border:0;border-radius:4px;background:transparent;color:var(--fv-ink);font:inherit;text-align:left;cursor:pointer}
+.fv-ed-ref-menu>button:hover,.fv-ed-ref-menu button:focus-visible{background:color-mix(in srgb,var(--fv-accent) 12%,transparent);outline:1px solid var(--fv-accent);outline-offset:-1px}
+.fv-ed-ref-menu>button[aria-checked=true]::after{content:'✓';float:right;color:var(--fv-accent)}
+.fv-ed-ref-menu [role=separator]{flex:none;height:1px;margin:5px 4px;background:var(--fv-border)}
+.fv-ed-ref-spare{display:flex;flex-wrap:wrap;gap:6px;padding:2px 4px}
+.fv-ed-ref-spare button{position:relative;width:44px;height:44px;padding:0;border:1px solid var(--fv-border);border-radius:6px;background:var(--fv-bg);overflow:hidden;cursor:pointer}
 .fv-editor .fv-ed-gen-target{height:36px;align-items:center}
 .fv-editor .fv-ed-gen-target button{height:30px;box-shadow:none}
 .fv-editor .fv-ed-genbar>button{flex:none}
@@ -96,6 +147,19 @@
 .fv-ed-toolbar>.fv-ed-zoom{margin-left:auto;flex:none}
 .fv-ed-toolbar .fv-ed-track-zoom{position:static;height:32px}
 .fv-ed-toolbar .fv-ed-zoom-slider{width:64px}
+.fv-editor .fv-ed-toolbar .fv-ed-more{flex:none;margin-left:auto}
+.fv-ed-more svg{width:16px;height:16px;fill:currentColor}
+.fv-ed-more-panel{position:absolute;top:calc(100% - 2px);right:8px;min-width:180px;max-height:min(320px,60dvh);overflow-y:auto;padding:6px;background:var(--fv-card);border:1px solid var(--fv-border);border-radius:8px;display:flex;flex-direction:column;z-index:9}
+.fv-ed-more-panel[hidden]{display:none}
+.fv-ed-more-panel .fv-ed-text-buttons{display:contents}
+.fv-editor .fv-ed-toolbar .fv-ed-more-panel button{flex:none;width:100%;height:32px;justify-content:flex-start;gap:10px;padding:0 10px;margin:0;color:var(--fv-ink);text-align:left;white-space:nowrap}
+.fv-ed-more-panel[data-up=true]{top:auto;bottom:calc(100% - 2px)}
+.fv-editor .fv-ed-toolbar .fv-ed-more-panel button[data-more-icon]>span{display:none}
+.fv-ed-more-panel button::after{content:attr(data-more-label)}
+/* A switch that is on shows it in its icon; the row tint stays for hover and focus. */
+.fv-editor .fv-ed-toolbar .fv-ed-more-panel button[aria-pressed=true]{color:var(--fv-ink);background:transparent}
+.fv-editor .fv-ed-toolbar .fv-ed-more-panel button[aria-pressed=true] svg{color:var(--fv-accent)}
+.fv-editor .fv-ed-toolbar .fv-ed-more-panel button:not(:disabled):hover,.fv-editor .fv-ed-toolbar .fv-ed-more-panel button:focus-visible{background:color-mix(in srgb,var(--fv-accent) 12%,transparent)}
 /* The tracks' basic fallback rises from the bottom; Blake supplies the waves. */
 .fv-editor .fv-ed-progress-fill{width:100%;height:calc(var(--fv-ed-progress)*100%);inset:auto 0 0}
 .fv-ed-drawer-toggle{display:none!important}
@@ -106,15 +170,19 @@
 .fv-editor .fv-ed-name-menu button:disabled{opacity:.4;cursor:not-allowed}
 .fv-ed-name-menu [role=separator]{flex:none;height:1px;margin:5px 4px;background:var(--fv-border)}
 .fv-ed-rename{width:100%;margin-bottom:4px}
+.fv-editor .fv-ed-name-menu .fv-ed-delete-confirm{color:var(--fv-danger)}
+.fv-editor .fv-ed-name-menu .fv-ed-delete-confirm:not(:disabled):is(:hover,:focus-visible){background:var(--fv-danger-subtle)}
+.fv-ed-delete-question{margin:6px 10px 10px;line-height:1.5;overflow-wrap:anywhere;white-space:normal}
 .fv-ed-notice{position:absolute;bottom:340px;right:16px;max-width:min(560px,calc(100vw - 32px));border:1px solid var(--fv-border);background:var(--fv-card);padding:10px 14px;border-radius:8px;z-index:9;color:var(--fv-ink)}
+.fv-ed-notice .fv-issue-button{margin-left:12px;vertical-align:middle;pointer-events:auto}
 @media(max-width:680px){
- .fv-studio.fv-editor{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(180px,1fr) 40px var(--fv-ed-generation-row,auto) 40px 236px;overflow:hidden}
+ .fv-studio.fv-editor{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(max(0px,calc(180px - var(--fv-ed-description-growth,0px))),1fr) 40px var(--fv-ed-generation-row,auto) 40px 236px;overflow:hidden}
  .fv-editor .fv-header{overflow-x:auto}
  .fv-editor .fv-ed-name{font-size:13px;max-width:112px;flex:1;padding:0 2px}
  .fv-editor .fv-ed-icon{width:28px;flex:none;font-size:20px}
  .fv-ed-export-box{gap:4px}
  .fv-ed-export-hint{display:none}
- .fv-editor .fv-ed-export-box>button{padding:0 8px;font-size:12px}
+ .fv-editor .fv-ed-export-box>button,.fv-editor .fv-ed-export-box>.fv-ed-export-main{padding:0 8px;font-size:12px}
  .fv-editor .fv-ed-drawer-toggle{display:inline-flex!important}
  .fv-editor .fv-ed-library{display:none;position:absolute;top:52px;bottom:0;left:0;width:264px;max-width:90vw;z-index:7;background:var(--fv-bg)}
  .fv-editor .fv-ed-library[data-open=true]{display:block}
@@ -124,27 +192,62 @@
  .fv-ed-toolbar{grid-column:1;grid-row:5;padding:0 12px;gap:8px;overflow-x:auto}
  .fv-ed-genbar{grid-column:1;grid-row:4;min-height:56px;gap:8px;padding:10px 12px;flex-wrap:wrap}
  .fv-ed-description{width:100%;flex:1 1 100%}
- .fv-editor .fv-ed-genbar>button{margin-left:auto;max-width:100%;font-size:12px}
+ .fv-ed-genbar .fv-ed-description{order:-1}
+ .fv-ed-refs{margin-right:auto;max-width:100%}
+ .fv-ed-ref-chips{max-width:calc(100vw - 96px)}
+ .fv-ed-gen-hint{flex:1 0 auto;white-space:nowrap}
+ .fv-ed-gen-note{order:-1;flex:1 1 100%;white-space:normal}
+ .fv-editor .fv-ed-genbar>button{margin-left:auto;max-width:100%;height:36px;min-height:36px;font-size:12px}
+ .fv-editor .fv-ed-genbar>button:not([hidden]) ~ button:not([hidden]){margin-left:0}
  .fv-ed-name-menu{position:fixed;top:120px;left:8px}
- .fv-ed-notice{top:60px;bottom:auto;pointer-events:none}
+ /* Beside the view switch it covered "Editor"; here it sits at the foot of the picture area, in the grid. */
+ .fv-ed-notice{position:relative;grid-column:1;grid-row:2;align-self:end;justify-self:end;margin:0 16px 8px;bottom:auto;right:auto;pointer-events:none}
  .fv-ed-save-warning{position:absolute;top:60px;left:8px;right:8px;border:1px solid var(--fv-border);background:var(--fv-card);padding:8px 12px;border-radius:8px;z-index:9}
 }
 
 .fv-ed-name-menu{max-height:calc(100dvh - 72px);overflow-y:auto}
+/* editor_header_fit.js: when the project name would not stay readable beside a centred view switch, the logo takes its phone size, then leaves, then the switch takes a second row. */
+.fv-studio.fv-editor .fv-header[data-fit~=compact] .fv-wordmark{width:90px}
+.fv-studio.fv-editor .fv-header[data-fit~=bare] .fv-wordmark{display:none}
+.fv-studio.fv-editor .fv-header[data-fit~=tight] .fv-lan{display:none}
+.fv-studio.fv-editor .fv-header[data-fit~=wrap]{height:auto;min-height:98px;grid-template-columns:minmax(0,1fr) auto;padding-block:10px}
+.fv-studio.fv-editor .fv-header[data-fit~=wrap]>.fv-view-switch{grid-column:1/-1;grid-row:2;justify-self:center}
+.fv-studio.fv-editor .fv-header[data-fit~=wrap]>.fv-header-actions{grid-column:2;grid-row:1}
+.fv-studio.fv-editor .fv-header[data-fit~=wrap] .fv-ed-name{max-width:320px}
+.fv-studio.fv-editor .fv-header[data-fit~=lean] .fv-feedback-entry{display:none}
 .fv-ed-volume-popover{position:absolute;top:calc(100% + 8px);left:0;display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--fv-border);border-radius:8px;background:var(--fv-card);white-space:nowrap;z-index:8}
 .fv-ed-volume{width:90px}.fv-ed-volume-value{font-variant-numeric:tabular-nums;font-size:12px;min-width:34px}
 
 /* Keep the editor's controls visible instead of clipping them at phone widths. */
 @media(max-width:480px){
- .fv-studio.fv-editor{grid-template-rows:auto minmax(128px,1fr) 40px auto auto 236px}
+ .fv-studio.fv-editor{grid-template-rows:auto minmax(max(0px,calc(96px - var(--fv-ed-description-growth,0px))),1fr) 40px var(--fv-ed-generation-row,max-content) auto minmax(160px,236px)}
+ .fv-studio.fv-editor:has(.fv-ed-gen-failure:not([hidden])){grid-template-rows:auto minmax(0,1fr) 40px var(--fv-ed-generation-row,max-content) auto minmax(160px,236px)}
  .fv-studio.fv-editor .fv-header:has(.fv-view-switch){grid-template-columns:minmax(0,1fr) auto}
- .fv-ed-toolbar{display:grid;grid-template-columns:auto minmax(0,1fr);height:auto;gap:4px 8px;padding:4px 12px;overflow:visible}
- .fv-ed-toolbar>.fv-ed-tool-group:nth-child(2){grid-column:2;grid-row:1/3;flex-wrap:wrap;align-self:start;min-width:0}
- .fv-ed-toolbar>.fv-ed-tool-group:nth-child(3){grid-column:1;grid-row:2}
+ /* One row: undo, split, delete and zoom; editor_toolbar_more.js moves the rest behind ⋯. */
+ .fv-ed-toolbar{gap:4px;padding:0 12px;overflow:visible}
  .fv-ed-toolbar .fv-ed-tool-group+.fv-ed-tool-group:before{display:none}
- .fv-ed-toolbar>.fv-ed-zoom{grid-column:1/-1;grid-row:3;justify-self:end;margin-left:0}
- .fv-editor .fv-ed-track-view{--fv-ed-head-width:104px}
+ .fv-ed-toolbar>.fv-ed-zoom{flex:1 1 auto;min-width:0;margin-left:4px}
+ .fv-ed-toolbar .fv-ed-track-zoom{display:flex;align-items:center}
+ .fv-editor .fv-ed-toolbar .fv-ed-track-zoom>button:not(.fv-ed-fit){display:none}
+ .fv-ed-toolbar .fv-ed-zoom-slider{flex:1 1 auto;width:auto;min-width:48px}
+ /* Track heads become a 32 px icon column; a press opens that track's switches beside it. */
+ .fv-studio.fv-editor .fv-ed-track-view[data-track-switches],.fv-studio.fv-editor[data-text-tracks] .fv-ed-track-view{--fv-ed-head-width:32px}
+ .fv-studio.fv-editor .fv-ed-track-head{justify-content:center;padding:0;cursor:pointer}
+ .fv-studio.fv-editor .fv-ed-track-head>svg{display:block;width:16px;height:16px}
+ .fv-studio.fv-editor .fv-ed-track-head[data-text-track=true]>svg{display:none}
+ .fv-studio.fv-editor .fv-ed-track-head[data-text-track=true]::before{content:"T";font-weight:600}
+ .fv-studio.fv-editor .fv-ed-track-head>[class$=-track-controls]{display:none}
+ .fv-studio.fv-editor .fv-ed-track-head[data-open=true]>[class$=-track-controls]{display:flex;position:absolute;left:calc(100% + 4px);top:50%;transform:translateY(-50%);gap:2px;padding:2px 4px;background:var(--fv-card);border:1px solid var(--fv-border);border-radius:8px}
+ .fv-studio.fv-editor .fv-ed-track-heads:has(>[data-open=true]){z-index:9}
+ .fv-studio.fv-editor .fv-ed-add-audio{padding:0;font-size:0}
+ .fv-studio.fv-editor .fv-ed-add-audio::before{content:attr(data-sign);font-size:16px}
  .fv-editor .fv-ed-playhead-handle{left:0}
  .fv-editor .fv-ed-library{grid-area:auto;top:116px;bottom:0;z-index:8}
  .fv-editor:has(.fv-ed-library[data-open=true]) .fv-ed-drawer-toggle{position:fixed;top:128px;right:20px;z-index:9}
+}
+/* Narrow window: the picture sits right under the header, the row takes the project's own shape (a
+   16:9 project is about 200 px tall at 400 px wide), and whatever height is left goes to the timeline. */
+@media(max-width:680px){
+ .fv-studio.fv-editor,.fv-studio.fv-editor:has(.fv-ed-gen-failure:not([hidden])){grid-template-rows:auto minmax(0,auto) 40px var(--fv-ed-generation-row,max-content) auto minmax(160px,1fr)}
+ .fv-editor .fv-ed-preview{box-sizing:border-box;align-self:start;aspect-ratio:var(--fv-ed-project-width,16)/var(--fv-ed-project-height,9);max-height:max(116px,calc(100dvh - 470px));padding-top:12px;padding-bottom:8px}
 }

@@ -36,8 +36,11 @@ def stored(folder):
     return rows
 
 
-def resident(folder, torch, device, precision):
-    """Returns the model on `device`, with int8 projections if precision == 'int8'."""
+def resident(folder, torch, device, precision, keep=None):
+    """Returns the model on `device`, with int8 projections if precision == 'int8'.
+
+    With `keep`, layers from that index on hold their int8 rows in host memory
+    and are streamed to the GPU as they run."""
     from accelerate import init_empty_weights
     from torch import nn
     from transformers import AutoConfig, GenerationConfig, Qwen3VLForConditionalGeneration
@@ -89,6 +92,9 @@ def resident(folder, torch, device, precision):
             merge(layer)
             if precision == 'int8':
                 int8.install(layer, device)
+                if keep is not None and layer.self_attn.layer_idx >= keep:
+                    for parent, name in int8.projections(layer):
+                        getattr(parent, name).offload()
         core.prepare(model, each_layer)
     finally:
         for reader in readers.values():
@@ -96,5 +102,7 @@ def resident(folder, torch, device, precision):
     if tied:
         model.lm_head.weight = model.model.language_model.embed_tokens.weight
     model = model.to(device)
+    if keep is not None:
+        model.streamer = int8.Streamer(torch, list(model.model.language_model.layers)[keep:])
     torch.cuda.empty_cache()  # Merge and quantize temporaries; KV space comes next.
     return model

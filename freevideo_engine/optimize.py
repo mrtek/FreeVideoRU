@@ -522,6 +522,8 @@ def search_plan(row, base, maximum, seconds, *, reject=None):
 
 def run(args, machine, ui):
     from .testing import environment, run_process, artifact_manifest, artifact_estimate
+    from .triton_compat import own_temporary_environment
+    own_temporary_environment(machine.get('root'))
     env = environment(machine)
     os.environ.update(execution_environment(env))
     if args.disable:
@@ -784,6 +786,8 @@ def main(argv=None):
         if not machine.get('ready'):
             raise ValueError('Setup is incomplete')
         from .testing import environment
+        from .triton_compat import own_temporary_environment
+        own_temporary_environment(machine.get('root'))
         os.environ.update(execution_environment(environment(machine)))
         with nullcontext() if args.plan else runtime_lock() as descriptor:
             previous = os.environ.get(LOCK_ENV)

@@ -4,7 +4,7 @@
 .fv-editor .fv-ed-notes-again{display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 8px;font-size:12px}
 .fv-ed-notes-again .fv-ed-glyph{width:12px;height:12px}
 .fv-editor .fv-ed-notes-again:disabled{opacity:.4}
-.fv-editor .fv-ed-notes-text{display:block;height:auto;box-sizing:border-box;width:100%;min-height:34px;max-height:94px;padding:6px 10px;resize:none;overflow-y:auto;font:13px/20px var(--fv-font);color:var(--fv-ink);background:var(--fv-bg);border:1px solid var(--fv-border);border-radius:8px}
+.fv-editor .fv-ed-notes-text{display:block;height:auto;box-sizing:border-box;width:100%;min-height:34px;max-height:98px;padding:6px 10px;resize:none;overflow-y:auto;font:13px/20px var(--fv-font);color:var(--fv-ink);background:var(--fv-bg);border:1px solid var(--fv-border);border-radius:8px}
 .fv-editor .fv-ed-notes-text:focus-visible{outline:1px solid var(--fv-accent);outline-offset:-1px;border-color:var(--fv-accent)}
 .fv-editor .fv-ed-notes-text:disabled{opacity:.4}
 .fv-ed-notes-versions{display:flex;flex-direction:column;gap:6px;margin-top:6px}
@@ -13,6 +13,9 @@
 /* Timeline: the strip sits under the pictures, one shade darker than the track. */
 .fv-ed-clip[data-noted=true] .fv-ed-clip-media{bottom:22px}
 .fv-ed-note{position:absolute;left:0;right:0;bottom:0;z-index:1;height:22px;padding:0 8px;overflow:hidden;background:var(--fv-bg);color:var(--fv-ink);font:12px/22px var(--fv-font);text-align:left;text-overflow:ellipsis;white-space:nowrap}
+/* A continued block's link sits at the strip's left end: the description starts after it, and the link is centred on the strip's line. */
+.fv-ed-clip.fv-ed-seamed .fv-ed-note{padding-left:26px}
+.fv-ed-clip.fv-ed-seamed[data-noted=true] .fv-ed-seam-mark{bottom:2px}
 /* Block numbers take the top-left corner, so planned lengths move right beside them. */
 .fv-ed-track-view:has(.fv-ed-track-row[data-noted=true]) .fv-ed-planned-label{left:24px}
 .fv-ed-block-number{position:absolute;left:6px;top:4px;z-index:2;color:#fff;font:700 11px/1 var(--fv-font);text-shadow:0 1px 2px rgba(0,0,0,.85);pointer-events:none}

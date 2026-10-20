@@ -3,13 +3,24 @@
 import * as model from './editor_model.js';
 import {FONT_KEYS} from './fonts.js';
 import {row, button, slider, number, segmented, toggle} from './editor_adjust.js';
-import {isText, isTextTrack, addText, changeText, changeSubtitleStyle, styleOf, activeText, setTextTrack, parseSRT, importSRT, addSubtitles, defaults} from './editor_text_model.js';
+import {isText, isTextTrack, addText, changeText, changeSubtitleStyle, styleOf, activeText, setTextTrack, parseSRT, importSRT, addSubtitles, defaults, cleanStyle, SUBTITLE_DEFAULTS} from './editor_text_model.js';
 import {loadCoverage, loadTextFonts, textFontStack, missingGlyphs, missingHint, overTwoHint, textLayout, drawText} from './editor_text_layout.js';
 import {createSelectionActions, isTyping} from './editor_select.js';
 import {plan} from './editor_geometry.js';
 import {isolateDialogKeys} from './dialog_keys.js';
+import {issueButton} from './issue_button.js';
+const SPEECH_ISSUE = ['Auto subtitles', '自动字幕'], FONT_ISSUE = ['Editor text fonts', '剪辑器文字字体'];
 const el=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;};
 const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+const PRESET_KEY='freevideo.subtitle-presets',PRESET_LIMIT=6;
+// Saved subtitle looks live in this browser, so any project can reuse them; a bad or missing store is an empty list.
+function readPresets(){
+    let saved;try{saved=JSON.parse(localStorage.getItem(PRESET_KEY));}catch{return [];}
+    if(!Array.isArray(saved))return [];
+    return saved.flatMap(value=>{try{return [cleanStyle(value,'subtitle')];}catch{return [];}}).slice(0,PRESET_LIMIT);
+}
+function writePresets(list){try{localStorage.setItem(PRESET_KEY,JSON.stringify(list));}catch{/* The look still applies without storage. */}}
+const sameStyle=(a,b)=>JSON.stringify(Object.entries(cleanStyle(a,'subtitle')).sort())===JSON.stringify(Object.entries(cleanStyle(b,'subtitle')).sort());
 export function createEditorText({element,state,t,actions,adjust,player,toolbar,exportBox,tracksHost}) {
     const frame=player.element, canvas=el('canvas','fv-ed-text-canvas'), boundsLayer=el('div','fv-ed-text-handles');
     canvas.setAttribute('aria-hidden','true'); frame.append(canvas,boundsLayer);
@@ -18,13 +29,18 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
     // Icons only on the toolbar; the name lives in the label and hover.
     const textButton=button('',{onClick:()=>add('text')}), subtitleButton=button('',{onClick:()=>add('subtitle')});
     textButton.classList.add('fv-ed-add-text'); subtitleButton.classList.add('fv-ed-add-subtitle');
-    textButton.append(el('span','fv-ed-text-icon','T')); subtitleButton.append(el('span','fv-ed-text-icon','CC'));
+    // The same 16 px line glyphs as the other toolbar tools.
+    const glyph=d=>{const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 16 16');svg.setAttribute('aria-hidden','true');svg.classList.add('fv-ed-glyph');const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',d);svg.append(path);return svg;};
+    textButton.classList.add('fv-ed-icon'); subtitleButton.classList.add('fv-ed-icon');
+    textButton.append(glyph('M3 5V3.5h10V5M8 3.5v9M6 12.5h4')); subtitleButton.append(glyph('M4 3.5h8a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2zM4.5 7.5h3M9.5 7.5h2M4.5 10h2M8.5 10h3'));
     textButton.setAttribute('aria-label',t('Text','文字')); subtitleButton.setAttribute('aria-label',t('Subtitles','字幕'));
     textButton.title=t('Text T','文字 T'); subtitleButton.title=t('Subtitles','字幕');
     buttons.append(textButton,subtitleButton);
     const marker=toolbar.querySelector('.fv-ed-marker, .fv-ed-add-marker');
     if(marker) marker.after(buttons); else toolbar.insertBefore(buttons,toolbar.querySelector('.fv-ed-zoom'));
     const notice=el('span');notice.setAttribute('role','button');notice.tabIndex=0;notice.onclick=()=>jumpMissing();notice.onkeydown=e=>{if(['Enter',' '].includes(e.key)){e.preventDefault();jumpMissing();}}; notice.classList.add('fv-ed-text-notice'); notice.hidden=true; exportBox.prepend(notice);
+    const fontFailure=()=>t('Text fonts could not be loaded','文字字体没能加载');
+    let fontIssue=null;
     const menu=el('div','fv-ed-text-menu'); menu.hidden=true; menu.setAttribute('role','menu'); element.append(menu);
     const names={sans:t('Sans','黑体'),serif:t('Serif','宋体'),kai:t('Kai','楷体'),mono:t('Mono','等宽')};
     let disposed=false,ready=false,table=null,loadError=false,draft=null,fresh=null,typing=null,lastStyle={},editing=null,drag=null,raf=null,layouts=new Map(),mapped={x:0,y:0,w:1,h:1};
@@ -51,16 +67,16 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
     // `need` is what has to be downloaded before the first use, in bytes; the same press downloads it and goes on.
     const speech={buttons:new Set(),available:false,need:0,busy:false,loading:false,shown:null,job:null,stop:null,run:0};
     function speechLabel(fraction){speech.shown=fraction;const p=Math.round(Math.min(1,Math.max(0,Number(fraction)||0))*100),size=Math.max(1,Math.round(speech.need/1e6)),text=fraction==null?(speech.need?t(`Auto subtitles · Download ${size} MB`,`自动字幕 · 下载 ${size} MB`):t('Auto subtitles','自动字幕')):speech.loading?t(`Cancel · Downloading ${p}%`,`取消 · 下载 ${p}%`):t(`Cancel · ${p}%`,`取消 · ${p}%`);for(const b of speech.buttons){b.textContent=text;b.hidden=!(speech.available||speech.need);}}
-    function speechEnd(text){speech.stop?.();speech.stop=null;speech.job=null;speech.busy=false;speech.loading=false;speechLabel(null);if(text)actions.notify?.(text);}
+    function speechEnd(text,where=null){speech.stop?.();speech.stop=null;speech.job=null;speech.busy=false;speech.loading=false;speechLabel(null);if(text)actions.notify?.(text,where);}
     const speechFailed=()=>t('Could not create subtitles','没能生成字幕'),speechSilent=()=>t('No speech found','没有听到说话声');
     const speechReason=reason=>reason==='no_sound'?speechSilent():reason==='language'?t('Language not supported yet','暂不支持这种语言'):speechFailed();
     function speechResult(job){
         if(job.state==='running'){speechLabel(job.fraction);return true;}
-        if(job.state!=='done'){speechEnd(job.state==='cancelled'?null:speechReason(job.reason));return false;}
+        if(job.state!=='done'){speechEnd(job.state==='cancelled'?null:speechReason(job.reason),job.state==='cancelled'||['no_sound','language'].includes(job.reason)?null:SPEECH_ISSUE);return false;}
         const cues=(Array.isArray(job.result?.lines)?job.result.lines:[]).filter(l=>typeof l?.text==='string'&&l.text.trim()&&l.end>l.start).map(l=>({start:l.start,frames:l.end-l.start,text:l.text.trim()}));
         speechEnd();if(!cues.length){actions.notify?.(speechSilent());return false;}
         finishInline();commitDraft();
-        if(!apply(t('Auto subtitles','自动字幕'),r=>addSubtitles(r,cues,{replace:true})))actions.notify?.(speechFailed());
+        if(!apply(t('Auto subtitles','自动字幕'),r=>addSubtitles(r,cues,{replace:true})))actions.notify?.(speechFailed(),SPEECH_ISSUE);
         else{const missing=projectMissing(state.record);if(missing.length)actions.notify?.(missingHint([...new Set(missing.flatMap(r=>r.chars))],t));}
         return false;
     }
@@ -75,17 +91,17 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
                 const ability=done?await actions.speech.ability():null;
                 if(run!==speech.run)return;
                 if(ability){speech.available=ability.available;speech.need=ability.need;}
-                if(!done||speech.need){speechEnd(t('Could not download','没能下载'));return;}
-                if(!speech.available){speechEnd(speechFailed());return;}
+                if(!done||speech.need){speechEnd(t('Could not download. Try again.','没能下载，请再试一次。'),SPEECH_ISSUE);return;}
+                if(!speech.available){speechEnd(speechFailed(),SPEECH_ISSUE);return;}
                 speech.loading=false;
             }
             speechLabel(0);
             const job=await actions.speech.start();
             if(run!==speech.run){if(job?.id)Promise.resolve(actions.speech.cancel(job.id)).catch(()=>{});return;}
-            if(!job){speechEnd(speechFailed());return;}
+            if(!job){speechEnd(speechFailed(),SPEECH_ISSUE);return;}
             speech.job=job.id??null;
-            if(speechResult(job))speech.stop=actions.speech.watch(job.id,value=>{if(run!==speech.run)return false;if(!value){speechEnd(speechFailed());return false;}return speechResult(value);});
-        }catch{if(run===speech.run)speechEnd(speech.loading?t('Could not download','没能下载'):speechFailed());}
+            if(speechResult(job))speech.stop=actions.speech.watch(job.id,value=>{if(run!==speech.run)return false;if(!value){speechEnd(speechFailed(),SPEECH_ISSUE);return false;}return speechResult(value);});
+        }catch{if(run===speech.run)speechEnd(speech.loading?t('Could not download. Try again.','没能下载，请再试一次。'):speechFailed(),SPEECH_ISSUE);}
     }
     function commitDraft(){if(draft){const change=draft.change;apply(t('Text','文字'),change);const c=selectedText();if(c?.text_kind==='text')lastStyle={...styleOf(state.record,c)};}}
     // Editing a text ended. One left without words is taken away; one that never had any leaves no step behind.
@@ -115,7 +131,11 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
         host.append(row(t('Content','内容'),content),warning,overflow);
         const duration=number({min:1/24,max:1e7/24,step:1/24,label:t('Duration','时长'),onChange:v=>{const c=selectedText();if(c)apply(t('Duration','时长'),r=>changeText(r,c.id,{frames:Math.max(1,Math.round(v*24))}));}});
         const durationRow=row(t('Duration','时长'),duration);
-        if(kind==='subtitle')host.append(durationRow,el('hr'),el('strong','fv-ed-subtitle-style-title',t('Style for all subtitles','全部字幕的样式')));
+        let presetRow=null;
+        if(kind==='subtitle'){
+            presetRow=el('div','fv-ed-style-presets');
+            host.append(durationRow,el('hr'),el('strong','fv-ed-subtitle-style-title',t('Style for all subtitles','全部字幕的样式')),presetRow);
+        }
         const font=el('select','fv-ed-text-font');font.setAttribute('aria-label',t('Font','字体'));
         for(const key of FONT_KEYS){const option=el('option','',names[key]);option.value=key;option.style.fontFamily=textFontStack(key);font.append(option);}
         font.onchange=()=>modifyStyle({font:font.value});host.append(row(t('Font','字体'),font));
@@ -145,8 +165,8 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
             const file=el('input');file.type='file';file.accept='.srt';file.hidden=true;
             const importButton=button(t('Import subtitle file','导入字幕文件'),{onClick:()=>file.click()});importButton.classList.add('fv-ed-import-srt');
             // Only a file that cannot be read says so; a refused edit (a locked track) flashes red like any other.
-            file.onchange=async()=>{const f=file.files?.[0];if(!f)return;let text;try{if(f.size>4*1024*1024)throw new Error();text=await f.text();parseSRT(text);}catch{actions.notify?.(t('Could not read this subtitle file','读不出这个字幕文件'));return;}finally{file.value='';}
-                if(apply(t('Import subtitle file','导入字幕文件'),r=>importSRT(r,text))){const missing=projectMissing(state.record);if(missing.length)actions.notify?.(missingHint([...new Set(missing.flatMap(r=>r.chars))],t));}};
+            file.onchange=async()=>{const f=file.files?.[0];if(!f)return;let text;const result={};try{if(f.size>4*1024*1024)throw new Error();text=await f.text();parseSRT(text,result);}catch{actions.notify?.(t('Could not read this subtitle file','读不出这个字幕文件'));return;}finally{file.value='';}
+                if(apply(t('Import subtitle file','导入字幕文件'),r=>importSRT(r,text))){const missing=projectMissing(state.record);if(missing.length)actions.notify?.(missingHint([...new Set(missing.flatMap(r=>r.chars))],t));if(result.truncated)actions.notify?.(t('Only the first 500 subtitles were imported.','只导入了前 500 条字幕。'));}};
             // Shown only where this computer can recognise speech.
             const hear=button(t('Auto subtitles','自动字幕'),{onClick:toggleSpeech});hear.classList.add('fv-ed-auto-subtitles');for(const b of speech.buttons)if(!b.isConnected)speech.buttons.delete(b);speech.buttons.add(hear);speechLabel(speech.busy?speech.shown:null);
             host.append(importButton,hear,file);
@@ -161,8 +181,36 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
             if(e.key==='Escape'){e.preventDefault();finishContent();content.blur();}
             else if(kind==='subtitle' && e.key==='Enter' && !e.shiftKey && !e.isComposing){e.preventDefault();const c=selectedText();if(!c||!model.find(record(),c.id)?.text.trim())return;commitDraft();add('subtitle',c.start+c.frames);content.value='';}
         };
-        panels.set(kind,{content,warning,overflow,font,size,sizeNumber,custom,backing,bold,align,position,duration,fade,host});
+        panels.set(kind,{presetRow,content,warning,overflow,font,size,sizeNumber,custom,backing,bold,align,position,duration,fade,host});
         updatePanel(kind);
+    }
+    // One press saves the subtitle look as a preset; one press on a preset sets it on every subtitle.
+    function renderPresets(host,current,replaced=false){
+        const list=readPresets(),found=list.findIndex(value=>sameStyle(value,current));
+        host.replaceChildren();
+        list.forEach((value,index)=>{
+            const full={...SUBTITLE_DEFAULTS,...value},chip=el('span','fv-ed-preset');chip.dataset.current=String(index===found);
+            const apply_=button('Aa',{onClick:()=>modifyStyle({...SUBTITLE_DEFAULTS,...value})});apply_.classList.add('fv-ed-preset-apply');
+            apply_.setAttribute('aria-label',t(`Use style ${index+1}`,`套用样式 ${index+1}`));apply_.title=t(`Use style ${index+1}`,`套用样式 ${index+1}`);
+            apply_.style.fontFamily=textFontStack(full.font);apply_.style.color=full.color;
+            const light=parseInt(full.color.slice(1,3),16)*.3+parseInt(full.color.slice(3,5),16)*.59+parseInt(full.color.slice(5,7),16)*.11>140;
+            apply_.style.backgroundColor=full.backing==='box'?'#000000':light?'#2a2f38':'#e5e7eb';
+            if(full.backing==='outline')apply_.style.textShadow=light?'0 0 2px #000, 0 0 2px #000':'0 0 2px #fff, 0 0 2px #fff';
+            const remove=button('×',{onClick:()=>{const next=readPresets();next.splice(index,1);writePresets(next);renderPresets(host,current);}});
+            remove.classList.add('fv-ed-preset-remove');remove.setAttribute('aria-label',t(`Delete style ${index+1}`,`删除样式 ${index+1}`));remove.title=t('Delete','删除');
+            chip.append(apply_,remove);host.append(chip);
+        });
+        const save=button(t('Save style','保存样式'),{onClick:()=>{
+            // A full list gives up its oldest look for the new one, and says so for a moment.
+            const next=readPresets(),full=next.length>=PRESET_LIMIT;if(full)next.shift();
+            next.push(cleanStyle(current,'subtitle'));writePresets(next);renderPresets(host,current,full);}});
+        save.classList.add('fv-ed-preset-save');
+        if(found>=0){save.disabled=true;save.title=t('Already saved','已保存过');}
+        host.append(save);
+        if(replaced){
+            const note=el('span','fv-ed-preset-note',t('Replaced the oldest','已替换最早的一套'));note.setAttribute('role','status');host.append(note);
+            setTimeout(()=>note.remove(),2000);
+        }
     }
     function updatePanel(kind){
         const p=panels.get(kind),c=selectedText();if(!p||!c||c.text_kind!==kind)return;
@@ -172,6 +220,7 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
         if(!draft){p.size.value=s.size*1080;p.sizeNumber.value=Math.round(s.size*1080);p.custom.value=s.color;}
         p.backing.value=s.backing;p.position.value=kind==='text'?s.y:s.position;p.duration.value=c.frames/24;
         if(p.bold){p.bold.value=s.bold;p.align.value=s.align;p.fade.value=s.fade;}
+        if(p.presetRow&&!draft)renderPresets(p.presetRow,s);
         updateWarnings();
     }
     for(const kind of ['text','subtitle'])adjust.register(kind,{render:host=>buildPanel(host,kind),update:()=>updatePanel(kind)});
@@ -182,13 +231,18 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
     function updateWarnings(){
         const r=record(),c=selectedText(),s=c&&styleOf(r,model.find(r,c.id));
         const missing=projectMissing(r),chars=[...new Set(missing.flatMap(r=>r.chars))];
-        notice.hidden=!chars.length&&!loadError;notice.textContent=loadError?t('Text fonts could not be loaded','文字字体没能加载'):missingHint(chars,t);notice.title=notice.textContent;
+        notice.hidden=!chars.length&&!loadError;notice.textContent=loadError?fontFailure():missingHint(chars,t);notice.title=notice.textContent;
         for(const [kind,p]of panels){
             if(c?.text_kind!==kind)continue;
             const entry=model.find(r,c.id),absent=table?missingGlyphs(entry.text,s.font,!!s.bold,table):[];
-            p.warning.hidden=!absent.length&&!loadError;p.warning.textContent=loadError?t('Text fonts could not be loaded','文字字体没能加载'):missingHint(absent,t);
+            p.warning.hidden=!absent.length&&!loadError;p.warning.textContent=loadError?fontFailure():missingHint(absent,t);
+            if(loadError)p.warning.append(issueButton(t,()=>({where:FONT_ISSUE,message:fontFailure()})));
             p.overflow.hidden=kind!=='subtitle'||!ready||!metrics||!textLayout(metrics,entry.text,s,kind,r.width,r.height).overTwo;
         }
+        // Both messages can be on screen at once; the button stays with the one nearest the text panel.
+        const panelShowing=loadError&&[...panels.values()].some(p=>p.warning.offsetParent!==null);
+        if(loadError&&!panelShowing&&!fontIssue){fontIssue=issueButton(t,()=>({where:FONT_ISSUE,message:fontFailure()}));notice.after(fontIssue);}
+        if((!loadError||panelShowing)&&fontIssue){fontIssue.remove();fontIssue=null;}
     }
     function jumpMissing(){const first=projectMissing(state.record)[0];if(first){const c=model.find(state.record,first.id);state.select({kind:'clip',ids:[c.id]});state.seek(c.start);adjust.open();}}
     function updateClip(item,r){
@@ -274,9 +328,11 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
         editing={id,input};boundsLayer.replaceChildren(input);
         input.oninput=()=>updateContent(c,input.value,true);
         input.onkeydown=e=>{e.stopPropagation();if(e.key==='Escape'){e.preventDefault();finishInline();} };input.onkeyup=e=>e.stopPropagation();
-        input.onblur=()=>finishInline();render();input.focus();if(selectAll)input.select();
+        input.onblur=e=>finishInline(e.relatedTarget);render();input.focus();if(selectAll)input.select();
     }
-    function finishInline(){if(!editing)return;const old=editing;editing=null;old.input.onblur=null;const c=model.find(state.record,old.id);if(!old.input.value.trim())endEditing(old.id);else if(c&&c.text!==old.input.value)updateContent(c,old.input.value);else commitDraft();old.input.remove();render();}
+    function finishInline(next){if(!editing)return;const old=editing;editing=null;old.input.onblur=null;const c=model.find(state.record,old.id);
+        // Moving to the side panel's Content box keeps typing the same text; an empty one is cleaned up when that box is left.
+        if(!old.input.value.trim()&&next?.classList?.contains('fv-ed-text-content')&&selectedText()?.id===old.id)typing=old.id;else if(!old.input.value.trim())endEditing(old.id);else if(c&&c.text!==old.input.value)updateContent(c,old.input.value);else commitDraft();old.input.remove();render();}
     function guide(axis,value){const line=el('span','fv-ed-text-guide '+axis);line.style[axis==='x'?'left':'top']=`${value*100}%`;boundsLayer.append(line);}
     function beginDrag(e,c){
         if(e.button!==0||locked(c)||editing)return;e.preventDefault();e.stopPropagation();
@@ -321,14 +377,14 @@ export function createEditorText({element,state,t,actions,adjust,player,toolbar,
     async function beforeExport(){
         if(!state.record.tracks.some(isTextTrack))return true;finishInline();commitDraft();await ensureFonts();
         const chars=[...new Set(projectMissing(state.record).flatMap(r=>r.chars))];if(!chars.length&&!loadError)return true;
-        const dialog=el('dialog','fv-studio fv-ed-text-export-dialog'),title=el('h3','',t('Export','导出')),message=el('p','',loadError?t('Text fonts could not be loaded','文字字体没能加载'):missingHint(chars,t));
-        const close=button(t('Back to edit','返回修改'),{onClick:()=>dialog.close()});dialog.append(title,message,close);document.body.append(dialog);
-        const stop=isolateDialogKeys(dialog,(e)=>{if(e.type==='keydown'&&e.key==='Escape'){e.preventDefault();dialog.close();}else if(e.type==='keydown'&&e.key==='Enter'){e.preventDefault();dialog.close();}});
+        const dialog=el('dialog','fv-studio fv-ed-text-export-dialog'),title=el('h3','',t('Export','导出')),message=el('p','',loadError?fontFailure():missingHint(chars,t));
+        const close=button(t('Back to edit','返回修改'),{onClick:()=>dialog.close()});dialog.append(title,message);if(loadError)dialog.append(issueButton(t,()=>({where:FONT_ISSUE,message:fontFailure()})));dialog.append(close);document.body.append(dialog);
+        const stop=isolateDialogKeys(dialog,(e)=>{if(e.type==='keydown'&&e.key==='Escape'){e.preventDefault();dialog.close();}else if(e.type==='keydown'&&e.key==='Enter'&&!e.target.closest?.('.fv-issue-button')){e.preventDefault();dialog.close();}});
         dialog.onclose=()=>{stop();dialog.remove();jumpMissing();};dialog.showModal();close.focus();return false;
     }
     return {get ready(){return ensureFonts();},beforeExport,speech(value){speech.available=value?.available===true;speech.need=Number(value?.need)||0;if(!speech.busy)speechLabel(null);},flush(){finishInline();commitDraft();},keyboard(e){
         if(isTyping(e.target)||e.ctrlKey||e.metaKey||e.altKey||e.isComposing)return false;
         if(e.key.toLowerCase()==='t'){e.preventDefault();e.stopPropagation();add('text');return true;}
         if(e.key==='Escape'&&(drag||!menu.hidden)){e.preventDefault();if(drag)endDrag(e,true);menu.hidden=true;return true;}return false;
-    },dispose(){disposed=true;if(speech.busy){const id=speech.job;speech.run++;speechEnd();if(id)Promise.resolve(actions.speech.cancel(id)).catch(()=>{});}speech.buttons.clear();player.setTextRenderer?.(null);unsubscribe();resize?.disconnect();cancelAnimationFrame(raf);tracksHost.removeEventListener('contextmenu',contextMenu);element.removeEventListener('pointerdown',outside);frame.removeEventListener('seeked',seeked,true);frame.removeEventListener('loadeddata',seeked,true);canvas.remove();boundsLayer.remove();buttons.remove();notice.remove();menu.remove();}};
+    },dispose(){disposed=true;if(speech.busy){const id=speech.job;speech.run++;speechEnd();if(id)Promise.resolve(actions.speech.cancel(id)).catch(()=>{});}speech.buttons.clear();player.setTextRenderer?.(null);unsubscribe();resize?.disconnect();cancelAnimationFrame(raf);tracksHost.removeEventListener('contextmenu',contextMenu);element.removeEventListener('pointerdown',outside);frame.removeEventListener('seeked',seeked,true);frame.removeEventListener('loadeddata',seeked,true);canvas.remove();boundsLayer.remove();buttons.remove();notice.remove();fontIssue?.remove();menu.remove();}};
 }

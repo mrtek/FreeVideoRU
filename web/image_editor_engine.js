@@ -10,7 +10,12 @@
 // Every edit is an entry in a list, so a saved document reopens from the
 // original image with each step still in place.
 
-import {fontCSS, fontLoaded, loadFonts} from './fonts.js';
+import {fontCSS as bundledFontCSS, fontLoaded, loadFonts} from './fonts.js';
+// A blocked font must not turn otherwise readable text into the bundled box glyph.
+const fontCSS = (name, weight, size) => {
+    const css = bundledFontCSS(name, weight, size);
+    return fontLoaded(name, weight) ? css : css.replace('"FreeVideo Box"', 'sans-serif');
+};
 
 export const BLENDS = ['source-over', 'multiply', 'screen', 'overlay', 'soft-light', 'darken', 'lighten',
     'color-dodge', 'color-burn', 'difference'];
@@ -43,6 +48,11 @@ export function newDocument(file, image) {
     return {version: 2, width: w, height: h, rotate: 0, flipX: false, flipY: false,
         extend: {l: 0, t: 0, r: 0, b: 0, color: '#000000'}, crop: {x: 0, y: 0, w, h}, ratio: 'original',
         layers: [baseLayer(file, image)], active: 'base'};
+}
+export function blankDocument({width, height}, ratio = 'free') {
+    return {version: 2, width, height, rotate: 0, flipX: false, flipY: false,
+        extend: {l: 0, t: 0, r: 0, b: 0, color: '#000000'},
+        crop: {x: 0, y: 0, w: width, h: height}, ratio, layers: [], active: null};
 }
 // Edits saved before layers: crop and strokes in fractions of the oriented picture.
 export function migrate(edit, file, image) {
@@ -112,8 +122,7 @@ export const rasterKinds = new Set(['image', 'paint']);
 export const textFonts = doc => doc.layers.filter(l => l.kind === 'text').map(l => [l.text.font, l.text.weight]);
 export const textFontsLoaded = doc => textFonts(doc).every(([name, weight]) => fontLoaded(name, weight));
 
-// Native size of a text block, from the same font settings it is drawn with. The font must
-// be loaded (textFonts): measuring before that would use another font's metrics.
+// Native size of a text block, using the same bundled or fallback font as drawing.
 export function measureText(text) {
     const ctx = document.createElement('canvas').getContext('2d');
     ctx.font = fontCSS(text.font, text.weight, text.size);
@@ -963,9 +972,26 @@ export class Renderer {
         return this.images.get(file);
     }
     loaded(file) { return this.images.get(file)?.value; }
+    // A black and white picture as transparent pixels (white kept), made once it has loaded.
+    maskShape(file) {
+        const image = this.loaded(file);
+        if (!image) return null;
+        this.masks ||= new Map();
+        let shape = this.masks.get(file);
+        if (!shape) {
+            shape = canvas(image.naturalWidth, image.naturalHeight);
+            const ctx = context(shape);
+            ctx.drawImage(image, 0, 0);
+            const data = ctx.getImageData(0, 0, shape.width, shape.height);
+            for (let i = 0; i < data.data.length; i += 4) { data.data[i + 3] = data.data[i] >= 128 ? 255 : 0; data.data[i] = data.data[i + 1] = data.data[i + 2] = 255; }
+            ctx.putImageData(data, 0, 0);
+            this.masks.set(file, shape);
+        }
+        return shape;
+    }
     async preload(doc) {
         for (const l of doc.layers) if (l.src) { const img = await this.image(l.src); this.images.get(l.src).value = img; }
-        await loadFonts(textFonts(doc));
+        await loadFonts(textFonts(doc)).catch(error => console.warn('FreeVideo image editor fonts unavailable; using fallback fonts.', error));
     }
     // Raster of a layer at scale × its native pixels, edits applied (before
     // adjustments and mask), reusing the cached prefix of its edits. exact: for a saved
@@ -1094,6 +1120,14 @@ export class Renderer {
                     const toSrc = new DOMMatrix().scaleSelf(scale, scale).multiplySelf(layerMatrix(layer).inverse()).multiplySelf(layerMatrix(src)).scaleSelf(1 / scale, 1 / scale);
                     ctx.setTransform(toSrc); ctx.drawImage(m, 0, 0);
                 }
+            } else if (part.shape === 'mask') {
+                // A picture the service made from a click: white where the object is, the size of its layer's pixels.
+                const src = doc.layers.find(l => l.id === part.layer), shape = this.maskShape(part.file);
+                if (src && shape) {
+                    const toSrc = new DOMMatrix().scaleSelf(scale, scale).multiplySelf(layerMatrix(layer).inverse()).multiplySelf(layerMatrix(src))
+                        .scaleSelf(src.nw / shape.width, src.nh / shape.height);
+                    ctx.setTransform(toSrc); ctx.imageSmoothingEnabled = false; ctx.drawImage(shape, 0, 0);
+                }
             } else {
                 ctx.setTransform(toLocal);
                 ctx.fillStyle = '#fff';
@@ -1115,7 +1149,7 @@ export class Renderer {
         return out;
     }
     text(layer, scale) {
-        const key = `${layer.id}@${scale}#text`, look = JSON.stringify([layer.text, layer.nw, layer.nh]);
+        const key = `${layer.id}@${scale}#text`, look = JSON.stringify([layer.text, layer.nw, layer.nh, fontCSS(layer.text.font, layer.text.weight, layer.text.size)]);
         const cached = this.layers.get(key);
         if (cached?.look === look) return cached.canvas;
         const t = layer.text, c = canvas(layer.nw * scale, layer.nh * scale), ctx = c.getContext('2d');
@@ -1210,4 +1244,58 @@ export class Renderer {
         for (const entry of this.layers.values()) { if (entry.canvas) { entry.canvas.width = entry.canvas.height = 0; } }
         this.layers.clear(); this.images.clear();
     }
+}
+
+// The outline of a black and white picture as closed polylines of its pixel corners, one loop per border
+// (inside kept clockwise), with runs along one direction joined. Used to draw the selection's ants as one line.
+export function traceOutline(alpha, w, h) {
+    const on = (x, y) => x >= 0 && y >= 0 && x < w && y < h && alpha[(y * w + x) * 4 + 3] >= 128;
+    const stride = w + 1, next = new Map();
+    const add = (x1, y1, x2, y2) => { const k = y1 * stride + x1; (next.get(k) || next.set(k, []).get(k)).push(y2 * stride + x2); };
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        if (!on(x, y)) continue;
+        if (!on(x, y - 1)) add(x, y, x + 1, y);
+        if (!on(x + 1, y)) add(x + 1, y, x + 1, y + 1);
+        if (!on(x, y + 1)) add(x + 1, y + 1, x, y + 1);
+        if (!on(x - 1, y)) add(x, y + 1, x, y);
+    }
+    const loops = [];
+    for (const [start, list] of next) {
+        while (list.length) {
+            const loop = [start];
+            let at = list.pop();
+            while (at !== start) {
+                loop.push(at);
+                const out = next.get(at);
+                if (!out?.length) break;
+                at = out.pop();
+            }
+            const pts = loop.map(v => [v % stride, Math.floor(v / stride)]), kept = [];
+            for (let i = 0; i < pts.length; i++) {
+                const a = pts[(i + pts.length - 1) % pts.length], b = pts[i], c = pts[(i + 1) % pts.length];
+                if ((b[0] - a[0]) * (c[1] - b[1]) !== (b[1] - a[1]) * (c[0] - b[0])) kept.push(b);
+            }
+            if (kept.length > 1) loops.push(kept);
+        }
+    }
+    return loops;
+}
+
+// Douglas-Peucker on a closed loop: staircase borders become straight runs, within eps pixels of the 0.5 border.
+export function simplifyLoop(loop, eps) {
+    if (loop.length < 4) return loop;
+    let far = 0, best = -1;
+    for (let i = 1; i < loop.length; i++) { const d = Math.hypot(loop[i][0] - loop[0][0], loop[i][1] - loop[0][1]); if (d > best) { best = d; far = i; } }
+    const keep = new Array(loop.length).fill(false); keep[0] = keep[far] = true;
+    const run = (a, b) => {
+        const pt = i => loop[i % loop.length], [ax, ay] = pt(a), [bx, by] = pt(b), len = Math.hypot(bx - ax, by - ay) || 1;
+        let at = -1, worst = eps;
+        for (let i = a + 1; i < b; i++) {
+            const [x, y] = pt(i), d = Math.abs((bx - ax) * (ay - y) - (ax - x) * (by - ay)) / len;
+            if (d > worst) { worst = d; at = i; }
+        }
+        if (at >= 0) { keep[at % loop.length] = true; run(a, at); run(at, b); }
+    };
+    run(0, far); run(far, loop.length);
+    return loop.filter((_, i) => keep[i]);
 }

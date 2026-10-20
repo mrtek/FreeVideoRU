@@ -7,14 +7,15 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, CancelledError
 
-from .bootstrap import PACKAGE, model_target
+from .bootstrap import PACKAGE, model_target, installation_model_files
 from .locking import runtime_lock
 from .monitoring import save
-from .install_tuning import required_models, hf_receipt, unchanged_before
+from .install_tuning import hf_receipt, unchanged_before
 from . import network
 from .storage import record_download, compact_sources, fingerprint
 from . import model_transfer
 from . import model_repair
+from .install_activity import byte_progress, step
 
 
 def model_headers(source):
@@ -67,13 +68,8 @@ def models(plan):
     ledger = root / 'verified-models.json'
     stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
     model_dir, encoder_dir = (Path(plan[name]).expanduser().resolve() for name in ('model_dir', 'encoder_dir'))
-    from . import prepared_model
     prepared = plan.get('prepared_model')
-    files = list(required_models(json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), plan.get('reuse_cache') or prepared))
-    files += prepared_model.files(prepared)
-    from .sampling_assets import install_files, usable_with
-    if prepared or (plan.get('reuse_cache') and usable_with(plan['reuse_cache'])):
-        files += install_files(bool(plan.get('sampling_caches')))
+    files = installation_model_files(prepared, plan.get('reuse_cache'), plan.get('sampling_caches'))
     mode = plan.get('verification', 'auto')
     from .local_models import key as local_key, import_file
     lock = threading.RLock()
@@ -215,7 +211,8 @@ def models(plan):
             # ownership of, replace, or download over that newly present file.
             if path.exists() or path.is_symlink():
                 prior = {}
-                if not verified(path, row, prior, mode=mode, hf_directory=hf_directory):
+                if not verified(path, row, prior, mode=mode, hf_directory=hf_directory,
+                                progress=byte_progress('verify_progress', path, name=NAMES[family(row)][0])):
                     raise ValueError('Model destination appeared with unexpected content: ' + str(path))
                 complete(row, path, prior[str(path)], 'verify')
                 return
@@ -409,22 +406,30 @@ def verify_cache(plan, cache):
         raise ValueError('Prepared cache is not complete; original model files retained')
     ledger = Path(plan['root']) / 'verified-cache.json'
     stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
-    for row in groups:
+    assets = list(validate_catalog(manifest, count))
+    total = len(groups) + len(assets)
+    step('Model files verifying', 0, total)
+    for index, row in enumerate(groups, 1):
         if row['file'] != row['group'] + '.safetensors':
             raise ValueError('Unexpected FP8 group path; original files retained')
         if not verified(cache / row['file'], row, stamps, mode=plan.get('verification', 'auto'),
-                        producer_receipt=cache / 'manifest.json'):
+                        producer_receipt=cache / 'manifest.json',
+                        progress=byte_progress('verify_progress', cache / row['file'])):
             raise ValueError('Existing FP8 cache failed integrity check: ' + row['file'] + '. Rerun setup with --rebuild-cache; failed files are retained.')
-    for row, identity in validate_catalog(manifest, count):
+        step('Model files verifying', index, total)
+    for index, (row, identity) in enumerate(assets, len(groups) + 1):
         path = asset_path(cache, row['file'])
-        if not verified(path, row, stamps, mode=plan.get('verification', 'auto')):
+        if not verified(path, row, stamps, mode=plan.get('verification', 'auto'),
+                        progress=byte_progress('verify_progress', path)):
             raise ValueError('AdaLN model asset failed integrity check: ' + row['file'])
         check_table(path, row, identity, verify_hash=False)
+        step('Model files verifying', index, total)
     save(ledger, stamps)
     return manifest
 
 
 def prepare(plan, out):
+    step('Model files preparing')
     root = Path(plan['root'])
     prepared = plan.get('prepared_model')
     cache_format = dict(capability=plan.get('inventory', {}).get('hardware', {}).get('capability'),
@@ -513,7 +518,13 @@ def main():
     if args.cleanup:
         record = json.loads((Path(plan['root']) / 'prepared-cache.json').read_text(encoding='utf-8'))
         verify_cache(plan, record['cache'])
-        result = compact_sources(plan, json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), args.out)
+        reporters = {}
+        def cleanup_progress(path, done, total):
+            if path not in reporters:
+                reporters[path] = byte_progress('verify_progress', path)
+            reporters[path](done, total)
+        result = compact_sources(plan, json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), args.out,
+                                 progress=cleanup_progress)
         print(json.dumps({'event': 'storage_compacted', **result}), flush=True)
     elif args.prepare:
         prepare(plan, args.out)

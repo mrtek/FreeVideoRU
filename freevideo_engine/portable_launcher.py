@@ -7,7 +7,7 @@ import time
 
 from . import component_licenses, launch_view, portable, processes
 from .comfy_launcher import Launcher
-from .comfy_launcher_runtime import Controller, local_url, matches_server, server_info
+from .comfy_launcher_runtime import Controller, local_url, loopback_url, matches_listener, matches_server, server_info
 from .monitoring import save
 from .long_paths import io_path, resolved, plain, plain_text
 
@@ -36,7 +36,9 @@ class PortableController(Controller):
         self.selection = dict(root=plain(portable.inside(self.root, self.bundle['comfy'])),
             engine=str(self.root/'engine'), source=str(self.source),
             python=plain(portable.inside(self.root, self.bundle['python'])),
-            url=local_url(url or 'http://127.0.0.1:8188'), ready=False, separate=False)
+            url=local_url(url or 'http://127.0.0.1:8188'), ready=False, separate=False,
+            lan_access=(values.get('installation') or {}).get('lan_access', values.get('lan_access', False)) is True,
+            lan_port=(values.get('installation') or {}).get('lan_port', (self.selection or {}).get('lan_port')))
         self.state = dict(status='bundled', selection=dict(self.selection),
                           engine_update_available=self.engine_outdated())
         self.restore_terminal(self.selection['engine'])
@@ -133,10 +135,28 @@ class PortableController(Controller):
         url = self.selection['url']
         info = server_info(url)
         if matches_server(info, self.selection['root'], self.selection['engine'], self.source):
+            if self.comfy_controller is not None and self.comfy_controller.owns_server():
+                # Our own server on this port: its controller moves the listening
+                # address and the LAN proxy. A server left on the previous source
+                # does not match and restarts below, as before.
+                self.selection['ready'] = True
+                self.ensure_shortcut()
+                self.attach_console(info)
+                try:
+                    return self.comfy_controller._configure_access(
+                        dict(url=url, lan_access=self.selection['lan_access']), connect=True)
+                finally:
+                    self._sync_access()
+            if not matches_listener(info, url):
+                self.state = dict(self.state, status='restart-required', url=loopback_url(url),
+                    error='The ComfyUI already running does not use this address. After its jobs finish, restart it with this address and connect again.')
+                return
             self.selection['ready'] = True
             self.ensure_shortcut()
             self.attach_console(info)
-            self.state = dict(self.state, status='open', url=url+'/?freevideo=launch', selection=dict(self.selection))
+            self.state = dict(self.state, status='open', url=loopback_url(url)+'/?freevideo=launch', selection=dict(self.selection))
+            if self.selection['lan_access']:
+                self._configure_access(dict(lan_access=True))
             return
         # Windows keeps a folder made by a run as administrator, or under another
         # account, from this account; the bundled Python would only report a
@@ -159,6 +179,10 @@ class PortableController(Controller):
                 'import sys;sys.path.insert(0,sys.argv[1]);'
                 'from freevideo_engine.portable import main;'
                 'sys.exit(main(sys.argv[2], ["--initialize"]))', str(self.source), str(self.root)]
+        # -I ignores PYTHONUTF8, so name the mode on the command line: the start
+        # process then reads and writes UTF-8 like every other FreeVideo process,
+        # whatever the system code page is.
+        command[1:1] = ['-X', 'utf8']
         tail = ''
         view = launch_view.view_for(self.root)
         self.progress(dict(stage='verify', done=0, total=None, detail='Check local files'))
@@ -201,11 +225,53 @@ class PortableController(Controller):
         self.progress(dict(stage='comfy', detail='Open FreeVideo workflow'))
         opened = portable.connect(self.root, self.bundle, machine, self.progress_keywords,
                                   self.cancelled, url=url, on_controller=self.retain_comfy_controller,
-                                  previous=self.comfy_controller)
+                                  previous=self.comfy_controller, lan_access=self.selection['lan_access'],
+                                  lan_port=self.selection.get('lan_port'))
+        if self.comfy_controller is not None:
+            self._sync_access()
         self.selection['ready'] = True
         self.ensure_shortcut()
         self.state = dict(self.state, status='open', url=opened, selection=dict(self.selection),
+                          lan_status=self.comfy_controller.state.get('lan_status', '') if self.comfy_controller else '',
                           overall=dict(done=3, total=3, label='Ready'))
+
+    def _sync_access(self, status=True):
+        child = self.comfy_controller
+        self.selection.update({key: child.selection[key] for key in ('url', 'lan_access', 'lan_port')
+                               if key in child.selection})
+        self.access_links = child.access_links
+        self.state = dict(self.state, selection=dict(self.selection), lan_status=child.state.get('lan_status', ''))
+        if status:
+            self.state = dict(self.state, status=child.state['status'], url=child.state.get('url', ''))
+
+    def _configure_access(self, values, *, connect=False):
+        if connect:
+            return self._launch(dict(installation=dict(self.selection, **values)))
+        if self.comfy_controller is None:
+            pending = self.state.get('engine_update_available', False)
+            try:
+                return super()._configure_access(values)
+            finally:
+                self.state = dict(self.state, engine_update_available=pending)
+        try:
+            self.comfy_controller._configure_access(values)
+        finally:
+            self._sync_access()
+
+    def stop_owned_server(self, *, grace=5):
+        if self.comfy_controller is not None:
+            self.comfy_controller.stop_owned_server(grace=grace)
+        super().stop_owned_server(grace=grace)
+
+    def check_access_proxy(self):
+        if self.comfy_controller is None:
+            return super().check_access_proxy()
+        if self.comfy_controller.access_proxy is None:
+            return
+        status = self.comfy_controller.state.get('status')
+        self.comfy_controller.check_access_proxy()
+        # The package's own state is copied only when this check saw ComfyUI stop.
+        self._sync_access(self.comfy_controller.state.get('status') != status)
 
     def ensure_shortcut(self):
         from .desktop_shortcut import create_after_install
@@ -218,6 +284,10 @@ class PortableController(Controller):
             if self._closed or self.cancelled.is_set():
                 controller.close()
                 raise RuntimeError('Startup cancelled; all files retained')
+            # An external connection can own a proxy directly on the package
+            # controller. Retire it before handing startup to the inner controller;
+            # later switch-off and polling operate through that inner controller.
+            self.stop_access_proxy()
             self.comfy_controller = controller
 
     def close(self):
@@ -266,8 +336,10 @@ class PortableLauncher(Launcher):
         if self.loading_settings:
             return
         self.queue_save()
+        if self.launch_selection and _ and _[0] in (str(self.url), str(self.lan_access)):
+            return  # The shared settings saver applies the connection change.
         if not self.controller.busy:
-            self.controller.restore({'url': self.url.get()})
+            self.controller.restore({'url': self.url.get(), 'lan_access': self.lan_access.get()})
             self.launch_selection = dict(self.controller.selection)
             self.reset_browser()
             self.refresh()
@@ -309,6 +381,8 @@ def gui(root):
 def portable_session(root):
     from .launcher_session import Session
     root = Path(plain(resolved(root)))
+    from .triton_compat import own_temporary_environment
+    own_temporary_environment(root / 'engine')
     os.environ.update(portable.environment(root, portable.manifest(root)))
     os.environ['FREEVIDEO_LAUNCHER_HOME'] = str(root/'engine/launcher')
     class PortableSession(Session):
@@ -322,12 +396,7 @@ def portable_session(root):
             self.page = 'launcher'
 
         def edit(self, key, value):
-            if key == 'url' and not self.controller.busy:
-                value = local_url(value)
-                self.controller.restore({'url': value})
-                self.remember(self.controller.selection)
-                self.browser_attempted = False
-            elif key in ('language', 'token'):
+            if key in ('url', 'lan_access', 'language', 'token'):
                 super().edit(key, value)
 
         def action(self, name, accepted=False):

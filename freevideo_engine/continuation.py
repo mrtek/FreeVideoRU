@@ -22,6 +22,8 @@ FIRST_FRAME_NOTE = ('The reference image is the very first frame of this whole f
                     'location, framing and colour tone as in that image throughout.')
 FIRST_FRAME_MAX_BYTES = 8 * 1024 * 1024
 FIRST_FRAME_MAX_SIDE = 4096
+FIRST_SOUND_MAX_BYTES = 4 * 1024 * 1024
+FIRST_SOUND_SECONDS = 6
 # The picture the model is given is half the side of the film's first frame, but not under this
 # on its short side: on a real six-part chain it held framing and colour as well as the full
 # picture for a third of the extra sampling time. Smaller pictures are not tested.
@@ -29,8 +31,33 @@ FIRST_FRAME_REFERENCE_SHORT = 384
 VERSION = 1
 
 MISSING = 'The previous video has no usable continuation data. Generate it again with this version of FreeVideo.'
-SIZE_MISMATCH = 'Use the same width and height as the previous video.'
-UNSUPPORTED = 'Video continuation requires full two-pass text generation on an NVIDIA GPU, without first frames, last frames or reference media.'
+SIZE_MISMATCH = 'Use the same aspect ratio as the previous video.'
+# Every refusal starts with UNSUPPORTED, then says what to change.
+UNSUPPORTED = 'Continue from video cannot be used with these settings.'
+UNSUPPORTED_DEVICE = UNSUPPORTED + ' Continuing a video needs an NVIDIA GPU or a Mac. To make a new video, clear "Continue from video".'
+UNSUPPORTED_PASSES = UNSUPPORTED + ' Turn on "Two-pass acceleration" and turn off the first-pass preview.'
+UNSUPPORTED_REFINE = UNSUPPORTED + ' Clear either "Second pass of preview" or "Continue from video".'
+UNSUPPORTED_MEDIA = UNSUPPORTED + ' Connect up to 3 pictures as references, and remove video, audio and pre-encoded inputs.'
+# A continued part keeps the cast's pictures, one per person and at most three people in a frame.
+PICTURES_MAX = 3
+
+
+def pick_pictures(rows, person):
+    """The pictures a continued part keeps from image rows in panel order: at most PICTURES_MAX.
+
+    person(row) is the id of the character a row belongs to, or None. With two or more characters each keeps
+    only the last of its rows (the face close-up, or the one picture its card has) so that everyone is seen; the
+    other pictures follow. With none or one character the first rows are kept."""
+    rows = list(rows)
+    last = {}
+    for index, row in enumerate(rows):
+        if person(row) is not None:
+            last[person(row)] = index
+    if len(last) < 2:
+        return rows[:PICTURES_MAX]
+    faces = [rows[index] for index in sorted(last.values())]
+    others = [row for row in rows if person(row) is None]
+    return (faces + others)[:PICTURES_MAX]
 INVALID_FRAMES = 'Frame count must be 5 + 17n and at least 39 (39, 56, 73, 90, ...).'
 INVALID_FILE = 'Choose an existing MP4 video using its absolute path.'
 
@@ -48,8 +75,6 @@ def audio_context():
 
 def supported():
     """Platform capability, without loading Torch or probing a GPU."""
-    if sys.platform == 'darwin':
-        return False, 'macos'
     from .paths import data_root
     try:
         machine = json.loads((data_root() / 'machine.json').read_text(encoding='utf-8'))
@@ -57,7 +82,7 @@ def supported():
         machine = {}
     if not isinstance(machine, dict):
         machine = {}
-    if machine.get('device_backend', 'cuda') != 'cuda':
+    if machine.get('device_backend', 'cuda') not in ('cuda', 'mps'):
         return False, 'unsupported_device'
     return True, None
 
@@ -68,17 +93,49 @@ def validate_frames(frames):
 
 
 def validate_route(*, task='t2va', two_pass=True, preview=False, refine_from=None,
-                   media=None, backend=None, anchor=False):
+                   media=None, backend=None, anchor=False, sound=False):
+    """anchor: the part also takes pictures (an explicit anchor or the cast's pictures);
+    sound: the engine adds the film's opening sound as the one audio reference."""
     media = media or {}
     references = media.get('references')
-    valid_reference = (anchor and isinstance(references, list) and len(references) == 1
-                       and isinstance(references[0], dict)
-                       and references[0].get('kind') == 'image')
-    if (not supported()[0] or backend not in (None, 'cuda') or task != ('ref2va' if anchor else 't2va')
-            or not two_pass or preview or refine_from
-            or any(media.get(key) for key in ('first', 'last', 'conditioning_info'))
+    kinds = ([row.get('kind') if isinstance(row, dict) else None for row in references]
+             if isinstance(references, list) else None)
+    valid_reference = (kinds is not None and kinds.count('image') + kinds.count('audio') == len(kinds)
+                       and kinds.count('image') <= (PICTURES_MAX if anchor else 0)
+                       and kinds.count('audio') == (1 if sound else 0))
+    valid_task = task == ('ref2va' if anchor else 't2va')
+    if sound:
+        valid_task = valid_reference and task in (('ref2va', 'ref2va_av') if anchor else ('t2va', 'ref2va', 'ref2va_audio'))
+    if not supported()[0] or backend not in (None, 'cuda', 'mps'):
+        raise ValueError(UNSUPPORTED_DEVICE)
+    if refine_from:
+        raise ValueError(UNSUPPORTED_REFINE)
+    if not two_pass or preview:
+        raise ValueError(UNSUPPORTED_PASSES)
+    # Keyframes reach a continued part as pictures (comfy_media.continued); here they are a request error.
+    if (not valid_task or any(media.get(key) for key in ('first', 'last', 'conditioning_info'))
             or (references and not valid_reference)):
-        raise ValueError(UNSUPPORTED)
+        raise ValueError(UNSUPPORTED_MEDIA)
+
+
+def encoded_references(conditions, task, anchor):
+    """Check a continued part's encoded references: its pictures, then the engine's sound. True when the sound is there."""
+    rows = conditions or []
+    images = [row for row in rows if row['kind'] == 'image' and row.get('audio_latent') is None]
+    sound = (task == ('ref2va_av' if anchor else 'ref2va_audio') and len(rows) == len(images) + 1
+             and rows[-1]['kind'] == 'audio' and rows[-1].get('audio_latent') is not None)
+    if not rows or anchor != bool(images) or len(images) + sound != len(rows) or len(images) > PICTURES_MAX:
+        raise ValueError('Continuation pictures must be one to %d images, followed only by its own sound' % PICTURES_MAX)
+    return sound
+
+
+def continuation_pictures(media):
+    """The pictures a continued part takes: image references only, at most PICTURES_MAX (one per person)."""
+    references = media.get('references') or []
+    pictures = [row for row in references if row.get('kind') == 'image']
+    if len(pictures) != len(references) or len(pictures) > PICTURES_MAX:
+        raise ValueError(UNSUPPORTED_MEDIA)
+    return pictures
 
 
 def anchor_media(media, path):
@@ -198,6 +255,101 @@ def _chain_first_frame(request, video_path):
     return pack_first_frame(first_frame_png(video_path))
 
 
+def pack_first_sound(raw):
+    """A bounded stereo PCM16 WAV, starting at the film's first audio sample."""
+    import io
+    import wave
+    try:
+        if not isinstance(raw, bytes) or len(raw) > FIRST_SOUND_MAX_BYTES:
+            raise ValueError('Invalid first sound')
+        with wave.open(io.BytesIO(raw), 'rb') as source:
+            rate, samples = source.getframerate(), source.getnframes()
+            if (source.getnchannels() != 2 or source.getsampwidth() != 2 or source.getcomptype() != 'NONE'
+                    or rate <= 0 or not 0 < samples <= round(FIRST_SOUND_SECONDS * rate)
+                    or len(source.readframes(samples + 1)) != samples * 4):
+                raise ValueError('Invalid first sound')
+        return dict(format='wav', rate=rate, data=base64.b64encode(raw).decode('ascii'))
+    except (ValueError, EOFError, wave.Error, OSError):
+        raise ValueError('Invalid first sound') from None
+
+
+def unpack_first_sound(value):
+    """Recheck the record's WAV, including its declared rate and decoded size."""
+    try:
+        if (value['format'] != 'wav' or type(value['rate']) is not int
+                or not isinstance(value['data'], str)
+                or len(value['data']) > (FIRST_SOUND_MAX_BYTES + 2) // 3 * 4):
+            raise ValueError('Invalid first sound')
+        raw = base64.b64decode(value['data'], validate=True)
+        if pack_first_sound(raw) != value:
+            raise ValueError('Invalid first sound')
+        return raw
+    except (KeyError, TypeError, ValueError, OSError):
+        raise ValueError('Invalid first sound') from None
+
+
+def first_sound_wav(video_path):
+    """Decode at most six seconds, at the source rate; duplicate mono without changing its gain."""
+    import io
+    import wave
+    import av
+    with av.open(str(video_path)) as container:
+        stream = container.streams.audio[0]
+        rate = stream.codec_context.sample_rate
+        if rate <= 0:
+            raise ValueError('Invalid first sound')
+        # Read one sample past the size limit to reject an oversized opening, while still
+        # accepting a short high-rate source whose actual WAV fits within the bound.
+        limit = (FIRST_SOUND_MAX_BYTES - 44) // 4
+        count = min(round(FIRST_SOUND_SECONDS * rate), limit + 1)
+        saved = 0
+        mono = len(stream.codec_context.layout.channels) == 1
+        resampler = av.AudioResampler(format='s16', layout='mono' if mono else 'stereo', rate=rate)
+        chunks = []
+        def keep(frame):
+            nonlocal count, saved
+            samples = frame.to_ndarray().reshape(-1, 1 if mono else 2)[:count]
+            if mono:
+                samples = samples.repeat(2, axis=1)
+            chunks.append(samples.astype('<i2', copy=False).tobytes())
+            count -= len(samples)
+            saved += len(samples)
+            if saved > limit:
+                raise ValueError('Invalid first sound')
+        for frame in container.decode(stream):
+            for converted in resampler.resample(frame):
+                keep(converted)
+            if count == 0:
+                break
+        if count:
+            for converted in resampler.resample(None):
+                keep(converted)
+    target = io.BytesIO()
+    with wave.open(target, 'wb') as output:
+        output.setparams((2, 2, rate, 0, 'NONE', 'not compressed'))
+        output.writeframes(b''.join(chunks))
+    return target.getvalue()
+
+
+def chain_first_sound(request, video_path=None):
+    """Carry the opening sound unchanged; only the first part may supply it from its own file."""
+    try:
+        metadata = _snapshot_value(request)['metadata']
+        if metadata.get('first_sound') is not None:
+            unpack_first_sound(metadata['first_sound'])
+            return metadata['first_sound']
+        if metadata['chain']['segment'] != 1 or video_path is None:
+            return None
+        from .continuation_store import video_id
+        if video_id(video_path) != request.get('source_id'):
+            raise ValueError(MISSING)
+        return pack_first_sound(first_sound_wav(video_path))
+    except (ValueError, MemoryError):
+        raise
+    except Exception:
+        raise ValueError('Invalid first sound') from None
+
+
 def validate_path(video_path):
     path = Path(video_path)
     if not path.is_absolute() or path.suffix.lower() != '.mp4' or not path.is_file():
@@ -244,8 +396,10 @@ def prepare(video_path, canvas, manifest=None, sampling_plan=None, *, directory=
 def _prepare_snapshot(request, value, canvas, manifest=None, sampling_plan=None):
     validate_frames(canvas['frames'])
     metadata = value['metadata']
+    # A record of another size is set aside like a missing one: the previous video's own ending is
+    # encoded instead, which scales the same shape and refuses another one.
     if any(metadata['geometry'][key] != canvas[key] for key in ('width', 'height')):
-        raise ValueError(SIZE_MISMATCH)
+        raise ValueError(MISSING)
     if manifest is not None and metadata['identity'] != identity(manifest):
         raise ValueError(MISSING)
     if sampling_plan is not None and metadata['first_canvas'] != {
@@ -313,9 +467,12 @@ def validate_snapshot(request, canvas, manifest=None, sampling_plan=None):
     return _prepare_snapshot(request, _snapshot_value(request), canvas, manifest, sampling_plan)
 
 
-def summary(request):
-    return dict({key: request[key] for key in ('overlap_frames', 'new_frames', 'frame_origin', 'audio_origin', 'segment')},
-                audio_lead_in_samples=request.get('audio_lead_in_samples', 0))
+def summary(request, *, hide_tail_frames=0):
+    result = dict({key: request[key] for key in ('overlap_frames', 'new_frames', 'frame_origin', 'audio_origin', 'segment')},
+                  audio_lead_in_samples=request.get('audio_lead_in_samples', 0))
+    if hide_tail_frames:
+        result['new_frames'] -= validate_hide_tail(hide_tail_frames)
+    return result
 
 
 def load(request, stage):
@@ -329,17 +486,36 @@ def load(request, stage):
                 audio=torch.from_numpy(value['audio'].copy()))
 
 
-def tail(video):
+# Dialogue parts settle into an ending over their last ~1.5 s. Hiding 34 frames also hid the pose reset, but the model
+# kept talking through the longer hidden tail and the next part opened with stray speech; 17 frames keep the seam
+# level steps as low with far less of it.
+HIDE_TAIL_FRAMES = 17
+
+
+def validate_hide_tail(frames):
+    # 34 stays valid for continuations recorded by earlier versions.
+    if type(frames) is not int or frames not in (0, 17, 34):
+        raise ValueError('Hidden tail must be 0, 17 or 34 frames')
+    return frames
+
+
+def tail(video, *, hide_tail_frames=0):
     # clone avoids keeping the entire clip's storage behind a small view.
+    hidden = validate_hide_tail(hide_tail_frames) // 17 * 5
+    if hidden:
+        return video[:, :, -hidden - LATENT_FRAMES:-hidden].detach().cpu().clone()
     return video[:, :, -LATENT_FRAMES:].detach().cpu().clone()
 
 
-def tail_data(first, video, audio, canvas, sampling_plan, manifest, request=None):
+def tail_data(first, video, audio, canvas, sampling_plan, manifest, request=None, *, hide_tail_frames=0):
     chain = ({key: request[key] for key in ('segment', 'frame_origin', 'audio_origin')} if request
              else dict(segment=1, frame_origin=0, audio_origin=0))
-    start = audio_origin(chain['frame_origin'] + canvas['frames'] - OVERLAP_FRAMES) - chain['audio_origin']
-    return dict(video_lo=first, video_hi=tail(video), audio=audio[:, :, start:].detach().cpu().clone(),
-                metadata=dict(identity=identity(manifest), geometry={key: canvas[key] for key in ('width', 'height', 'frames')},
+    kept = canvas['frames'] - validate_hide_tail(hide_tail_frames)
+    start = audio_origin(chain['frame_origin'] + kept - OVERLAP_FRAMES) - chain['audio_origin']
+    end = round(kept * 40 / 24) if hide_tail_frames else audio.shape[2]
+    return dict(video_lo=first, video_hi=tail(video, hide_tail_frames=hide_tail_frames),
+                audio=audio[:, :, start:end].detach().cpu().clone(),
+                metadata=dict(identity=identity(manifest), geometry=dict(width=canvas['width'], height=canvas['height'], frames=kept),
                     first_canvas={key: sampling_plan['first'][key] for key in ('width', 'height')}, chain=chain,
                     **({'source_id': request['source_id']} if request and 'source_id' in request else {})))
 
@@ -375,13 +551,16 @@ class Prefix:
     update. Audio is either kept clean or re-noised at each call, and restored
     on return. Only re-noising owns an independent RNG.
     """
-    def __init__(self, transformer, data, seed, device, *, video_offset=0):
+    def __init__(self, transformer, data, seed, device, *, video_offset=0, audio_offset=0):
         import torch
         from diffusers.modular_pipelines.minimax_h3.before_denoise import patchify_video_latents
         self.audio_context = validate_audio_context(data.get('audio_context', AUDIO_CONTEXT_DEFAULT))
         if type(video_offset) is not int or video_offset < 0:
             raise ValueError('Invalid continuation reference row offset')
         self.video_offset = video_offset
+        if type(audio_offset) is not int or audio_offset < 0:
+            raise ValueError('Invalid continuation reference row offset')
+        self.audio_offset = audio_offset
         self.video = data['video'].to(device=device, dtype=torch.float32)
         self.audio = data['audio'].to(device=device, dtype=torch.float32)
         if (self.video.ndim != 5 or self.video.shape[:3] != (1, transformer.config.in_channels, LATENT_FRAMES)
@@ -400,18 +579,20 @@ class Prefix:
         import torch
         video, audio = kwargs['hidden_states'][0], kwargs['audio_hidden_states'][0]
         count, ticks = self.video_rows.shape[0], self.audio.shape[2]
-        if video.shape[0] <= self.video_offset + count or audio.shape[0] // 2 < ticks:
+        generated = audio.shape[0] - self.audio_offset
+        if video.shape[0] <= self.video_offset + count or generated // 2 < ticks:
             raise ValueError(MISSING)
         self.current_video = video
         self.restore_video()
-        audio_rows = torch.cat([torch.arange(ticks, device=audio.device) + channel * (audio.shape[0] // 2)
+        audio_rows = torch.cat([torch.arange(ticks, device=audio.device) + self.audio_offset + channel * (generated // 2)
                                 for channel in range(2)])
         row_times = kwargs['timestep'][kwargs['timestep_indices']].clone()
         if self.audio_context == 'clean':
             audio[audio_rows] = self.audio_rows
             row_times[kwargs['audio_indices'][audio_rows]] = CLEAN_T
         else:
-            audio_t = row_times[kwargs['audio_indices'][0]]
+            # The first generated row: a voice reference ahead of it stays clean.
+            audio_t = row_times[kwargs['audio_indices'][self.audio_offset]]
             # scale_noise uses H3's clean-at-one convention, not a standard DDPM clock.
             audio[audio_rows] = self.scheduler.scale_noise(self.audio_rows, audio_t, self.noise)
         row_times[kwargs['video_indices'][self.video_offset:self.video_offset + count]] = CLEAN_T
@@ -429,12 +610,13 @@ class Prefix:
 
 
 @contextmanager
-def sampling(transformer, data, seed, device, *, video_offset=0):
+def sampling(transformer, data, seed, device, *, video_offset=0, audio_offset=0):
     if data is None:
         yield None
         return
     # Keep the legacy constructor call identical for existing continuations.
-    prefix = Prefix(transformer, data, seed, device, **({'video_offset': video_offset} if video_offset else {}))
+    prefix = Prefix(transformer, data, seed, device, **({'video_offset': video_offset} if video_offset else {}),
+                    **({'audio_offset': audio_offset} if audio_offset else {}))
     handle = transformer.register_forward_pre_hook(prefix.before, with_kwargs=True, prepend=True)
     try:
         yield prefix

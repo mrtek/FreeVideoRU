@@ -20,11 +20,32 @@ guard.
 """
 import json
 import os
+import sys
 from pathlib import Path
 import threading
 import time
 
-from .encoder_prewarm import CHUNK, GiB, available_memory
+from .encoder_prewarm import CHUNK, GiB, available_memory as host_available_memory, cgroup_memory
+
+
+def available_memory():
+    """Memory the file cache may use for this read: physical RAM, not commit.
+
+    Pages read through a reused buffer sit in the OS file cache. They are
+    reclaimable and add nothing to the commit charge, so on Windows the commit
+    headroom (which pinned weights and sampling may have used up) is no bound
+    here. The cgroup limit on Linux and the system reserve still apply.
+    """
+    available, complete = host_available_memory()
+    try:
+        from .system import system_memory
+        physical = system_memory().get('physical_available_bytes')
+    except Exception:
+        physical = None
+    if sys.platform == 'win32' and type(physical) is int:
+        group = cgroup_memory().get('available_bytes')
+        available = physical if group is None else min(physical, group)
+    return available, complete
 
 
 def decoder_ranges(base):
@@ -61,11 +82,29 @@ class DecoderReadAhead:
         self.ram_budget_bytes = ram_budget_bytes
         self.budget_is_estimate = bool(budget_is_estimate)
         self.drive_idle = False
+        self.load_read_rate = None
+        self.total_bytes = None
         self.cancelled = threading.Event()
         self.thread = None
         self.result = dict(state='not-started', read_bytes=0, elapsed_seconds=0.,
                            gpu_allocation_bytes=0, private_buffer_bytes=CHUNK,
                            scope='Decoder-only checkpoint pages; reclaimable OS cache, no GPU residency')
+
+    # Reading from the start of sampling matters only when the drive is too
+    # slow to finish in the last two steps. The rate is what the model load
+    # measured; unknown (a resident model read nothing) keeps the last two steps.
+    EARLY_MARGIN = 1.25
+
+    def due(self, remaining_seconds):
+        rate = self.load_read_rate
+        if self.thread is not None or not rate or rate <= 0 or remaining_seconds is None:
+            return False
+        if self.total_bytes is None:
+            try:
+                self.total_bytes = sum(hi - lo for _, spans, _ in decoder_ranges(self.base) for lo, hi in spans)
+            except Exception:
+                self.total_bytes = 0
+        return self.total_bytes > 0 and self.total_bytes / rate * self.EARLY_MARGIN >= remaining_seconds
 
     def start(self, *, drive_idle=False):
         if self.thread is not None:

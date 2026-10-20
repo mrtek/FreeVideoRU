@@ -117,11 +117,15 @@ def checksums(builds):
             *('%s  %s' % (builds[c]['sha256'], builds[c]['path'].name) for c in PLATFORMS), '```', '</details>', '']
 
 
+# The same offline packages, mirrored to ModelScope for downloads from China (anonymous folder page).
+OFFLINE_MODELSCOPE = 'https://modelscope.cn/models/BowenXue/FreeVideo-releases/tree/master/offline'
+
+
 def stable_body(builds, tag):
     # Visitors come to download: the files come first, then what changed.
     rows = [LOGO, '## Download / 下载', ''] + downloads(PAGE + '/releases/download/' + tag + '/')
     rows += ['**Windows:** run FreeVideo.exe, choose an existing ComfyUI folder or install a new one, then click '
-             '**Install & launch**. Offline packages are on [Quark](https://pan.quark.cn/s/c51235b84618).',
+             '**Install & launch**. Offline packages are on [Quark](https://pan.quark.cn/s/c51235b84618) and [ModelScope](%s).' % OFFLINE_MODELSCOPE,
              '',
              '**macOS:** open the DMG and drag FreeVideo.app into Applications. If macOS asks you to confirm the first '
              'launch, see the [first-open steps](%s/blob/main/docs/Mac.md#first-open).' % PAGE,
@@ -130,7 +134,7 @@ def stable_body(builds, tag):
              'Windows. On a server or from a terminal, see [Linux](%s/blob/main/docs/Linux.md).' % PAGE,
              '',
              '**Windows：** 运行 FreeVideo.exe，选择已有的 ComfyUI 或安装新的 ComfyUI，点击 **安装并启动**。'
-             '离线包见[夸克网盘](https://pan.quark.cn/s/c51235b84618)。',
+             '离线包见[夸克网盘](https://pan.quark.cn/s/c51235b84618)或[魔搭](%s)。' % OFFLINE_MODELSCOPE,
              '',
              '**macOS：** 打开 DMG，将 FreeVideo.app 拖入「应用程序」。首次打开如需确认，请参考'
              '[首次打开步骤](%s/blob/main/docs/Mac.zh-CN.md#首次打开)。' % PAGE,

@@ -4,8 +4,11 @@ include __init__.py README.zh-CN.md
 include NOTICE THIRD_PARTY_NOTICES.md CONTRIBUTING.md SECURITY.md CITATION.cff
 recursive-include example_workflows *.json
 recursive-include web *.js *.css
-recursive-include web/assets *.svg *.png
+include web/vendor/three/LICENSE
+recursive-include web/assets *.svg *.png *.webp
+recursive-include web/howto *.png
 recursive-include web/fonts *.woff2
+recursive-include web/tutorial *.webp *.mp4
 recursive-include freevideo_engine/assets *.png *.ico
 recursive-include freevideo_engine/launcher *.qml
 recursive-include freevideo_engine/launcher/licenses *.txt
@@ -15,6 +18,8 @@ include scripts/bootstrap_linux.sh scripts/build_windows.py scripts/windows_app.
 include scripts/build_macos.py scripts/macos_app.py scripts/verify_macos_build.py
 include scripts/scan_windows_release.py
 include scripts/build_launcher_notices.py
+include scripts/prune_qt_bundle.py scripts/deduplicate_bundle_data.py scripts/pyi_rth_bundle_data.py
+include scripts/verify_dmg_conversion.py
 prune docs
 include docs/LoRA.md docs/LoRA.zh-CN.md
 prune tests
@@ -22,3 +27,5 @@ prune benchmarks
 prune distribution
 prune .github
 exclude AGENTS.md CHANGELOG.md
+
+include freevideo_source_bootstrap.py freevideo_ed25519.py freevideo_update_keys.py

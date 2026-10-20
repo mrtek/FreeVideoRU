@@ -1,0 +1,56 @@
+/* Follows the app's dark tokens from theme.css (.fv-tutorial-book is in its scope list). */
+.fv-tutorial-book {
+  --book-bg:var(--fv-canvas); --book-panel:var(--fv-bg); --book-ink:var(--fv-ink); --book-muted:var(--fv-muted);
+  --book-line:var(--fv-border); --book-selected:var(--fv-selected); --book-hover:var(--fv-hover); --book-focus:var(--fv-accent);
+  --book-button:var(--fv-accent); --book-button-ink:var(--fv-bg); --book-backdrop:rgb(5 8 12 / .62);
+  --book-xs:6px; --book-sm:12px; --book-md:20px; --book-lg:28px; --book-xl:36px;
+  --book-radius:var(--fv-r-lg); --book-control-radius:var(--fv-r-sm); --book-media-radius:var(--fv-r-md);
+  --book-control:var(--fv-h); --book-border:1px; --book-outline:2px;
+  --book-media-height:360px; --book-nav:240px; --book-width:1160px; --book-height:820px; --book-edge:24px;
+  --book-body:15px; --book-small:13px; --book-title:24px; --book-section:16px; --book-nav-size:14px; --book-leading:1.7;
+  --book-font:var(--fv-font);
+  box-sizing:border-box; width:min(var(--book-width),calc(100vw - var(--book-edge) * 2));
+  height:min(var(--book-height),calc(100dvh - var(--book-edge) * 2)); max-width:none; max-height:none;
+  margin:auto; padding:0; border:var(--book-border) solid var(--book-line); border-radius:var(--book-radius);
+  background:var(--book-bg); color:var(--book-ink); font:var(--book-body)/var(--book-leading) var(--book-font);
+  color-scheme:dark; overflow:hidden;
+}
+.fv-tutorial-book[open] { display:flex; flex-direction:column; }
+.fv-tutorial-book::backdrop { background:var(--book-backdrop); }
+.fv-tutorial-book *, .fv-tutorial-book *::before { box-sizing:border-box; }
+.fv-tutorial-book [hidden] { display:none!important; }
+.fv-tutorial-book :is(button,select) { font:inherit; color:inherit; }
+.fv-tutorial-book button { cursor:pointer; }
+.fv-tutorial-book :focus-visible { outline:var(--book-outline) solid var(--book-focus); outline-offset:var(--book-outline); }
+.fv-book-header { display:flex; align-items:center; justify-content:space-between; gap:var(--book-sm); padding:var(--book-sm) var(--book-md); border-bottom:var(--book-border) solid var(--book-line); }
+.fv-book-header h1 { margin:0; font-size:var(--book-section); font-weight:600; }
+.fv-book-close { min-height:var(--book-control); padding:var(--book-xs) var(--book-sm); border:var(--book-border) solid var(--book-line); border-radius:var(--book-control-radius); background:transparent; }
+.fv-book-close:hover { background:var(--book-hover); }
+.fv-book-layout { display:grid; grid-template-columns:var(--book-nav) minmax(0,1fr); min-height:0; flex:1; }
+.fv-book-nav { display:flex; flex-direction:column; gap:var(--book-xs); padding:var(--book-sm); overflow-y:auto; background:var(--book-panel); border-right:var(--book-border) solid var(--book-line); }
+.fv-book-chapter { flex-shrink:0; width:100%; min-height:var(--book-control); text-align:start; border:0; border-radius:var(--book-control-radius); padding:var(--book-sm); background:transparent; font-size:var(--book-nav-size); overflow-wrap:anywhere; }
+.fv-book-chapter:hover { background:var(--book-hover); }
+.fv-book-chapter[aria-current] { background:var(--book-selected); }
+.fv-book-chapter[aria-current] { font-weight:600; }
+.fv-book-article { min-width:0; overflow-y:auto; overscroll-behavior:contain; padding:var(--book-lg) var(--book-xl); overflow-wrap:anywhere; }
+.fv-book-chapter-title { margin:0 0 var(--book-sm); font-size:var(--book-title); font-weight:600; line-height:1.35; }
+.fv-book-summary { margin:0 0 var(--book-md); }
+.fv-book-media { display:block; width:auto; max-width:100%; height:auto; max-height:var(--book-media-height); object-fit:contain; margin-inline:auto; border:var(--book-border) solid var(--book-line); border-radius:var(--book-media-radius); background:var(--book-panel); }
+.fv-book-steps { padding-inline-start:var(--book-lg); margin:var(--book-lg) 0 var(--book-md); }
+.fv-book-steps li { padding-inline-start:var(--book-xs); margin-bottom:var(--book-sm); }
+.fv-book-steps li::marker { font-weight:600; }
+.fv-book-limits { margin-top:var(--book-lg); border-top:var(--book-border) solid var(--book-line); padding-top:var(--book-md); }
+.fv-book-limits h3 { font-size:var(--book-section); font-weight:600; margin:0 0 var(--book-sm); }
+.fv-book-limits ul { padding-inline-start:var(--book-md); margin:0; }
+.fv-book-limits li { margin-bottom:var(--book-sm); }
+.fv-book-start { margin-top:0; padding:var(--book-sm) var(--book-md); min-height:var(--book-control); border:0; border-radius:var(--book-control-radius); background:var(--book-button); color:var(--book-button-ink)!important; font-weight:600; }
+.fv-book-start:disabled { opacity:.5; cursor:default; }
+.fv-book-picker { display:none; }
+@media(max-width:680px) {
+  .fv-tutorial-book { --book-edge:8px; --book-xl:20px; --book-lg:20px; }
+  .fv-book-layout { display:flex; }
+  .fv-book-nav { display:none; }
+  .fv-book-picker { display:flex; align-items:center; gap:var(--book-sm); padding:var(--book-sm) var(--book-md); border-bottom:var(--book-border) solid var(--book-line); }
+  .fv-book-picker select { flex:1; min-width:0; min-height:var(--book-control); padding:var(--book-xs) 28px var(--book-xs) var(--book-xs); text-overflow:ellipsis; border:var(--book-border) solid var(--book-line); border-radius:var(--book-control-radius); background:var(--book-bg); }
+  .fv-book-article { flex:1; }
+}

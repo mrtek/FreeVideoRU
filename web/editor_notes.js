@@ -12,13 +12,15 @@ function glyph(d) {
 const AGAIN = 'M13.5 2.5v3.5H10M13.2 6A5.5 5.5 0 1 0 13.5 9.5', PENCIL = 'M10.5 2.5l3 3-8 8h-3v-3z';
 const generating = clip => ['queued', 'running'].includes(clip?.pending);
 const firstLine = text => (text || '').trim().split('\n')[0];
-// Only the picture track grows a description strip, and only once one block has a description.
-export const describedTrack = track => track.kind === 'video' && track.clips.some(clip => !isText(clip) && clip.text?.trim());
+// A note written about a block (by an agent working on the project) is what the strip shows; without one, the description.
+export const stripText = clip => clip.note || firstLine(clip.text);
+// Only the picture track grows a description strip, and only once one block has something to show.
+export const describedTrack = track => track.kind === 'video' && track.clips.some(clip => !isText(clip) && stripText(clip));
 const agentWrote = record => record.tracks.some(track => track.clips.some(clip => clip.text_by === 'agent'));
 // Status words appear only in the hover tip and the panels (Iris 10-11).
-export function blockStatus(clip, t, fraction = 0) {
+export function blockStatus(clip, t, fraction = 0, interrupted = false) {
     if (clip.pending === 'running') return t(`Generating ${Math.round(fraction * 100)}%`, `生成中 ${Math.round(fraction * 100)}%`);
-    if (clip.pending === 'stopped') return t('Stopped', '已停止');
+    if (clip.pending === 'stopped') return interrupted ? t('Interrupted', '上次中断') : t('Stopped', '已停止');
     if (clip.pending === 'failed') return t('Unfinished', '未完成');
     if (clip.pending) return t('Not generated', '未生成');
     const current = model.takes(clip).find(take => take.index === -1);
@@ -101,7 +103,7 @@ export function createBlockNotes({state, t, actions}) {
     function showTip(item) {
         const view = item.element.closest('.fv-ed-track-view'), clip = item.clip; if (!view || !item.element.isConnected) return;
         const fraction = Number(item.element.style.getPropertyValue('--fv-ed-progress')) || 0;
-        const text = [clip.text.trim(), blockStatus(clip, t, fraction)].filter(Boolean).join(' · ');
+        const text = [clip.note || clip.text.trim(), blockStatus(clip, t, fraction, !!actions.interrupted?.(clip))].filter(Boolean).join(' · ');
         if (!text) return;
         if (!tip) { tip = el('div', 'fv-ed-note-tip'); tip.setAttribute('role', 'tooltip'); }
         if (tip.parentElement !== view) view.append(tip);
@@ -120,7 +122,7 @@ export function createBlockNotes({state, t, actions}) {
         items.set(item.clip.id, item);
         item.element.dataset.noted = String(noted);
         item.note.hidden = item.number.hidden = !noted;
-        item.note.textContent = firstLine(item.clip.text); item.number.textContent = String(index + 1);
+        item.note.textContent = stripText(item.clip); item.number.textContent = String(index + 1);
         // The pencil marks blocks an agent leaves alone; a project nobody else wrote in has none.
         item.mark.hidden = !agentWrote(record) || !!item.clip.text_by;
     }

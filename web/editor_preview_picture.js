@@ -74,7 +74,7 @@ export function createPreviewPicture(host, frame, {state, t}) {
 
     frame.prepend(bed); frame.append(shade, handles, cropBox, ...lines); host.append(outside);
     let current = null, layout = null, gesture = null, key = '', disposed = false, observedVideo = null, videoCallback = null;
-    let followFrame = 0;
+    let followFrame = 0, inputs = null, drawn = null;
     const samples = [], layouts = []; metrics.set(state, {draw: samples, layout: layouts});
     const recordTime = (list, start) => { list.push(performance.now()-start); if(list.length>240)list.shift(); };
     // No part under the playhead (a gap, or past the end) is never the selected one.
@@ -84,13 +84,14 @@ export function createPreviewPicture(host, frame, {state, t}) {
     function reset() {
         for (const node of [bed, outside, shade, handles, cropBox, ...lines]) node.hidden = true;
         shade.style.display = 'none';
-        frame.classList.remove('fv-ed-picture-adjusted'); layout = null; key = '';
+        frame.classList.remove('fv-ed-picture-adjusted'); layout = null; key = ''; inputs = drawn = null;
         frame.querySelectorAll('video').forEach(v => { if (!v.matches('.fv-ed-source-preview')) v.removeAttribute('style'); });
     }
     function watch(video) {
         if (observedVideo === video) return;
         if (observedVideo) { observedVideo.cancelVideoFrameCallback?.(videoCallback); observedVideo.removeEventListener('seeked', draw); observedVideo.removeEventListener('loadeddata', draw); }
         observedVideo = video;
+        key = ''; drawn = null;
         if (video) {
             video.addEventListener('seeked', draw); video.addEventListener('loadeddata', draw);
             const next = () => { if (disposed || observedVideo !== video) return; draw(); videoCallback = video.requestVideoFrameCallback?.(next); };
@@ -102,6 +103,15 @@ export function createPreviewPicture(host, frame, {state, t}) {
         current = value;
         if (!value?.clip || !value.size || value.preview || !value.video) { if (session.draft?.mode === 'crop') session.cancel(); watch(null); reset(); return; }
         if (value.playing && session.draft && session.draft.mode !== 'slider') session.cancel();
+        const nextInputs = [value.clip, state.record, session.draft, state.selection, value.video, value.video.dataset.source,
+            value.size.width, value.size.height, !!value.playing, session.output(value.clip)];
+        // ResizeObserver and the transition follower invalidate geometry. A
+        // transport tick alone needs neither style writes nor a layout read.
+        if (!force && layout && inputs && nextInputs.every((v, i) => v === inputs[i])) {
+            if (!value.video.requestVideoFrameCallback) draw();
+            return;
+        }
+        inputs = nextInputs;
         watch(value.video);
         const clip = {...PICTURE_DEFAULTS, ...session.clip(value.clip)}, record = state.record;
         const cropping = session.draft?.mode === 'crop' && session.draft.id === clip.id;
@@ -125,7 +135,7 @@ export function createPreviewPicture(host, frame, {state, t}) {
         // The Fill/Fit switch sits on the preview area (editor_frame.js shows or hides it); here it only turns gray while the part cannot change.
         const tools = host.querySelector('.fv-ed-picture-tools');
         if (tools) for (const button of tools.querySelectorAll('button')) button.disabled = !session.canEdit(clip);
-        const nextKey = JSON.stringify([clip, policy, rect.width, rect.height, hostRect.width, hostRect.height, isSelected(clip), value.playing]);
+        const nextKey = JSON.stringify([clip, policy, value.video.dataset.source, rect.width, rect.height, hostRect.width, hostRect.height, isSelected(clip), value.playing]);
         if (!force && nextKey === key) { recordTime(layouts, started); return; } key = nextKey;
         let view = p;
         if (policy.mode === 'source') {
@@ -181,6 +191,11 @@ export function createPreviewPicture(host, frame, {state, t}) {
     function draw() {
         if (!layout || !current?.video || current.video.readyState < 2 || !current.video.videoWidth || !current.video.videoHeight || (bed.hidden && outside.hidden)) return;
         const start = performance.now(), {p, bw, bh, m, left, top, hw, hh} = layout, video = current.video;
+        // loadeddata, seeked and the frame callback can describe the same frame.
+        // Keep the existing blur resolution/filter, but rasterize it only once.
+        const mediaTime = video.currentTime;
+        if (drawn?.video === video && drawn.layout === layout && drawn.time === mediaTime) return;
+        drawn = {video, layout, time: mediaTime};
         const cropping = session.draft?.mode === 'crop';
         if (!bed.hidden) {
             const w = Math.max(1, Math.ceil(bw/4)), h = Math.max(1, Math.ceil(bh/4));

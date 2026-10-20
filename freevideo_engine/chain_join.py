@@ -24,6 +24,19 @@ class JoinCancelled(InterruptedError):
     pass
 
 
+class _VoiceFailed(Exception):
+    """The optional voice step failed partway: the join is done again without it."""
+
+
+def _voice_step(call, *args):
+    try:
+        return call(*args)
+    except JoinCancelled:
+        raise
+    except Exception as error:
+        raise _VoiceFailed() from error
+
+
 class _ExactEndFailed(Exception):
     pass
 
@@ -147,7 +160,7 @@ def _exact_tail(source, target, wanted, cancelled=None):
         temporary.unlink(missing_ok=True)
 
 
-def join_files(sources, target, cancelled=None, frames=None, leads=None, expected=None):
+def join_files(sources, target, cancelled=None, frames=None, leads=None, expected=None, speaking=None):
     """Write `target` from `sources` in order; returns the joined frame and sample counts.
 
     `frames`: stop at this length when a compatible short tail can close it exactly,
@@ -158,13 +171,23 @@ def join_files(sources, target, cancelled=None, frames=None, leads=None, expecte
     """
     sources = list(sources)
     try:
-        return _join_files(sources, target, cancelled, frames, leads=leads, expected=expected)
+        return _join_ending(sources, target, cancelled, frames, leads, expected, speaking)
+    except _VoiceFailed:
+        logging.warning('[FreeVideo] The voice of the parts could not be evened out; they are joined as they are',
+                        exc_info=True)
+        return _join_ending(sources, target, cancelled, frames, leads, expected, None)
+
+
+def _join_ending(sources, target, cancelled, frames, leads, expected, speaking):
+    try:
+        return _join_files(sources, target, cancelled, frames, leads=leads, expected=expected, speaking=speaking)
     except _ExactEndFailed:
         # A late mux or validation error must also leave the original ending available.
-        return _join_files(sources, target, cancelled, frames, exact=False, leads=leads, expected=expected)
+        return _join_files(sources, target, cancelled, frames, exact=False, leads=leads, expected=expected,
+                           speaking=speaking)
 
 
-def _join_files(sources, target, cancelled, frames, exact=True, leads=None, expected=None):
+def _join_files(sources, target, cancelled, frames, exact=True, leads=None, expected=None, speaking=None):
     import av
     from .comfy_metadata import _copy_stream
     try:
@@ -201,6 +224,7 @@ def _join_files(sources, target, cancelled, frames, exact=True, leads=None, expe
         if shape[5] != FPS or step.denominator != 1:
             raise ValueError('The blocks are not 24 frames per second videos')
         step = int(step)
+        voice = _voice(sources, speaking, cancelled) if sound is not None else None
         with av.open(str(temporary), 'w', format='mp4',
                      options={'movflags': 'use_metadata_tags+faststart'}) as output:
             picture = audio = fifo = joined_audio = None
@@ -230,7 +254,7 @@ def _join_files(sources, target, cancelled, frames, exact=True, leads=None, expe
                             audio.codec_context.time_base = Fraction(1, rate)
                             fifo = av.AudioFifo()
                             joined_audio = _JoinedAudio(output, audio, fifo, rate, layout,
-                                                        audio_lead_in, apply_audio_lead_in, cancelled)
+                                                        audio_lead_in, apply_audio_lead_in, cancelled, voice)
                     streams = [video] + ([container.streams.audio[0]] if sound is not None else [])
                     shift, count = None, 0
                     # A decoder returns the encoder's padding after the last sample; the stream's own
@@ -288,8 +312,10 @@ def _join_files(sources, target, cancelled, frames, exact=True, leads=None, expe
         return dict(exact_end=wanted is not None and frames == wanted, frames=frames, width=shape[1], height=shape[2],
                     audio_samples=samples, sample_rate=rate,
                     seams_repaired=joined_audio.seams_repaired if joined_audio is not None else 0,
-                    seams_expected=expected)
-    except JoinCancelled:
+                    seams_expected=expected,
+                    voice=[[round(setting[0], 1), round(setting[1], 1)] if setting is not None else None
+                           for setting in voice] if voice is not None and audio is not None else None)
+    except (JoinCancelled, _VoiceFailed):
         raise
     except Exception as error:
         if used_tail:
@@ -299,10 +325,26 @@ def _join_files(sources, target, cancelled, frames, exact=True, leads=None, expe
         temporary.unlink(missing_ok=True)
 
 
+def _voice(sources, speaking, cancelled):
+    """Each block's voice setting, or None: an optional step that never stops the join."""
+    if speaking is None:
+        return None
+    try:
+        from .chain_level import plan
+        return plan(sources, speaking, lambda: cancelled is not None and cancelled())
+    except Exception:
+        logging.warning('[FreeVideo] The voice of the parts could not be measured; they are joined as they are')
+        return None
+
+
 class _JoinedAudio:
     """Keep native seam windows out of the encoder until the next block's head is ready."""
-    def __init__(self, output, stream, fifo, rate, layout, read_lead, apply_lead, cancelled=None):
+    def __init__(self, output, stream, fifo, rate, layout, read_lead, apply_lead, cancelled=None, voice=None):
         self.output, self.stream, self.fifo = output, stream, fifo
+        self.shaper = None
+        if voice is not None:
+            from .chain_level import Shaper
+            self.shaper = _voice_step(Shaper, voice, rate, stream.codec_context.layout.nb_channels)
         self.rate, self.layout = rate, layout
         self.read_lead, self.apply_lead = read_lead, apply_lead
         self.cancelled, self.next_head = cancelled, None
@@ -316,7 +358,10 @@ class _JoinedAudio:
         self.limit, self.heard, self.kept = limit, 0, 0
         # end() has released the previous tail and flushed its resampler. Count
         # both encoded samples and those still waiting in the encoder queue.
-        joined = self.written + self.fifo.samples if total_frames is not None else 0
+        joined = self.written + self.fifo.samples + (self.shaper.pending if self.shaper is not None else 0) \
+            if total_frames is not None else 0
+        if self.shaper is not None:
+            _voice_step(self.shaper.mark)
         if last is not None:
             cut = (max(0, round(total_frames * self.rate / FPS) - joined) if total_frames is not None
                    else round((last + 1) * self.rate / FPS))
@@ -408,7 +453,7 @@ class _JoinedAudio:
 
     def _encode(self, frames):
         self.heard, self.written = _encode(self.output, self.stream, self.fifo, frames, self.heard, self.limit,
-                                           self.written, self.rate, self.layout)
+                                           self.written, self.rate, self.layout, shaper=self.shaper)
 
     def end(self):
         if self.native is not None:
@@ -420,7 +465,7 @@ class _JoinedAudio:
 
     def finish(self):
         return _encode(self.output, self.stream, self.fifo, [], 0, None,
-                       self.written, self.rate, self.layout, final=True)[1]
+                       self.written, self.rate, self.layout, final=True, shaper=self.shaper)[1]
 
 
 def _audio_head(source, cancelled):
@@ -452,10 +497,16 @@ def _audio_head(source, cancelled):
     return None
 
 
-def _encode(output, stream, fifo, resampled, heard, limit, written, rate, layout, final=False):
+def _encode(output, stream, fifo, resampled, heard, limit, written, rate, layout, final=False, shaper=None):
     """Queue one block's resampled sound up to its length and encode whole encoder frames; `final` writes the rest."""
     import av
     import numpy as np
+
+    def queue(data):
+        if data is not None:
+            frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(data), format='fltp', layout=layout)
+            frame.sample_rate = rate
+            fifo.write(frame)
     for frame in resampled:
         keep = frame.samples if limit is None else min(frame.samples, limit - heard)
         if keep <= 0:
@@ -466,7 +517,12 @@ def _encode(output, stream, fifo, resampled, heard, limit, written, rate, layout
             frame.sample_rate = rate
         heard += keep
         frame.pts = None  # the queue counts samples itself: blocks follow one another without gaps
-        fifo.write(frame)
+        if shaper is not None:
+            queue(_voice_step(shaper.push, frame.to_ndarray()))
+        else:
+            fifo.write(frame)
+    if final and shaper is not None:
+        queue(_voice_step(shaper.flush))
     size = stream.codec_context.frame_size or 1024
     while fifo.samples >= size or final and fifo.samples:
         frame = fifo.read(min(size, fifo.samples))
@@ -506,7 +562,8 @@ def _replace_target(root, replace, identity, sources):
     return None
 
 
-def join_outputs(outputs, identity, cancelled=None, frames=None, replace=None, leads=None, expected_seams=None):
+def join_outputs(outputs, identity, cancelled=None, frames=None, replace=None, leads=None, expected_seams=None,
+                 speaking=None):
     """Join relative block outputs into a saved video, replacing only this chain's earlier join."""
     import folder_paths
     root = Path(folder_paths.get_output_directory()).resolve()
@@ -537,7 +594,7 @@ def join_outputs(outputs, identity, cancelled=None, frames=None, replace=None, l
             originals = {str(source): output for source, output in zip(sources, outputs)}
             def kept(following, previous):
                 return leads(originals.get(str(following)), originals.get(str(previous)) if previous is not None else None)
-        joined = join_files(sources, staged, cancelled, frames, leads=kept, expected=expected_seams)
+        joined = join_files(sources, staged, cancelled, frames, leads=kept, expected=expected_seams, speaking=speaking)
         if expected_seams is not None and joined['seams_repaired'] < expected_seams:
             # A seam sound left unrepaired is never reported as a finished video.
             raise ValueError('Only %d of %d seam sounds could be repaired' % (joined['seams_repaired'], expected_seams))
@@ -548,6 +605,8 @@ def join_outputs(outputs, identity, cancelled=None, frames=None, replace=None, l
                                       exact_end=joined['exact_end']))
         if expected_seams is not None:
             report['chain_join']['seams_expected'] = expected_seams
+        if joined.get('voice') is not None:
+            report['chain_join']['voice'] = joined['voice']
         with temporary.open('w', encoding='utf-8') as stream:
             json.dump(report, stream, ensure_ascii=False)
             stream.flush()

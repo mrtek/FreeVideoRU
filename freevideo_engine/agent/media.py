@@ -676,6 +676,7 @@ def _stream_seconds(stream, container):
 
 def _video_stream(container):
     import av
+    import av.stream
     attached = getattr(getattr(av.stream, 'Disposition', None), 'attached_pic', 0)
     for stream in container.streams.video:
         if not (attached and stream.disposition & attached):

@@ -25,14 +25,15 @@ const payloadOf = (key, metadata) => {
     return {source: {kind: key.slice(0, separator), id: key.slice(separator + 1)}, frames: metadata.frames, hasAudio: true, hasVideo: false};
 };
 // The library cards keep their own gestures; while the mode is on, "add" gestures pick instead.
-export function attachReplacePicker({state, library, store, actions, t}) {
+export function attachReplacePicker({state, library, store, actions, t, error = () => {}}) {
     const mode = replaceMode(state);
     async function pick(key) {
         const id = mode.id;
         await store.getSources([key]);
         if (mode.id !== id || id === null) return;
-        const payload = payloadOf(key, store.sources.get(key));
-        if (!payload) return;
+        const metadata = store.sources.get(key), payload = payloadOf(key, metadata);
+        // A pick that cannot replace says why; the mode stays on for another pick.
+        if (!payload) { error(metadata && !metadata._fallback ? {reason: 'no_audio'} : new Error('source')); return; }
         if (actions.replaceAudio(id, payload).ok !== false) mode.cancel();
     }
     const choose = event => {
@@ -40,7 +41,7 @@ export function attachReplacePicker({state, library, store, actions, t}) {
         const button = event.target.closest?.('.fv-ed-source-card')?.querySelector('.fv-ed-source');
         if (!button || button.disabled) return;
         event.preventDefault(); event.stopImmediatePropagation();
-        pick(button.dataset.key).catch(() => {});
+        pick(button.dataset.key).catch(value => error(value));
     };
     const onClick = event => { if (event.target.closest?.('.fv-ed-source-add')) choose(event); };
     // The keys a card answers to: Enter on the card, Enter or Space on its add button.

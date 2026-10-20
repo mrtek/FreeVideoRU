@@ -17,8 +17,8 @@ WEB = Path(__file__).resolve().parents[2] / 'web'
 # import does. editor_model and editor_text_model import each other: the
 # module still loading is reached only through a namespace import.
 MODULES = ('editor_picture_fields', 'editor_transport_model', 'editor_audio_model', 'editor_speed_model',
-           'editor_text_model', 'editor_model', 'editor_room', 'editor_actions', 'editor_generation', 'chain_support',
-           'editor_store')
+           'editor_text_model', 'editor_model', 'editor_room', 'editor_actions', 'editor_generation', 'sampling_effort',
+           'chain_support', 'editor_store')
 TIME_LIMIT = 5.0
 MEMORY_LIMIT = 256 * 2**20
 STACK_LIMIT = 4 * 2**20
@@ -103,7 +103,7 @@ globalThis.__call = text => {
 // before; the first rejection stops the batch and nothing is returned to save.
 globalThis.__batch = text => {
     const {project, operations} = JSON.parse(text), model = __load('editor_model'), actions = __load('editor_actions');
-    const by = {by: 'agent'}, results = [];
+    const texts = __load('editor_text_model'), by = {by: 'agent'}, results = [];
     const ids = record => new Set(record.tracks.flatMap(track => track.clips.map(clip => clip.id)));
     let record;
     try { record = model.parse(project); }
@@ -137,7 +137,10 @@ globalThis.__batch = text => {
             case 'move': record = actions.moveParts(record, op.clip_ids, {frames: op.frames, track: null}); break;
             case 'describe': record = model.describe(record, actions.linkedIds(record, op.clip_ids), op.text, by); break;
             case 'set_ref': record = model.setRef(record, actions.linkedIds(record, op.clip_ids), op.ref); break;
+            case 'note': record = model.setNote(record, actions.linkedIds(record, op.clip_ids), op.text); break;
             case 'use_version': record = model.restoreVersion(record, op.clip_id, op.index, by); break;
+            // One undo on the page; rejects as subtitles / range / text / locked / overlap.
+            case 'subtitles': record = texts.addSubtitles(record, op.cues, {replace: op.replace === true}); break;
             default: throw new model.EditError('invalid', 'unknown operation');
             }
         } catch (error) {
@@ -163,12 +166,15 @@ globalThis.__generation = text => {
     };
     try {
         const record = model.parse(request.project);
+        const generation = __load('editor_generation');
         if (request.mode === 'request') {
             const value = model.generationRequest(record, request.ids, {text: request.text, paths: request.paths});
-            return JSON.stringify({ok: true, blocks: value.blocks.map(({before, ...block}) => block)});
+            // Parts that continue finished footage are made at its shape, as on the page.
+            const follow = generation.continuedSize(model.generationBefore(record, request.ids), new Map(Object.entries(request.sizes || {})));
+            return JSON.stringify({ok: true, blocks: value.blocks.map(({before, ...block}) => block), size: follow});
         }
-        const store = __load('editor_store'), generation = __load('editor_generation');
-        const size = generation.generationSize(record), target = request.target, words = request.text;
+        const store = __load('editor_store');
+        const size = request.size || generation.generationSize(record), target = request.target, words = request.text;
         const reply = request.capability, ready = reply && (!reply.status || reply.status === 'ready');
         const limits = ready ? store.capabilityPoints(reply, {...record, ...size})
             : {maxSeconds: 15, maxFollowSeconds: 15, maxRequestFrames: null};
@@ -316,6 +322,11 @@ class ScriptRuntime:
         return context
 
     def _text(self, name, request):
+        try:
+            request.encode('utf-8')
+        except UnicodeEncodeError:
+            # QuickJS ends the whole program on half of a character pair, wherever the text came from.
+            raise ValueError('The text holds half of a character pair') from None
         with self._lock:
             if self._context is None:
                 self._context = self._fresh()
@@ -346,7 +357,7 @@ class EditorRuntime(ScriptRuntime):
         return self._entry('__batch', dict(project=project, operations=operations))
 
     def generation(self, **request):
-        """mode='plan' (project, target, text, capability) or mode='request' (project, ids, text, paths)."""
+        """mode='plan' (project, target, text, capability[, size]) or mode='request' (project, ids, text, paths, sizes)."""
         return self._entry('__generation', request)
 
     def deliver(self, **request):

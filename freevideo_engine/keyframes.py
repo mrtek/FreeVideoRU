@@ -11,9 +11,13 @@ def first_pass_conditions(conditions, target, canvas):
     ComfyUI conditioning, where the source pixels are no longer available.
     """
     from torch.nn import functional as F
-    from .two_pass import plan
-    sampling = plan(target, staged=True)
-    if any(canvas[key] != sampling['first'][key] for key in ('width', 'height', 'frames')):
+    from .two_pass import plan, SCALES
+    # The first-pass canvas tells the upscale factor apart: each factor has its own size.
+    for scale in SCALES:
+        sampling = plan(target, staged=True, scale=scale)
+        if all(canvas[key] == sampling['first'][key] for key in ('width', 'height', 'frames')):
+            break
+    else:
         raise ValueError('Keyframe resize must match the planned first-pass canvas')
     anchors, latents = conditions
     left, top = (sampling['crop'][key] // 16 for key in ('left', 'top'))

@@ -25,7 +25,8 @@ from .setup_progress import ProgressState
 
 def discover_libraries(folder_paths, environ=None):
     env = os.environ if environ is None else environ
-    candidates = [str(folder_paths.models_dir)]
+    from .launcher_settings import saved_model_libraries
+    candidates = saved_model_libraries() + [str(folder_paths.models_dir)]
     # folder_paths already incorporates extra_model_paths.yaml, including paths
     # registered by other nodes. No second, subtly different YAML parser.
     for name in ('diffusion_models', 'unet', 'checkpoints', 'text_encoders', 'clip', 'vae'):
@@ -157,13 +158,33 @@ class Setup:
         except (OSError, ValueError) as error:
             detail = str(error)
         from .sampling_assets import total_bytes
+        from .launcher_settings import extra_model_directories
         return dict(root=str(root), ready=ready, detail=detail,
-                    libraries=discover_libraries(self.folder_paths), token=self.token,
+                    libraries=discover_libraries(self.folder_paths), extra_libraries=extra_model_directories(), token=self.token,
                     environment='Managed FreeVideo environment; ComfyUI packages are kept',
                     restart_required=False, downloads=self.downloads(download_root or root),
                     resources=self.resource_settings(),
                     sampling_cache_bytes=total_bytes())
 
+
+    @plain_errors
+    def model_directories(self, value):
+        if self.runner.busy:
+            raise ValueError('Wait for setup to finish before saving model folders')
+        from .launcher_settings import model_directory_store
+        choices = model_directory_store().save_model_directories(value.get('extra_libraries'))
+        missing = []
+        for path in choices:
+            try:
+                exists = io_path(Path(path).expanduser()).is_dir()
+            except (OSError, RuntimeError):
+                exists = False
+            if not exists:
+                missing.append(path)
+        self.plan = None
+        self.state.pop('plan_id', None)
+        self.state.pop('plan', None)
+        return dict(saved=True, extra_libraries=choices, missing_libraries=missing)
 
     def resource_settings(self, value=None):
         from .resource_settings import read, write, setting
@@ -254,7 +275,7 @@ class Setup:
             raise ValueError('Invalid setup choices')
         # Folders the user chose are validated and kept first; folders found
         # automatically fill the remaining places.
-        chosen = library_roots(extra)
+        chosen = library_roots(extra, skip_missing=True)
         libraries = library_roots(chosen + discover_libraries(self.folder_paths), keep_first=True)
         io_path(self.logs).mkdir(parents=True, exist_ok=True)
         manifest = self.logs / ('libraries-' + uuid.uuid4().hex + '.json')
@@ -277,6 +298,8 @@ class Setup:
             arguments += ['--prepared-format', value['prepared_format']]
         if value.get('copy'):
             arguments.append('--copy-existing-models')
+        if value.get('download_list'):
+            arguments.append('--download-list')
         self.selection = dict(root=str(root), arguments=arguments)
         self.plan = None
         self.state = dict(status='running', action='plan', libraries=libraries)
@@ -452,6 +475,8 @@ def register():
             name = request.match_info['action']
             if name == 'inspect':
                 result = setup.inspect(value)
+            elif name == 'model-directories':
+                result = setup.model_directories(value)
             elif name in ('network-probe','network-source'):
                 result = setup.network_settings(value,probe=name=='network-probe')
             elif name == 'network-token':

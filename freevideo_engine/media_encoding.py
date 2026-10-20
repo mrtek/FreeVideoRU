@@ -34,7 +34,7 @@ def reference_size(width, height, canvas):
     return max(32, round(width * scale / 32) * 32), max(32, round(height * scale / 32) * 32)
 
 
-def encode_visual(vae, pixels, *, device='cuda'):
+def encode_visual(vae, pixels, *, device='cuda', posterior='sample'):
     """The pinned VAE chunk/padding/posterior recipe with one live pixel chunk.
 
     Posterior sampling still occurs once on the original device with seed 42;
@@ -58,7 +58,9 @@ def encode_visual(vae, pixels, *, device='cuda'):
     moments = torch.cat(moments, dim=2).to(device)
     if len(pixels) > 1 and vae.config.token_drop:
         moments = moments[:, :, :-vae.config.token_drop]
-    latent = DiagonalGaussianDistribution(moments).sample(generator=torch.Generator().manual_seed(42))
+    distribution = DiagonalGaussianDistribution(moments)
+    # References keep the pipeline's seeded sample; a continuation context wants the picture itself.
+    latent = distribution.mode() if posterior == 'mode' else distribution.sample(generator=torch.Generator().manual_seed(42))
     latent = latent.to(torch.float16).float().cpu()
     mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1)
@@ -131,6 +133,8 @@ def prepare(media, canvas, directory):
     for index, row in enumerate(media.get('references', [])):
         kind, path = row['kind'], row['path']
         ref = {'kind': kind}
+        if 'early_steps' in row:
+            ref['early_steps'] = row['early_steps']
         numbers[kind] += 1
         longer, length, used = False, None, limit / 24.
         target = directory / ('reference-%02d.npy' % index)
@@ -178,7 +182,9 @@ def prepare(media, canvas, directory):
                 pixels.flush()
                 ref.update(pixels=str(target), frames=count, normalized_fps=24)
                 used = count / 24.
-                soundtrack, longer_audio, _ = _audio(path, directory / ('reference-%02d-audio.npy' % index), limit / 24.)
+                # The clip's own sound is a reference too, unless the request turned it off.
+                soundtrack, longer_audio, _ = (None, False, None) if row.get('sound') is False else \
+                    _audio(path, directory / ('reference-%02d-audio.npy' % index), limit / 24.)
                 longer = longer or longer_audio
                 if soundtrack:
                     ref['audio'] = soundtrack
@@ -202,7 +208,78 @@ def prepare(media, canvas, directory):
     return result, {'images': key_images} if key_images else {'minimax_ref_items': ref_items} if ref_items else {}
 
 
-def encode_latents(normalized, value, base, canvas, *, resident=None, device='cuda'):
+def reference_options(normalized, options, step):
+    """Filter whole references, including a video's optional audio presentation."""
+    items, offset = [], 0
+    for row in normalized:
+        count = 1 + int(row['kind'] == 'video' and bool(row.get('audio')))
+        if 'early_steps' not in row or step < row['early_steps']:
+            items.extend(options['minimax_ref_items'][offset:offset + count])
+        offset += count
+    return {'minimax_ref_items': items} if items else {}
+
+
+def _latent_cache(root, base, device):
+    """Per-picture latent receipts; another encoder, recipe or device never matches."""
+    import torch
+    from .input_cache import InputCache, digest
+    directory = Path(base) / 'vae'
+    files = sorted(directory.glob('*.safetensors'))
+    if not files:
+        return None
+    kind = torch.device(device).type
+    try:
+        from importlib.metadata import version
+        diffusers = version('diffusers')
+    except Exception:
+        diffusers = None
+    from . import __version__
+    identity = {'recipe': 'reference-latent-v1', 'engine': __version__, 'diffusers': diffusers,
+                'torch': torch.__version__, 'device': kind,
+                'gpu': torch.cuda.get_device_name() if kind == 'cuda' else None,
+                'config': digest(directory / 'config.json') if (directory / 'config.json').exists() else None,
+                'weights': [[f.name, f.stat().st_size, f.stat().st_mtime_ns] for f in files]}
+    return InputCache(identity, root=root, kind='reference-latent')
+
+
+def _pixels_key(mapped):
+    import hashlib
+    import numpy as np
+    value = hashlib.sha256(json.dumps([list(mapped.shape), str(mapped.dtype)]).encode())
+    for begin in range(0, len(mapped), 8):
+        value.update(np.ascontiguousarray(mapped[begin:begin + 8]).reshape(-1).view('u1').data)
+    return value.hexdigest()
+
+
+def _cached_latent(cache, key, directory):
+    import torch
+    target = Path(directory) / ('reference-latent-' + key[:16] + '.hit.pt')
+    try:
+        if cache.get(key, target) is None:
+            return None
+        latent = torch.load(target, map_location='cpu', weights_only=True)
+        if isinstance(latent, torch.Tensor) and latent.is_floating_point() and bool(torch.isfinite(latent).all()):
+            return latent
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, EOFError):
+        pass
+    finally:
+        target.unlink(missing_ok=True)
+    return None
+
+
+def _remember_latent(cache, key, latent, directory):
+    import torch
+    path = Path(directory) / ('reference-latent-' + key[:16] + '.save.pt')
+    try:
+        torch.save(latent, path)
+        cache.put(key, path, {'success': True})
+    except (OSError, ValueError, RuntimeError):
+        pass
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def encode_latents(normalized, value, base, canvas, *, resident=None, device='cuda', cache_root=None):
     import gc
     import numpy as np
     import torch
@@ -212,8 +289,26 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
     if torch.device(device).type not in ('cuda', 'mps'):
         raise ValueError('Media encoding requires a CUDA or MPS device')
     empty_cache = torch.mps.empty_cache if torch.device(device).type == 'mps' else torch.cuda.empty_cache
-    refs = [{'kind': row['kind']} for row in normalized]
-    if any(row.get('pixels') for row in normalized):
+    refs = [{key: row[key] for key in ('kind', 'early_steps') if key in row} for row in normalized]
+    keys, cache, hits = {}, None, set()
+    if cache_root and any(row.get('pixels') for row in normalized):
+        # The same picture or clip with another prompt reuses its latent and may skip loading the encoder.
+        try:
+            cache = _latent_cache(cache_root, base, device)
+            for index, (row, ref) in enumerate(zip(normalized, refs)):
+                if cache is None or not row.get('pixels'):
+                    continue
+                mapped = np.load(row['pixels'], mmap_mode='r', allow_pickle=False)
+                keys[index] = _pixels_key(mapped[:row['frames']])
+                del mapped
+                latent = _cached_latent(cache, keys[index], Path(row['pixels']).parent)
+                if latent is not None:
+                    ref['latent'] = latent
+                    hits.add(index)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+            cache = None
+        print(json.dumps({'event': 'reference_latent_cache', 'hits': len(hits), 'misses': len(keys) - len(hits)}), flush=True)
+    if any(row.get('pixels') for index, row in enumerate(normalized) if index not in hits):
         print(json.dumps({'event': 'media_encode_phase', 'phase': 'Encoding image/video references'}), flush=True)
         # Conditioning never decodes: the 9.0 GiB decoder in the shared shards
         # is not read. The independent output decoder is loaded after sampling.
@@ -224,8 +319,8 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
             from .backends.mps_vae_encode import bounded_encoder
             lifetime = bounded_encoder(vae)
         with lifetime as memory:
-            for row, ref in zip(normalized, refs):
-                if row.get('pixels'):
+            for index, (row, ref) in enumerate(zip(normalized, refs)):
+                if row.get('pixels') and index not in hits:
                     mapped = np.load(row['pixels'], mmap_mode='r', allow_pickle=False)
                     if row['frames'] == 1:
                         pixels = torch.from_numpy(np.array(mapped[:1])).to(device).permute(3, 0, 1, 2)[None]
@@ -234,6 +329,8 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
                     else:
                         ref['latent'] = encode_visual(vae, mapped[:row['frames']], device=device)
                     del mapped
+                    if cache is not None and index in keys:
+                        _remember_latent(cache, keys[index], ref['latent'], Path(row['pixels']).parent)
                     from .streamed_weights import release_file_pages
                     release_file_pages([Path(row['pixels'])])
         if memory is not None:
@@ -263,5 +360,9 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
                      condition_latents=[row['latent'] for row in refs])
     else:
         value['references'] = refs
+        for stage in value.get('early_reference', {}).get('conditions', []):
+            remaining = [ref for ref in refs if 'early_steps' not in ref or stage['start_step'] < ref['early_steps']]
+            if remaining:
+                stage['value']['references'] = remaining
     from .media_conditioning import describe
     return describe(value, canvas['width'], canvas['height'], canvas['frames'])

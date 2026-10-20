@@ -28,12 +28,32 @@ export async function agentGet(api, path, options = {}) {
 
 // A restarted FreeVideo forgets page sessions: fetch a new one once and repeat.
 export async function agentPost(api, path, body) {
+    return agentSend(api, 'POST', path, body);
+}
+
+export async function agentSend(api, method, path, body, headers = {}) {
     for (let attempt = 0; ; attempt++) {
-        const response = await api.fetchApi(path, {method: 'POST',
-            headers: {'Content-Type': 'application/json', ...await agentHeaders(api)}, body: JSON.stringify(body)});
+        const response = await api.fetchApi(path, {method, credentials: 'same-origin',
+            headers: {'Content-Type': 'application/json', ...headers, ...await agentHeaders(api)},
+            ...(body === undefined ? {} : {body: JSON.stringify(body)})});
         if (response.status !== 403 || attempt) return response;
         const value = await response.clone().json().catch(() => null);
         if (value?.error?.code !== 'page_session_required') return response;
         sessions.delete(api);
+    }
+}
+
+// UI actions retry once, including HTTP refusals. Callers keep the same
+// idempotency id/body and show the result where the user clicked.
+export async function retryAgentPost(api, path, body, {retry = async () => body, accept = () => true} = {}) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        let response = null;
+        try {
+            response = await agentPost(api, path, body);
+            if (response?.ok && await accept(response)) return response;
+        } catch { /* Retry below, including an unreadable response body. */ }
+        if (attempt) return response?.ok ? null : response;
+        body = await retry(response);
+        if (!body) return response;
     }
 }

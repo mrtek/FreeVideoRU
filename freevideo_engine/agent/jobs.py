@@ -1,8 +1,8 @@
 """Agent jobs: one durable record per request, dependencies, GPU turn-taking and status.
 
 Generation uses the studio's durable chain runner. Jobs keeps Agent chains in
-FIFO order until the runner is free. The local VLM (prompt enhancement and questions) only
-starts when that queue is empty, and generation waits while the VLM runs. Jobs
+FIFO order until the runner is free. Local image and VLM jobs (prompt enhancement and questions) only
+start when that queue is empty, and video generation waits while either runs. Jobs
 may read other jobs' results (a frame, a clip, an enhanced prompt); such a job
 waits until those finish and fails with dependency_failed if one does not.
 """
@@ -14,7 +14,9 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
+import shutil
 import stat
 from pathlib import Path
 import threading
@@ -24,12 +26,57 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import spec as specs
 from . import schema, errors, assets
+from .length import single_frame_limit
 from ..system import windows
 
 ACTIVE = ('waiting', 'queued', 'running', 'cancelling')
 CAST_AGAIN = 'POST /freevideo/agent/v1/cast/%s/generate to make the reference pictures again.'
 DONE = ('succeeded', 'failed', 'cancelled', 'interrupted')
-GPU_KINDS = ('vlm', 'enhance')
+GPU_KINDS = ('vlm', 'enhance', 'image')
+IMAGE_ERRORS = errors.IMAGE_ERRORS
+IMAGE_WAIT_ERRORS = ('busy', 'busy_video')
+IMAGE_WAIT_NOTICES = {
+    'video': 'A video is being generated; this picture starts when it finishes. Tell the user that once, then wait.',
+    'image': 'Another picture is being generated; this picture starts when it finishes. Tell the user that once, then wait.',
+    'gpu': 'The GPU is in use; this picture starts when it is free. Tell the user that once, then wait.',
+}
+
+
+def image_reference(port, relative):
+    """The name the image service reads an input picture by.
+
+    It takes files in the input folder itself and its own results as they are, and checks them itself;
+    a picture anywhere else under input is copied next to them once, named by its contents."""
+    folder, _, leaf = relative.rpartition('/')
+    if folder in ('', 'freevideo-image'):
+        return relative
+    try:
+        source = port.input_path(relative)
+        with open(source, 'rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        name = 'agent-image-' + digest[:16] + source.suffix.lower()
+        target = port.input_root / name
+        if not target.exists():
+            part = target.with_name('%s.%s.part' % (name, uuid.uuid4().hex[:8]))
+            try:
+                shutil.copyfile(source, part)
+                os.replace(part, target)
+            finally:
+                part.unlink(missing_ok=True)
+        return name
+    except OSError:
+        raise JobError('invalid_media', IMAGE_ERRORS['invalid_media']) from None
+
+
+USER_STOP_NEXT = ('The user stopped this job on the page, and the page already shows it as stopped. Send no message '
+                  'about it, and do not retry or resume it unless they ask. Wait for what they say next.')
+
+
+def user_stop_notice(row):
+    """What a job the user stopped on the page tells the agent. A job the agent cancelled, and one that finished
+    some other way before the stop took hold, read as before."""
+    stopped = row.get('cancelled_by') == 'user' and row.get('status') not in ('succeeded', 'failed', 'interrupted')
+    return dict(cancelled_by='user', next=USER_STOP_NEXT) if stopped else {}
 
 
 class JobError(Exception):
@@ -40,7 +87,8 @@ class JobError(Exception):
     def view(self):
         return errors.build(self.code, details=self.details.get('details'),
                             owner=self.details.get('owner'),
-                            retry_after_seconds=self.details.get('retry_after_seconds'))
+                            retry_after_seconds=self.details.get('retry_after_seconds'),
+                            kind=self.details.get('kind'), report_id=self.details.get('report_id'))
 
 
 class ManagedByProduction(JobError):
@@ -60,9 +108,13 @@ def chain_error(code, message, next_action, *, details=None, retryable=False):
     return JobError(code, message, details=details or [], next=next_action, retryable=retryable)
 
 
-def single_block(seconds):
-    from ..chain_plan import plan
-    return plan(seconds)['single']
+def single_block(spec, seconds=None):
+    from ..chain_plan import PlanError, plan
+    try:
+        return plan(spec['seconds'] if seconds is None else seconds, max_frames=single_frame_limit(spec),
+                    continued=bool(spec.get('continue_from')))['single']
+    except PlanError:
+        return False  # Too long for one generation and it cannot be cut into parts: parts_problems says so.
 
 
 def continuation_problems(spec, prefix='', *, editor=None):
@@ -73,20 +125,31 @@ def continuation_problems(spec, prefix='', *, editor=None):
     if spec['kind'] != 'generate' or spec.get('refine_from'):
         return []
     if not (any(block['after'] for block in editor['blocks']) if editor is not None
-            else spec.get('continue_from') or not single_block(spec['seconds'])):
+            else spec.get('continue_from') or not single_block(spec)):
         return []
-    why = ' when continuing a video or making one longer than 15 s'
+    why = ' when continuing a saved video or generating multiple blocks'
     problems = []
     if not spec['two_pass']:
         # The quality name is a contract enum, never caller text.
-        problem = schema.diagnostic(prefix + '/quality', '"light" (two-pass), or sampling.two_pass=true,' + why, None)
-        got = '"%s" (one pass)' % spec['quality']
+        if spec.get('sampling_note'):
+            # Two-pass was asked for with a first-pass count other than 8: it runs one pass.
+            problem = schema.diagnostic(prefix + '/quality',
+                                        '"light" or "medium" (two-pass), or sampling.two_pass=true with base_steps=8,' + why, None)
+            got = '%d first-pass steps (one pass)' % spec['base_steps']
+        else:
+            problem = schema.diagnostic(prefix + '/quality', '"light" or "medium" (two-pass), or sampling.two_pass=true,' + why, None)
+            got = '"%s" (one pass)' % spec['quality']
         problems.append(dict(problem, got=got, message=problem['message'].replace('received None', 'received ' + got)))
     if spec['preview']:
         problems.append(schema.diagnostic(prefix + '/preview', 'false' + why, True))
-    if spec['media']:
-        problems.append(schema.diagnostic(prefix + '/media', 'none' + why + ' (continue_from carries the previous video)',
+    others = [key for key, value in spec['media'].items() if key != 'references' and value]
+    pictures = spec['media'].get('references') or []
+    if others:
+        problems.append(schema.diagnostic(prefix + '/media', 'only references' + why + ' (continue_from carries the previous video)',
                                           None))
+    elif len(pictures) > specs.CONTINUED_PICTURES or not all(specs.still_picture(item) for item in pictures):
+        problems.append(schema.diagnostic(prefix + '/media/references', 'at most %d pictures%s' % (specs.CONTINUED_PICTURES, why),
+                                          len(pictures)))
     return problems
 
 
@@ -94,7 +157,7 @@ def cut_problems(spec, seconds, prefix='', *, editor=None):
     """A shot cut at or after the end of the video never appears; refuse it before anything is generated."""
     if spec['kind'] != 'generate' or spec.get('refine_from') or spec.get('continue_from') or seconds is None:
         return []
-    if any(block['after'] for block in editor['blocks']) if editor is not None else not single_block(seconds):
+    if any(block['after'] for block in editor['blocks']) if editor is not None else not single_block(spec, seconds):
         return []  # Every block of a continued video reads the same text.
     late = [cut for cut in specs.cut_times(spec.get('prompt')) if cut >= seconds]
     if not late:
@@ -105,6 +168,61 @@ def cut_problems(spec, seconds, prefix='', *, editor=None):
     return [dict(problem, got=got, message=problem['message'].replace('received None', 'received ' + got))]
 
 
+def part_prompt_problems(spec, prefix=''):
+    """part_prompts gives one description per planned part; the chain backend refuses any other count."""
+    if spec['kind'] != 'generate' or not spec.get('part_prompts'):
+        return []
+    from ..chain_plan import PlanError, plan
+    try:
+        count = len(plan(spec['seconds'], max_frames=single_frame_limit(spec),
+                         continued=bool(spec.get('continue_from')))['blocks'])
+    except PlanError:
+        return []  # parts_problems names the length.
+    given = len(spec['part_prompts'])
+    if given == count:
+        return []
+    allowed = '%d description%s, one for each of the chain_plan.blocks POST /plan gives for %g s' % (
+        count, '' if count == 1 else 's', spec['seconds'])
+    return [schema.diagnostic(prefix + '/part_prompts', allowed, given)]
+
+
+def _continued_part_problem(seconds, chain):
+    """True when a video that continues another has a part the backend refuses, or is under 10 s.
+
+    The backend compares each part's node input frames (overlap included); a part that
+    continues is also at least MIN_PART_SECONDS long.
+    """
+    from ..chain_plan import MIN_PART_FRAMES, MIN_PART_SECONDS
+    return seconds < MIN_PART_SECONDS or any(block['frames'] < MIN_PART_FRAMES for block in chain['blocks'])
+
+
+def length_problem(seconds, continued, prefix='', *, minimum=None, frames=None):
+    """Suggest nearby whole-second lengths the same planner, device limit (`frames`) and minimum accept."""
+    from ..chain_plan import PlanError, plan
+    available = []
+    for candidate in range(max(1, int(seconds) - 30), int(seconds) + 31):
+        try:
+            chain = plan(candidate, max_frames=frames, continued=continued)
+        except PlanError:
+            continue
+        if not continued or not _continued_part_problem(candidate, chain):
+            available.append(candidate)
+    if minimum is not None and seconds >= minimum:
+        minimum = None  # long enough on its own: the length only cannot be cut into parts that long
+    nearby = [s for s in available if s < seconds][-2:] + [s for s in available if s > seconds][:2]
+    rule = ('at least %d s per continued part' % minimum if minimum is not None
+            else 'a length that can be split into supported parts')
+    allowed = rule + ('; available lengths: ' + ', '.join('%d s' % s for s in nearby) if nearby
+                      else '; this device makes no length near this one at this size')
+    problem = schema.diagnostic(prefix + '/seconds', allowed, seconds, nearest=nearby)
+    if not nearby:
+        problem['next'] = 'Try a smaller width and height.'
+    if minimum is not None:
+        problem['message'] = ('Each continued part must be at least %d seconds. Make it longer. ' % minimum
+                              + problem['message'])
+    return problem
+
+
 def parts_problems(spec, runner, prefix='', *, editor=None, work=None, planned=None):
     """One video continues through a limited number of parts; say so before anything is generated.
 
@@ -112,13 +230,24 @@ def parts_problems(spec, runner, prefix='', *, editor=None, work=None, planned=N
     `work` is the saved video continue_from names (output-relative), or None while it cannot be told.
     `planned` is the number of parts an unfinished job it continues will have, when that is known instead.
     """
-    if runner is None or spec['kind'] != 'generate' or spec.get('refine_from'):
+    if spec['kind'] != 'generate' or spec.get('refine_from'):
         return []
-    from ..chain_plan import plan
+    from ..chain_plan import MIN_PART_SECONDS, PlanError, plan
     from ..chain_runner import ChainTooLong
     from ..chain_store import reference
-    limit, continued = runner.max_parts, bool(spec.get('continue_from'))
-    count = lambda seconds: len(plan(seconds, continued=continued)['blocks'])
+    continued, frames = bool(spec.get('continue_from')), single_frame_limit(spec)
+    if editor is None:
+        # Planning errors must not be swallowed by the source-depth fallback below.
+        try:
+            chain = plan(spec['seconds'], max_frames=frames, continued=continued)
+        except PlanError:
+            return [length_problem(spec['seconds'], continued, prefix, frames=frames)]
+        if continued and _continued_part_problem(spec['seconds'], chain):
+            return [length_problem(spec['seconds'], continued, prefix, minimum=MIN_PART_SECONDS, frames=frames)]
+    if runner is None:
+        return []
+    limit = runner.max_parts
+    count = lambda seconds: len(plan(seconds, max_frames=frames, continued=continued)['blocks'])
     try:
         with runner.lock:
             if editor is not None:
@@ -128,7 +257,7 @@ def parts_problems(spec, runner, prefix='', *, editor=None, work=None, planned=N
             else:
                 # A source the backend has no record of counts as one part, as it does there.
                 earlier = (runner._work_parts(work, ()) if work else planned or 1) if continued else 0
-                needed = earlier + count(spec['seconds'])
+                needed = earlier + len(chain['blocks'])
     except (ValueError, KeyError, TypeError):
         return []  # Not a chain the backend accepts; it says why when the chain is created.
     if needed <= limit:
@@ -136,7 +265,14 @@ def parts_problems(spec, runner, prefix='', *, editor=None, work=None, planned=N
     if editor is not None:
         problem, got = schema.diagnostic(prefix + '/target', 'a range that takes at most %d parts' % limit, None), '%d parts' % needed
     else:
-        fit = next((s for s in range(int(spec['seconds']), 1, -1) if earlier + count(s) <= limit), None)
+        # A length the planner refuses does not fit; a part that continues a video is at least MIN_PART_SECONDS.
+        def parts(seconds):
+            try:
+                return count(seconds)
+            except ValueError:
+                return limit + 1
+        shortest = MIN_PART_SECONDS if continued else 2
+        fit = next((s for s in range(int(spec['seconds']), shortest - 1, -1) if earlier + parts(s) <= limit), None)
         if fit is None:
             problem = schema.diagnostic(prefix + '/continue_from', 'a video of fewer than %d parts' % limit, None)
             got = 'a video of %d parts' % earlier
@@ -148,7 +284,7 @@ def parts_problems(spec, runner, prefix='', *, editor=None, work=None, planned=N
 
 def continuation_unavailable():
     return chain_error('continuation_unavailable', 'This backend cannot continue multiple video blocks.',
-                       'Submit a new job with seconds<=15, or enable a backend with continuation inputs and resume.')
+                       'Use POST /plan for a supported single block (unknown limit: seconds<=15), or enable continuation and resume.')
 
 
 def library_id(relative):
@@ -216,6 +352,17 @@ def iso(stamp):
         return None if stamp is None else time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stamp))
     except (OSError, OverflowError, TypeError, ValueError):
         return None
+
+
+class _Warmed:
+    """A submit's capability source inside Jobs.lock: the studio's answer as it stands, never a wait."""
+    def __init__(self, port):
+        self.port = port
+
+    def capability_snapshot(self, query):
+        table = self.port.capability_snapshot(query)
+        # Still being worked out after the wait before the lock: the unknown limit, as a timeout gives.
+        return dict(status='unavailable') if table.get('status') == 'computing' else table
 
 
 class _ReceiptWrites:
@@ -339,11 +486,15 @@ class Jobs:
         # Optional executor hook: called as parent_allowed(row['parent']) before a
         # child with a parent may start. A False answer records the job as cancelled.
         self.parent_allowed = None
+        # Optional: called as session_open(sid) while work for a conversation is committed; raises if it is gone.
+        self.session_open = None
         from .projects import Projects
         # The page keeps its projects under ComfyUI's output folder; loading may already poll project jobs.
         self.projects = Projects(port.output_root)
         from .images import Images
         self.images = Images(self, self.directory.parent / 'images')
+        from .whitebox import Whitebox
+        self.whitebox = Whitebox(self.directory.parent / 'whitebox', port.output_root)
         self.load()
         from .productions import Productions
         self.productions = Productions(self)
@@ -395,14 +546,23 @@ class Jobs:
             records = list(latest.values())
         for row in records:
             if (isinstance(row, dict) and specs.JOB_ID.fullmatch(str(row.get('id')))
-                    and row.get('kind') in ('generate', 'assemble', 'export', 'image_edit') + GPU_KINDS
+                    and row.get('kind') in ('generate', 'assemble', 'export', 'listen', 'image_edit') + GPU_KINDS
                     and row.get('status') in ACTIVE + DONE and isinstance(row.get('spec'), dict)
                     and type(row.get('created_at')) in (int, float) and math.isfinite(row['created_at'])):
-                if row.get('status') == 'running' and row['kind'] in ('assemble', 'export', 'image_edit') + GPU_KINDS:
+                if row.get('status') == 'running' and row['kind'] in ('assemble', 'export', 'listen', 'image_edit') + GPU_KINDS:
                     # This process restarted while the work ran in it; nothing continues it.
                     self.finish(row, 'failed', error=dict(code='interrupted',
                                 message='ComfyUI restarted while this job ran; submit it again'), save=False)
                 row['_restored'] = True
+                if row['kind'] == 'generate' and row['status'] in ACTIVE:
+                    # Waiting, queued or running when the process restarted: this process runs it
+                    # under the one-pass rule, however it is started again. A finished job is left.
+                    note = self.legacy_one_pass_note(row['spec'])
+                    if note:
+                        row['spec']['sampling_note'] = note
+                if row['kind'] == 'generate' and not row['spec'].get('refine_from'):
+                    # Before device-aware Agent planning, every accepted job used the unknown limit.
+                    row['spec'].setdefault('single_max_frames', None)
                 self.jobs[row['id']] = row
         for row in self.jobs.values():
             if (row['kind'] != 'generate' or row['spec'].get('refine_from')
@@ -470,14 +630,21 @@ class Jobs:
     def finish(self, row, status, *, result=None, error=None, save=True):
         if error is not None:
             code = error.get('code', 'internal_error')
-            if code == 'invalid_json' and row['kind'] in GPU_KINDS:
+            report_id = error.get('report_id')
+            if code == 'invalid_json' and row['kind'] in ('vlm', 'enhance'):
                 code = 'vlm_invalid_json'
-            if code != error.get('code') or not error.get('request_id'):
+            reason_zh = errors.failure_reason(dict(error, code=code))
+            if code != error.get('code') or not error.get('request_id') or row['kind'] == 'image':
                 error = errors.build(code, details=error.get('details'),
                     request=row.get('request_id'), action_required=code != 'cancelled',
-                    kind=row['kind'], stage='terminal', resumable=not row['spec'].get('refine_from'))
+                    kind=row['kind'], stage='terminal', resumable=not row['spec'].get('refine_from'),
+                    report_id=error.get('report_id'))
+                if row['kind'] == 'image':
+                    reason_zh = error['error_zh']
         if error is not None:
-            error = dict(error, request_id=row.get('request_id') or error['request_id'])
+            error = dict(error, request_id=row.get('request_id') or error['request_id'], error_zh=reason_zh)
+            if row['kind'] != 'image' and isinstance(report_id, str) and re.fullmatch(r'[a-f0-9]{32}', report_id):
+                error['report_id'] = report_id
             if error.get('next'):
                 error['next'] = errors.recovery(error['code'], kind=row['kind'], stage='terminal',
                     resumable=not row['spec'].get('refine_from')).replace('{id}', row['id'])
@@ -487,6 +654,8 @@ class Jobs:
                 card = (row.get('parent') or {}).get('cast')
                 if card and '/resume' in error['next']:
                     error['next'] = CAST_AGAIN % card
+            if row.get('cancelled_by') == 'user' and status == 'cancelled':
+                error['next'] = USER_STOP_NEXT
         if row['status'] == status and row.get('error') == error and row.get('finished_at') is not None:
             if result is not None and row.get('result') != result:
                 row['result'] = result
@@ -547,16 +716,35 @@ class Jobs:
         payload = dict(value, **({'takes': takes} if takes != 1 else {}))
         return self.submit_request(payload, client=client, parent=parent, editor=editor)[0]
 
+    def warm_capabilities(self, inputs):
+        """Before Jobs.lock: each row waits here (length.WAIT_SECONDS at most) for a size asked for the first time."""
+        from .routes import substitute
+        names = {}
+        for raw in inputs:
+            item = substitute({k: v for k, v in raw.items() if k not in ('ref', 'takes')}, names)
+            if isinstance(raw.get('ref'), str):
+                names[raw['ref']] = specs.new_id()  # Stands in for the id this row gets under the lock.
+            try:
+                specs.normalize(item, port=self.port)
+            except Exception:
+                pass  # The locked pass reports it, in batch order.
+
     def submit_request(self, value, *, client=None, key=None, parent=None, editor=None):
         batch = isinstance(value, dict) and 'jobs' in value
         schema.validate(schema.batch_schema(local=True) if batch else schema.job_schema(local=True), value)
         schema.preflight_submission(value)
+        if key is not None or value.get('ref') is not None:
+            with self.lock:
+                _, replay = self.idempotency('submit', value, key, client)
+                if replay is not None:
+                    return replay, True
+        inputs = value['jobs'] if batch else [value]
+        self.warm_capabilities(inputs)
         with self.lock:
+            # Another submit may have committed the same key while its tables warmed.
             receipt, replay = self.idempotency('submit', value, key, client)
             if replay is not None:
                 return replay, True
-            batch = 'jobs' in value
-            inputs = value['jobs'] if batch else [value]
             names, rows, problems = {}, [], []
             for i, raw in enumerate(inputs):
                 prefix = '/jobs/%d' % i if batch else ''
@@ -569,7 +757,7 @@ class Jobs:
                 from .routes import substitute
                 item = substitute(item, names)
                 try:
-                    normalized = specs.normalize(item)
+                    normalized = specs.normalize(item, port=_Warmed(self.port))
                 except specs.SpecError as error:
                     problems.extend(schema.prefix_diagnostic(e, prefix) for e in error.errors)
                     continue
@@ -582,6 +770,7 @@ class Jobs:
                                                work=self.continued_work(normalized),
                                                planned=self.planned_parts(normalized, rows)))
                 problems.extend(cut_problems(normalized, normalized.get('seconds'), prefix, editor=editor))
+                problems.extend(part_prompt_problems(normalized, prefix))
                 try:
                     self.port.check(normalized)
                 except specs.SpecError as error:
@@ -619,12 +808,14 @@ class Jobs:
                         if any(block['after'] for block in row['editor']['blocks']) and not self.continuation_ready():
                             raise continuation_unavailable()
                         continue
-                    self.require_continuation(row['spec']['seconds'])
+                    self.require_continuation(row['spec'])
                     if row['spec'].get('continue_from') and not self.continuation_ready():
                         raise continuation_unavailable()
             if receipt:
                 receipt['jobs'] = [r['id'] for r in rows]
                 rows[0]['receipts'] = [receipt]
+            if self.session_open is not None and rows and rows[0].get('session'):
+                self.session_open(rows[0]['session'])  # Deleting a conversation checks for work under this same lock.
             self.save_batch(rows)
             self.jobs.update({r['id']: r for r in rows})
             return rows, False
@@ -648,11 +839,14 @@ class Jobs:
                 and (not project or r['spec'].get('project') == project)]
         return rows[:limit]
 
-    def cancel(self, identity):
+    def cancel(self, identity, *, by=None):
         row = self.get(identity)
         with self.lock:
             if row['status'] in DONE:
                 return row
+            if by == 'user':
+                # Save before contacting an executor, including jobs still being dispatched.
+                self.touch(row, cancelled_by='user')
             if row['kind'] == 'generate' and not row['spec'].get('refine_from'):
                 row['_cancel'] = True
                 row['cancel_requested'] = True
@@ -683,7 +877,9 @@ class Jobs:
             state = self.port.cancel(row['comfy']['prompt_id'], row['comfy']['node'])
             if state == 'cancelled':
                 self.finish(row, 'cancelled', error=dict(code='cancelled', message='Removed from the queue'))
-        elif row['kind'] in GPU_KINDS and row.get('_vlm'):
+        elif row['kind'] == 'image' and row.get('_image'):
+            self.port.image_cancel(row['_image'])
+        elif row['kind'] in ('vlm', 'enhance') and row.get('_vlm'):
             self.port.vlm_cancel(row['_vlm'])
         return row
 
@@ -697,8 +893,8 @@ class Jobs:
         from ..comfy_chain import continuation_available
         return continuation_available() and os.environ.get('FREEVIDEO_CHAIN_INDEPENDENT') != '1'
 
-    def require_continuation(self, seconds):
-        if not single_block(seconds) and not self.continuation_ready():
+    def require_continuation(self, spec):
+        if not single_block(spec) and not self.continuation_ready():
             raise continuation_unavailable()
 
     def require_runner(self):
@@ -828,6 +1024,7 @@ class Jobs:
                 row.setdefault('receipts', []).append(dict(receipt, jobs=[identity]))
             row.pop('error', None)
             row.pop('_cancel', None)
+            row.pop('cancelled_by', None)
             self.touch(row, status='waiting', resume_pending=bool(row.get('chain_id')), cancel_requested=False,
                        cancelled_in_jobs=False,
                        chain_submission='linked' if row.get('chain_id') else None,
@@ -896,9 +1093,21 @@ class Jobs:
             result['chain_id'] = row['chain_id']
         if row['kind'] == 'generate':
             result.update(cancel_requested=row.get('cancel_requested', False), attempt=row.get('attempt', 1))
+            note = spec.get('sampling_note')
+            if (note is None and row['status'] not in DONE and spec.get('two_pass') and not spec.get('preview')
+                    and not spec.get('refine_from')):
+                # A job stored before the one-pass rule and not yet run: the engine applies it when it runs.
+                # A finished one keeps what it did, which a stored request cannot tell.
+                from ..two_pass import one_pass_note
+                note = one_pass_note(spec.get('base_steps', 8))
+            if note:
+                result['notice'] = note
         if row['status'] == 'waiting':
             pending = [d for d in row.get('depends_on', ()) if self.jobs.get(d, {}).get('status') not in DONE]
-            result['waiting_for'] = pending or (['gpu'] if row['kind'] in GPU_KINDS + ('generate',) else [])
+            result['waiting_for'] = pending or row.get('waiting_for') or (['gpu'] if row['kind'] in GPU_KINDS + ('generate',) else [])
+            if row['kind'] == 'image' and not pending and row.get('waiting_for'):
+                # Only once it was really held back; a picture just submitted has not been looked at yet.
+                result['notice'] = IMAGE_WAIT_NOTICES[row['waiting_for'][0]]
         if row['status'] in ('queued', 'running', 'cancelling'):
             result['progress'] = progress
             if row.get('chain_id'):
@@ -909,9 +1118,22 @@ class Jobs:
             result['error'] = row['error'] if row['error'].get('request_id') else errors.build(
                 row['error'].get('code'), details=row['error'].get('details'), request=row.get('request_id'),
                 kind=row['kind'], stage='terminal', resumable=not row['spec'].get('refine_from'))
+            if row['kind'] == 'image':
+                result['error'] = errors.build(result['error']['code'], kind='image', stage='terminal',
+                    details=result['error'].get('details'), request=row.get('request_id'),
+                    action_required=result['error']['code'] != 'cancelled', report_id=row['error'].get('report_id'))
+            else:
+                result['error'] = dict(result['error'], error_zh=errors.failure_reason(row['error']))
+                report_id = row['error'].get('report_id')
+                if isinstance(report_id, str) and re.fullmatch(r'[a-f0-9]{32}', report_id):
+                    result['error']['report_id'] = report_id
             if result['error'].get('next'):
                 result['error'] = dict(result['error'], next=errors.recovery(result['error']['code'], kind=row['kind'],
                     stage='terminal', resumable=not row['spec'].get('refine_from')).replace('{id}', row['id']))
+        notice = user_stop_notice(row)
+        result.update(notice)
+        if notice and result.get('error'):
+            result['error'] = dict(result['error'], next=USER_STOP_NEXT)
         if detail:
             result['spec'] = {k: v for k, v in spec.items() if k not in ('depends_on',)}
             if row.get('comfy'):
@@ -967,6 +1189,32 @@ class Jobs:
         return dict(phase=row.get('_phase') or ('running' if row['status'] == 'running' else 'queued'),
                     **({'detail': row['_detail']} if row.get('_detail') else {}))
 
+    def estimate(self, row):
+        """The engine's own timing of the current phase, for a page that moves its bar between two messages
+        the way the creation panel does. Only keys the engine sent."""
+        if row['status'] not in ('queued', 'running', 'cancelling'):
+            return None
+        try:
+            if row.get('chain_id'):
+                # A video in several parts has one bar over all of them; the engine times each part by itself.
+                chain = self.chain(row['chain_id'])
+                message = self.port.progress(chain['node']) or {} if chain['count'] == 1 and chain.get('node') else {}
+            elif row['kind'] == 'generate' and row.get('comfy'):
+                message = self.port.progress(row['comfy']['node']) or {}
+            else:
+                return None
+        except Exception:
+            return None
+        value = {key: message[key] for key in ('age_seconds', 'phase', 'done', 'total', 'display_fraction',
+                                               'step_elapsed_seconds', 'estimated_step_seconds') if message.get(key) is not None}
+        overall = message.get('overall') if isinstance(message.get('overall'), dict) else {}
+        overall = {key: overall[key] for key in ('fraction', 'estimated', 'status', 'phase_start_fraction', 'phase_weight',
+                                                 'phase_seconds', 'phase_elapsed_seconds', 'sampling_time_weighted', 'remaining_source')
+                   if overall.get(key) is not None}
+        if overall:
+            value['overall'] = overall
+        return value or None
+
     # Scheduling ----------------------------------------------------------------------------------------
     def active(self):
         return [r for r in self.rows() if r['status'] in ACTIVE]
@@ -1011,8 +1259,8 @@ class Jobs:
     def _tick(self):
         """Advance every unfinished job once, oldest first; safe to call often.
 
-        The GPU takes turns: a VLM job starts only with no generation ahead of it
-        or in ComfyUI's queue, and a generation never overtakes an earlier VLM job.
+        The GPU takes turns: local image and VLM jobs start only with no video ahead
+        of them or in ComfyUI's queue, and a video never overtakes an earlier GPU job.
         """
         dispatches = []
         generation_ahead = vlm_ahead = False
@@ -1025,7 +1273,9 @@ class Jobs:
                         self.poll_chain(row)
                     elif kind == 'generate' and row.get('comfy'):
                         self.poll_generation(row)
-                    elif kind in GPU_KINDS and row.get('_vlm'):
+                    elif kind == 'image' and row.get('_image'):
+                        self.poll_image(row)
+                    elif kind in ('vlm', 'enhance') and row.get('_vlm'):
                         self.poll_vlm(row)
                     if row['status'] in ACTIVE:
                         generation_ahead |= kind == 'generate'
@@ -1036,7 +1286,7 @@ class Jobs:
                 if self.ready(row) != 'ready':
                     continue
                 if kind == 'generate':
-                    if generation_ahead or vlm_ahead or self.port.vlm_busy():
+                    if generation_ahead or vlm_ahead or self.port.vlm_busy() or self.port.image_busy():
                         generation_ahead = True
                         continue
                     generation_ahead = True
@@ -1044,9 +1294,16 @@ class Jobs:
                         continue
                 elif kind in GPU_KINDS:
                     chain_busy = self.runner_busy()
-                    busy = generation_ahead or vlm_ahead or chain_busy or self.port.queue_busy() or self.port.vlm_busy()
+                    video_busy = generation_ahead or chain_busy or self.port.queue_busy()
+                    image_busy = self.port.image_busy()
+                    busy = video_busy or vlm_ahead or image_busy or self.port.vlm_busy()
                     vlm_ahead = True
                     if busy:
+                        if kind == 'image':
+                            code = 'busy_video' if video_busy else 'busy'
+                            if not self.wait_image(row, code,
+                                    waiting_for='video' if video_busy else 'image' if image_busy else 'gpu'):
+                                self.finish(row, 'failed', error=dict(code=code))
                         continue
                 row['_dispatching'] = True
                 dispatches.append(row)
@@ -1094,6 +1351,9 @@ class Jobs:
             if row['kind'] == 'export':
                 from .projects import run_export
                 result = run_export(self.port, row)
+            elif row['kind'] == 'listen':
+                from .projects import run_listen
+                result = run_listen(self.port, row)
             elif row['kind'] == 'image_edit':
                 from .images import run_render
                 result = run_render(self, row)
@@ -1108,13 +1368,16 @@ class Jobs:
             await asyncio.to_thread(check)
             if row['kind'] == 'generate':
                 await self.start_generation(row)
-            elif row['kind'] in GPU_KINDS:
+            elif row['kind'] == 'image':
+                await asyncio.to_thread(self.start_image, row)
+            elif row['kind'] in ('vlm', 'enhance'):
                 await asyncio.to_thread(self.start_vlm, row)
             else:
                 result = await asyncio.to_thread(run)
                 succeeded = True
         except JobError as error:
-            failure = ('cancelled' if error.code == 'cancelled' else 'failed', error.view())
+            if row['kind'] != 'image' or not self.wait_image(row, error.code):
+                failure = ('cancelled' if error.code == 'cancelled' else 'failed', error.view())
         except specs.SpecError as error:
             failure = ('failed', dict(code='invalid_request', message=str(error), details=error.errors))
         except Exception as error:  # noqa: BLE001 - a job must always end with a reason
@@ -1168,7 +1431,8 @@ class Jobs:
                 spec = source['spec']
                 if spec['kind'] != 'generate' or spec.get('refine_from') or source.get('editor'):
                     return None
-                total += len(plan(spec['seconds'], continued=bool(spec.get('continue_from')))['blocks'])
+                total += len(plan(spec['seconds'], max_frames=single_frame_limit(spec),
+                                  continued=bool(spec.get('continue_from')))['blocks'])
                 if not spec.get('continue_from'):
                     return total
                 work = self.continued_work(spec)
@@ -1208,9 +1472,28 @@ class Jobs:
             relative = edited
         return relative
 
+    @staticmethod
+    def legacy_one_pass_note(spec):
+        """The note for an unfinished two-pass job stored before the one-pass rule, else None."""
+        base = spec.get('base_steps', 8)
+        if (spec.get('sampling_note') is None and spec.get('two_pass') is True and not spec.get('preview')
+                and not spec.get('refine_from') and type(base) is int and 1 <= base <= 32 and base != 8):
+            from ..two_pass import one_pass_note
+            return one_pass_note(base)
+        return None  # a damaged stored value gets no note; the row is judged where it is used
+
     async def start_generation(self, row):
         def prepare():
             spec = row['spec']
+            note = self.legacy_one_pass_note(spec)
+            if note:
+                # A job stored before the one-pass rule starts under it now, on a first start
+                # and on a resume alike: keep what it runs as, so the note outlasts the run and
+                # a reload (a stored request alone cannot tell, and a finished old job must
+                # not gain a note).
+                with self.lock:
+                    spec['sampling_note'] = note
+                self.touch(row)
             if row.get('resume_pending'):
                 self.start_chain(row, resume=True)
                 return
@@ -1234,11 +1517,14 @@ class Jobs:
                             assets.append(dict(file=self.media_file(row, spec['media'][role], role, target=target),
                                                role=role))
                     for i, item in enumerate(spec['media'].get('references', []), 1):
-                        assets.append(dict(file=self.media_file(row, item, 'reference-%02d' % i, target=target),
-                                           role='reference'))
+                        asset = dict(file=self.media_file(row, item, 'reference-%02d' % i, target=target), role='reference')
+                        if 'early_steps' in item:
+                            asset['early_steps'] = item['early_steps']
+                        assets.append(asset)
                     return assets
                 assets = resolve()
                 graph = specs.comfy_prompt(spec, node, prompt=prompt, assets=assets)
+                prompt = graph[node]['inputs']['text']
                 with self.lock:
                     row['inputs'] = dict(media=assets, prompt_chars=len(prompt))
             if row.get('_cancel'):
@@ -1249,6 +1535,7 @@ class Jobs:
                 return graph, extra, node
             else:
                 payload = dict(node=node, prompt=graph, seconds=spec['seconds'],
+                               max_frames=single_frame_limit(spec),
                                client_id='agent:' + row['id'], extra_data=extra)
                 if row.get('editor'):
                     payload.pop('seconds')
@@ -1257,6 +1544,10 @@ class Jobs:
                     # Planned as a continuation, so the new video is as long as the request says.
                     payload.update(after=dict(work=self.port.output_relative(self.source_video(spec['continue_from']))),
                                    text=prompt, seed=spec['seed'])
+                if spec.get('part_prompts') and 'seconds' in payload:
+                    # Each part plays its own description, with the same LoRA trigger words the whole prompt gets.
+                    from ..lora_triggers import apply_triggers
+                    payload['texts'] = [apply_triggers(text, spec.get('loras', [])) for text in spec['part_prompts']]
                 self.start_chain(row, payload=payload)
         work = asyncio.create_task(asyncio.to_thread(prepare))
         try:
@@ -1280,16 +1571,17 @@ class Jobs:
             if row.get('_cancel') or row['status'] == 'cancelled':
                 return
             if (any(r['state'] in ('queued', 'running', 'cancelling') or r['output_state'] == 'joining'
-                    for r in runner.records.values()) or self.port.queue_busy() or self.port.vlm_busy()):
+                    for r in runner.records.values()) or self.port.queue_busy() or self.port.vlm_busy() or self.port.image_busy()):
                 return
             # Submit and plan refuse this up front; the backend can still change before a queued or resumed job starts.
             if (any(b['state'] != 'done' and (b['after'] or b['before'])
                     for b in runner.records[row['chain_id']]['blocks']) if resume
                     else any(b['after'] for b in payload['blocks']) if row.get('editor')
-                    else bool(row['spec'].get('continue_from')) or not single_block(payload['seconds'])) and not self.continuation_ready():
+                    else bool(row['spec'].get('continue_from')) or not single_block(row['spec'])) and not self.continuation_ready():
                 raise continuation_unavailable()
             self.touch(row, chain_submission='creating', status='queued', queued_at=self.clock())
-            from ..chain_runner import ChainBusy, ChainTooLong
+            from ..chain_plan import PlanError
+            from ..chain_runner import ChainBusy, ChainPartTooShort, ChainTooLong
             try:
                 if resume:
                     chain = runner.resume(row['chain_id'], client_id='agent:' + row['id'])
@@ -1304,6 +1596,13 @@ class Jobs:
                 # Submit and plan refuse this up front; a source that was still being made can only be counted here.
                 row['resume_pending'] = False
                 self.finish(row, 'failed', error=errors.build('chain_too_long', validation=True, message=str(error)))
+                return
+            except (PlanError, ChainPartTooShort) as error:
+                row['resume_pending'] = False
+                problem = length_problem(row['spec']['seconds'], bool(row['spec'].get('continue_from')),
+                                         minimum=error.limit if isinstance(error, ChainPartTooShort) else None,
+                                         frames=single_frame_limit(row['spec']))
+                self.finish(row, 'failed', error=errors.validation([problem]))
                 return
             except Exception:
                 row['resume_pending'] = False
@@ -1481,6 +1780,10 @@ class Jobs:
                     reason = self.port.generation_error(history, chain['node'])
             except Exception as error:
                 self.log_poll_failure(row, error)
+        try:
+            report_id = (self.port.progress(chain['node']) or {}).get('report_id')
+        except Exception:
+            report_id = None
         code = reason.get('code', 'generation_failed')
         if code not in ('insufficient_memory', 'out_of_memory', 'generation_failed'):
             code = 'generation_failed'
@@ -1503,8 +1806,81 @@ class Jobs:
                        'POST /freevideo/agent/v1/jobs/%s/resume to retry unfinished work.' % row['id'])
         if code == 'insufficient_memory' and reason.get('alternatives'):
             next_action = 'Use the alternatives in details to lower size or duration, then POST /freevideo/agent/v1/jobs.'
-        return chain_error(code, errors.ERRORS[code][2], next_action, details=[detail],
-                           retryable=code != 'insufficient_memory').view()
+        failure = dict(chain_error(code, errors.ERRORS[code][2], next_action, details=[detail],
+                           retryable=code != 'insufficient_memory').view(),
+                    error_zh=errors.failure_reason(dict(code=code, message=message)))
+        if isinstance(report_id, str) and re.fullmatch(r'[a-f0-9]{32}', report_id):
+            failure['report_id'] = report_id
+        return failure
+
+    # Local image generation ----------------------------------------------------------------------------
+    def wait_image(self, row, code, *, waiting_for=None):
+        if code not in IMAGE_WAIT_ERRORS:
+            return False
+        if row.get('_cancel'):
+            self.finish(row, 'cancelled', error=dict(code='cancelled'))
+            return True
+        waiting_for = [waiting_for or ('video' if code == 'busy_video' else 'image')]
+        row.pop('_image', None)
+        if row['status'] != 'waiting' or row.get('waiting_for') != waiting_for:
+            self.touch(row, status='waiting', started_at=None, waiting_for=waiting_for)
+        return True
+
+    def start_image(self, row):
+        spec = row['spec']
+        row['_phase'] = 'preparing images'
+        value = {k: spec[k] for k in ('width', 'height', 'seed') if k in spec}
+        if spec.get('people'):
+            # A first frame: the people's pictures at the asked places, in the scene shown or described.
+            action = 'compose'
+            value['people'] = [dict(person, image=image_reference(self.port, person['image'])) for person in spec['people']]
+            if spec.get('scene_image'):
+                value['scene_image'] = image_reference(self.port, spec['scene_image'])
+            else:
+                value['scene'] = spec['prompt']
+        else:
+            action = 'generate'
+            value.update(prompt=spec['prompt'], images=[image_reference(self.port, name) for name in spec['images']])
+            metadata = spec.get('metadata') or {}
+            if metadata.get('cast_card') and metadata.get('cast_part') == 'back':
+                value['cast_view'] = 'back'
+        if row.get('_cancel'):
+            raise JobError('cancelled', IMAGE_ERRORS['cancelled'])
+        row['_image'] = self.port.image_start(action, value)
+        row['_phase'] = 'starting'
+        row.pop('waiting_for', None)
+        self.touch(row, status='running', started_at=self.clock())
+        if row.get('_cancel'):
+            self.port.image_cancel(row['_image'])
+
+    def poll_image(self, row):
+        try:
+            state = self.port.image_status(row['_image'])
+        except ValueError:
+            self.finish(row, 'failed', error=dict(code='unknown_job'))
+            return
+        phase = state.get('phase')
+        if phase in ('queued', 'starting', 'progress', 'cancelling'):
+            row['_phase'] = state.get('stage') if phase == 'progress' else phase
+        elif phase == 'complete':
+            from PIL import Image
+            relative = state['file']
+            with Image.open(self.port.input_path(relative)) as picture:
+                width, height = picture.size
+            result = dict(assets.view(relative, 'input'), width=width, height=height)
+            result['thumbnail'] = result['url']
+            seed = state.get('seed', row['spec'].get('seed'))
+            if seed is not None:
+                result['seed'] = seed
+            self.finish(row, 'succeeded', result=result)
+        elif phase == 'cancelled':
+            self.finish(row, 'cancelled', error=dict(code='cancelled'))
+        else:
+            failure = state.get('error')
+            code = failure.get('code') if isinstance(failure, dict) else failure
+            code = code or 'generation_failed'
+            if not self.wait_image(row, code):
+                self.finish(row, 'failed', error=dict(code=code, report_id=state.get('report_id')))
 
     # Local VLM -----------------------------------------------------------------------------------------
     def start_vlm(self, row):
@@ -1580,13 +1956,10 @@ class Jobs:
         clips = []
         for item in spec['clips']:
             clips.append(dict(path=str(self.source_video(item)), start=item.get('start', 0.), end=item.get('end')))
-        name = spec.get('name') or spec.get('label') or row['id']
-        name = ''.join(c if c.isalnum() or c in '._-' else '-' for c in name)[:64].strip('-.') or row['id']
-        relative = 'FreeVideo-Sequences/%s/%s-%s.mp4' % (time.strftime('%Y-%m-%d', time.gmtime()), name, row['id'])
-        if row.get('parent', {}).get('production'):
-            # Deterministic output identity survives a process restart during assembly.
-            run = hashlib.sha256(row['id'].encode()).hexdigest()[:32]
-            relative = 'FreeVideo/%s/%s/video.mp4' % (iso(row['created_at'])[:10], run)
+        # Every sequence is saved as a library work, so it shows in My works and has a library link.
+        # The identity comes from the job id, so it survives a process restart during assembly.
+        run = hashlib.sha256(row['id'].encode()).hexdigest()[:32]
+        relative = 'FreeVideo/%s/%s/video.mp4' % (iso(row['created_at'])[:10], run)
         out = self.port.output_path(relative, create=True)
         row['_phase'] = 'assembling'
         def progress(value):
@@ -1598,20 +1971,16 @@ class Jobs:
                                       cancelled=lambda: bool(row.get('_cancel')))
         if row.get('_cancel'):
             raise JobError('cancelled', 'Cancelled')
-        manifest = dict(schema='freevideo.sequence', schema_version=1, job=row['id'], label=spec.get('label'),
+        manifest = dict(schema='freevideo.sequence', schema_version=1, job=row['id'], label=spec.get('label'), name=spec.get('name'),
                         project=spec.get('project'), created_at=iso(self.clock()),
                         clips=[dict(source={k: v for k, v in item.items() if k in ('from_job', 'library', 'file')},
                                     start=item.get('start', 0.), end=item.get('end')) for item in spec['clips']],
                         transition=spec['transition'], transition_seconds=spec['transition_seconds'])
         out.with_suffix('.json').write_text(json.dumps(manifest, indent=1), encoding='utf-8')
-        if row.get('parent', {}).get('production'):
-            out.with_suffix('.request.json').write_text(json.dumps(dict(success=True, geometry={
-                k: made.get(k) for k in ('seconds', 'frames', 'width', 'height')}, sequence=manifest)), encoding='utf-8')
-            return dict(library_id=library_id(relative), video=library_view(self.port, relative),
-                        **{k: made.get(k) for k in ('seconds', 'frames', 'width', 'height', 'has_audio', 'clips')})
-        return dict(video=self.port.file_view(relative), seconds=made.get('seconds'), frames=made.get('frames'),
-                    width=made.get('width'), height=made.get('height'), has_audio=made.get('has_audio'),
-                    clips=manifest['clips'])
+        out.with_suffix('.request.json').write_text(json.dumps(dict(success=True, geometry={
+            k: made.get(k) for k in ('seconds', 'frames', 'width', 'height')}, sequence=manifest)), encoding='utf-8')
+        return dict(library_id=library_id(relative), video=library_view(self.port, relative),
+                    **{k: made.get(k) for k in ('seconds', 'frames', 'width', 'height', 'has_audio', 'clips')})
 
 
 VLM_ERRORS = {

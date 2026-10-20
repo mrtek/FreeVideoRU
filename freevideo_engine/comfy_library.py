@@ -182,7 +182,8 @@ def video_download(output_directory, identity):
 _OWNED_FILE = re.compile(r'(?:video\.[A-Za-z0-9._-]+|prompt\.txt|workflow\.json|comfy-request\.json|generate\.log'
                          r'|continuation-source\.safetensors'
                          r'|media\.json|prompt-rewrite\.json|input-conditioning\.pt|(?:first|last)\.png'
-                         r'|reference-\d{2}\.(?:png|mp4|wav))(?:\.[a-z0-9_]{8}\.tmp)?')
+                         r'|reference-\d{2}\.(?:png|mp4|wav)'
+                         r'|\.(?:share|editor-export)-[0-9a-f]{32}\.mp4)(?:\.[a-z0-9_]{8}\.tmp)?')
 _OWNED_FOLDER = 'video.artifacts'
 _REPARSE_POINT = 0x400
 
@@ -335,6 +336,45 @@ def release_decoded(folder):
         return dict(freed_bytes=0, left=['.'], skipped='unreadable')
 
 
+# What an interrupted share or editor export leaves beside a creation: its working copy,
+# written under a random name and renamed only when finished.
+_INTERRUPTED = re.compile(r'\.(?:share|editor-export)-[0-9a-f]{32}\.mp4')
+
+
+def clean_interrupted(output_directory, *, older=3600., now=None):
+    """Delete working copies of shares and exports that a closed program left behind.
+
+    Only files not written to for ``older`` seconds, so one being written now stays. A folder
+    that holds nothing else afterwards (an export that never finished) goes with it.
+    Returns the bytes freed.
+    """
+    try:
+        output_directory = checked_real_path(output_directory)
+    except AliasUnavailable:
+        return 0
+    root = Path(output_directory).resolve() / 'FreeVideo'
+    now = time.time() if now is None else now
+    freed = 0
+    for path in sorted(root.glob('*/*/.*.mp4')):
+        try:
+            folder = path.parent
+            if (not _INTERRUPTED.fullmatch(path.name) or not _ID.fullmatch(folder.relative_to(root).as_posix())
+                    or not _plain(folder.parent) or not _plain(folder) or not _plain(path)):
+                continue
+            info = path.stat()
+            if now - info.st_mtime < older:
+                continue
+            path.unlink()
+            freed += info.st_size
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+        except OSError:
+            continue
+    return freed
+
+
 def release_later(output_directory):
     """Have the next start finish a release that Windows kept open."""
     from .monitoring import save
@@ -429,24 +469,44 @@ def _queued_continuation_uses(path, output_directory, queue):
     return False
 
 
-def delete_video(output_directory, identity, *, queue=None):
-    """Delete one saved creation: its whole run folder, only when FreeVideo wrote everything in it.
+def _request_states(root, cache):
+    """The small request records of every run, re-read only when their file changed."""
+    rows = []
+    for state_path in root.glob('*/*/comfy-request.json'):
+        try:
+            info = state_path.stat()
+            key = (info.st_mtime_ns, info.st_size, getattr(info, 'st_ino', 0))
+            known = cache.get(state_path)
+            if known is None or known[0] != key:
+                state = json.loads(state_path.read_text(encoding='utf-8')) if info.st_size <= 1024 * 1024 else {}
+                known = cache[state_path] = (key, state)
+        except (OSError, ValueError):
+            continue
+        rows.append(known[1])
+    return rows
 
-    The folder is first renamed into FreeVideo/.deleted, so it leaves the
-    library at once, or, when Windows still has a file open, nothing changes.
+
+class RecordUnsaved(Exception):
+    """The record that names a folder before it moves could not be written, so nothing moved."""
+
+
+def _trash_creation(output_directory, identity, queue, cache, announce=None):
+    """Check that a creation may go, and rename its folder into FreeVideo/.deleted.
+
+    Returns the trash folder and the content identifier of its video. Nothing is
+    deleted yet: the caller removes the folder when it is sure it is not wanted back.
+    ``announce(target, identifier)`` runs under the same locks just before the move, so a
+    caller can write down where the folder is going first; if it raises, nothing moves.
     """
-    try:
-        output_directory = checked_real_path(output_directory)
-    except AliasUnavailable as error:
-        raise DeleteRefused('not-freevideo') from error
     path = _video(output_directory, identity)
     _report(path)
     root = Path(output_directory).resolve() / 'FreeVideo'
     folder = path.parent
     if folder.parent.parent != root or not _plain(folder.parent) or not _plain(folder):
         raise DeleteRefused('not-freevideo')
-    # Not while the startup release is deleting files in this folder.
-    with _RELEASING, (queue.mutex if queue is not None else nullcontext()):
+    # Not while the startup release is deleting files in this folder. _PENDING comes first,
+    # as in undo_deleted, so the move and its in-flight mark cannot interleave with a purge.
+    with _PENDING, _RELEASING, (queue.mutex if queue is not None else nullcontext()):
         from .comfy_editor import reference_users
         try:
             users = reference_users(output_directory, identity)
@@ -460,11 +520,7 @@ def delete_video(output_directory, identity, *, queue=None):
         if _queued_continuation_uses(path, output_directory, queue):
             raise DeleteRefused('continuation-in-use')
         # A second pass of this preview may be reading its first pass right now.
-        for state_path in root.glob('*/*/comfy-request.json'):
-            try:
-                state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.stat().st_size <= 1024 * 1024 else {}
-            except (OSError, ValueError):
-                continue
+        for state in _request_states(root, cache):
             if not isinstance(state, dict) or state.get('status') not in ('queued', 'starting', 'running'):
                 continue
             source = state.get('upscaled_preview')
@@ -479,7 +535,7 @@ def delete_video(output_directory, identity, *, queue=None):
         # cleanup may fail, including in lightweight CI without PyAV.
         identifier = None
         try:
-            from .continuation_store import video_id, delete_id
+            from .continuation_store import video_id
             identifier = video_id(path)
         except ModuleNotFoundError as error:
             if error.name not in ('av', __package__ + '.continuation_store'):
@@ -491,28 +547,495 @@ def delete_video(output_directory, identity, *, queue=None):
         if not _plain(trash):
             raise DeleteRefused('not-freevideo')
         target = trash / ('%s-%d' % (identity.replace('/', '-'), time.time_ns()))
+        if announce is not None:
+            announce(target, identifier)
         try:
             folder.rename(target)
         except OSError as error:
             raise DeleteRefused('in-use') from error
-        if identifier is not None:
-            try:
-                delete_id(identifier)
-            except Exception as error:
-                logging.warning('[FreeVideo] Continuation cleanup failed (%s).', type(error).__name__)
-    freed, left = _remove(target)
-    # A result-cache row naming this creation can no longer be reused.
+        _INFLIGHT.add(target.name)
+    return target, identifier
+
+
+def _forget(identifiers, root):
+    """Drop what only a deleted creation needed: its continuation data and reusable results."""
+    for identifier in identifiers:
+        if identifier is None:
+            continue
+        try:
+            from .continuation_store import delete_id
+            delete_id(identifier)
+        except Exception as error:
+            logging.warning('[FreeVideo] Continuation cleanup failed (%s).', type(error).__name__)
+
+
+def _forget_results(identities, root):
+    """A result-cache row naming a deleted creation can no longer be reused."""
     for index in (root / '.result-cache').glob('*.json'):
         try:
-            if index.stat().st_size <= 1024 * 1024 and json.loads(index.read_text(encoding='utf-8')).get('id') == identity:
+            if index.stat().st_size <= 1024 * 1024 and json.loads(index.read_text(encoding='utf-8')).get('id') in identities:
                 index.unlink()
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, TypeError):
             pass
+
+
+def delete_video(output_directory, identity, *, queue=None):
+    """Delete one saved creation: its whole run folder, only when FreeVideo wrote everything in it.
+
+    The folder is first renamed into FreeVideo/.deleted, so it leaves the
+    library at once, or, when Windows still has a file open, nothing changes.
+    """
+    try:
+        output_directory = checked_real_path(output_directory)
+    except AliasUnavailable as error:
+        raise DeleteRefused('not-freevideo') from error
+    root = Path(output_directory).resolve() / 'FreeVideo'
+    target, identifier = _trash_creation(output_directory, identity, queue, {})
+    try:
+        _forget([identifier], root)
+        freed, left = _remove(target)
+        _forget_results({identity}, root)
+    finally:
+        with _PENDING:
+            _INFLIGHT.discard(target.name)
     # Finish earlier deletions that Windows had kept open.
-    for earlier in trash.iterdir():
-        if earlier != target and _plain(earlier) and earlier.is_dir():
-            freed += _remove(earlier)[0]
+    freed += _purge_trash(root / '.deleted', keep={target.name})
     return dict(id=identity, freed_bytes=freed, left=len(left))
+
+
+# Several creations deleted together stay in FreeVideo/.deleted for a few seconds, so
+# one click can bring them back. A manifest beside them names what to restore or remove.
+UNDO_SECONDS = 10
+_UNDO_GRACE = 3          # the server waits a little longer than the page shows
+_MANIFEST = '.pending-'
+_BATCH_NAME = re.compile(r'[0-9]{1,20}-[0-9a-f]{6}')
+# A folder in the trash is named by the id it had, with its slash a dash, and the time it moved.
+_TRASH_NAME = re.compile(r'\d{4}-\d{2}-\d{2}-[0-9a-f]{32}-\d+')
+_PENDING = threading.Lock()
+MAX_BATCH = 500
+MAX_EXTEND = 200
+_SESSION = os.urandom(6).hex()
+# Batch names taken in the last hour, and those whose deletion is still moving folders.
+# A name is taken before the first folder moves, so a repeated or parallel request with it
+# is refused instead of overwriting the other's record. Guarded by _PENDING.
+_CLAIMED = {}
+_ACTIVE = set()
+_CLAIM_SECONDS = 3600
+_CLAIM_LIMIT = 4096
+# Folders already moved into FreeVideo/.deleted whose batch record is not written yet.
+# A purge running at the same time must leave them alone. Guarded by _PENDING.
+_INFLIGHT = set()
+
+
+def _pending_manifests(trash):
+    rows = []
+    try:
+        names = sorted(path for path in trash.iterdir() if path.name.startswith(_MANIFEST) and path.suffix == '.json')
+    except OSError:
+        return rows
+    for path in names:
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(value, dict) and isinstance(value.get('items'), list):
+                rows.append((path, value))
+        except (OSError, ValueError):
+            continue
+    return rows
+
+
+def _claim(token, manifest):
+    with _PENDING:
+        now = time.monotonic()
+        for name in [name for name, taken in _CLAIMED.items() if now - taken > _CLAIM_SECONDS]:
+            del _CLAIMED[name]
+        while len(_CLAIMED) >= _CLAIM_LIMIT:
+            del _CLAIMED[next(iter(_CLAIMED))]
+        if token in _CLAIMED or manifest.exists():
+            raise ValueError('Invalid selection')
+        _CLAIMED[token] = now
+        _ACTIVE.add(token)
+
+
+def _hold(root, tokens, due):
+    """Set the end of the undo time of batches an earlier request of the same click already made.
+
+    Returns the batches whose record could not be written; those keep the time they had.
+    """
+    from .monitoring import save
+    failed = []
+    with _PENDING:
+        for token in tokens:
+            path = root / '.deleted' / (_MANIFEST + token + '.json')
+            try:
+                value = json.loads(path.read_text(encoding='utf-8'))
+                current = float(value['due'])
+                if value.get('restore') or time.time() >= current:
+                    continue
+                value['due'] = due
+                save(path, value)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            except OSError:
+                if path.exists():
+                    failed.append(token)
+    return failed
+
+
+def _recover(root, path, value):
+    """Try again to put back what a failed delete could not; never removes anything.
+
+    The caller holds _PENDING and _RELEASING."""
+    from .monitoring import save
+    rows = [item for item in value['items'] if isinstance(item, dict) and isinstance(item.get('id'), str)
+            and _ID.fullmatch(item['id']) and isinstance(item.get('name'), str)
+            and _TRASH_NAME.fullmatch(item['name'])]
+    failed = set(_restore_moved(root, rows))
+    left = [row for row in rows if row['id'] in failed]
+    try:
+        if left:
+            if len(left) != len(value['items']):
+                save(path, dict(value, items=left))
+        else:
+            path.unlink()
+    except OSError:
+        logging.warning('FreeVideo could not update the record of creations it still has to put back.')
+        return
+    _INFLIGHT.difference_update(row['name'] for row in rows if row['id'] not in failed)
+
+
+def _purge_trash(trash, keep=()):
+    """Remove folders that earlier deletions left behind, except those a batch may still restore.
+
+    The folders to remove are chosen while no batch is moving one in, so a folder
+    that is on its way into a batch record is never taken for left-over rubbish.
+    """
+    freed = 0
+    try:
+        with _PENDING:
+            held = set(keep) | _INFLIGHT
+            for _, value in _pending_manifests(trash):
+                held.update(str(item.get('name')) for item in value['items'] if isinstance(item, dict))
+            leftovers = [earlier for earlier in trash.iterdir() if earlier.name not in held]
+        for earlier in leftovers:
+            try:
+                if _plain(earlier) and earlier.is_dir():
+                    freed += _remove(earlier)[0]
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return freed
+
+
+def _restore_moved(root, rows):
+    """Put folders back where they were taken from; returns the ids that could not be restored."""
+    trash, failed = root / '.deleted', []
+    for row in rows:
+        try:
+            source, folder = trash / row['name'], root / row['id']
+            # Named before it moved: a folder that never left, or is already back, needs nothing.
+            if not os.path.lexists(source):
+                continue
+            if folder.exists():
+                raise OSError
+            folder.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(folder)
+        except OSError:
+            failed.append(row['id'])
+    return failed
+
+
+def delete_videos(output_directory, identities, *, queue=None, batch=None, extend=()):
+    """Delete several creations at once, each under the single delete's checks.
+
+    A creation that is in use is skipped with its reason, never forced. The rest
+    leave the library at once and are removed for good ``UNDO_SECONDS`` later;
+    ``undo_deleted`` brings them back until then. ``batch`` lets the page name the batch
+    before asking, so a page that is reloaded while the request runs can still undo it. A name
+    is used once: a second request with it is refused. ``extend`` names the earlier batches of
+    the same click; their undo time is kept open while this request runs and ends with it.
+    """
+    if batch is not None and not (isinstance(batch, str) and _BATCH_NAME.fullmatch(batch)):
+        raise ValueError('Invalid selection')
+    if (not isinstance(identities, list) or not identities or len(identities) > MAX_BATCH
+            or not all(isinstance(identity, str) for identity in identities)):
+        raise ValueError('Invalid selection')
+    if (not isinstance(extend, (list, tuple)) or len(extend) > MAX_EXTEND
+            or not all(isinstance(name, str) and _BATCH_NAME.fullmatch(name) for name in extend)):
+        raise ValueError('Invalid selection')
+    try:
+        output_directory = checked_real_path(output_directory)
+    except AliasUnavailable as error:
+        raise DeleteRefused('not-freevideo') from error
+    root = Path(output_directory).resolve() / 'FreeVideo'
+    finish_deleted(output_directory)
+    cache, moved, skipped = {}, [], []
+    from .monitoring import save
+    token = batch or '%d-%s' % (time.time_ns(), os.urandom(3).hex())
+    manifest = root / '.deleted' / (_MANIFEST + token + '.json')
+    _claim(token, manifest)
+    if extend:
+        _hold(root, extend, time.time() + 120)
+
+    def announce(row):
+        # Written before the folder moves, as a record that only puts things back: if the move, the next
+        # step, a later write or this process fails, whatever sits in the trash is named and never removed.
+        # The caller holds _PENDING.
+        def write(target, identifier):
+            try:
+                save(manifest, dict(schema=1, due=0, restore=True, session=_SESSION,
+                                    items=moved + [dict(row, name=target.name, continuation=identifier)]))
+            except OSError as error:
+                raise RecordUnsaved from error
+        return write
+
+    def publish(due):
+        # Every folder is in the trash and named; from now on the record removes them when the time is over.
+        with _PENDING:
+            save(manifest, dict(schema=1, due=due, born=time.time(), session=_SESSION, items=moved))
+            _INFLIGHT.difference_update(row['name'] for row in moved)
+
+    try:
+        for identity in dict.fromkeys(identities):
+            try:
+                target, identifier = _trash_creation(output_directory, identity, queue, cache,
+                                                     announce=announce(dict(id=identity)))
+            except DeleteRefused as error:
+                skipped.append(dict(id=identity, reason=error.reason, kept=error.kept[:20]))
+            except RecordUnsaved:
+                skipped.append(dict(id=identity, reason='unsaved', kept=[]))
+            except (FileNotFoundError, NotADirectoryError, ValueError):
+                # The creation is already gone from disk (or was never complete): it only has to leave the page.
+                skipped.append(dict(id=identity, reason='unavailable', kept=[]))
+            except OSError:
+                # Still there but not readable or writable (permissions, read-only disk): it stays, and says so.
+                skipped.append(dict(id=identity, reason='failed', kept=[]))
+            else:
+                moved.append(dict(id=identity, name=target.name, continuation=identifier))
+        if moved:
+            # The undo time starts when the last creation has left the library.
+            publish(time.time() + UNDO_SECONDS + _UNDO_GRACE)
+        else:
+            with _PENDING:
+                try:
+                    manifest.unlink()
+                except OSError:
+                    pass
+    except BaseException:
+        with _PENDING, _RELEASING:
+            failed = set(_restore_moved(root, moved))
+            _INFLIGHT.difference_update(row['name'] for row in moved)
+            try:
+                if not failed:
+                    manifest.unlink()
+                else:
+                    logging.warning('FreeVideo could not put back %d creations after a failed delete.', len(failed))
+                    # What could not be put back stays named by a record that only restores it, until it can be.
+                    save(manifest, dict(schema=1, due=0, restore=True, session=_SESSION,
+                                        items=[row for row in moved if row['id'] in failed]))
+            except OSError:
+                # The record already on disk was written before the moves and says the same.
+                pass
+        raise
+    finally:
+        # The earlier chunks get their normal time before this one is reported as finished.
+        if extend:
+            _hold(root, extend, time.time() + UNDO_SECONDS + _UNDO_GRACE)
+        with _PENDING:
+            _ACTIVE.discard(token)
+    if moved:
+        timer = threading.Timer(UNDO_SECONDS + _UNDO_GRACE + 1, _finish_quietly, (output_directory,))
+        timer.daemon = True
+        timer.start()
+    return dict(batch=token if moved else None, undo_seconds=UNDO_SECONDS,
+                deleted=[row['id'] for row in moved], skipped=skipped)
+
+
+def _finish_quietly(output_directory):
+    try:
+        finish_deleted(output_directory)
+    except Exception:
+        logging.warning('FreeVideo could not finish removing deleted creations.', exc_info=True)
+
+
+def finish_deleted(output_directory, *, everything=False):
+    """Remove for good the batches whose undo time is over (all of them with ``everything``).
+
+    Also what the continuation store and the result cache kept for them, and any
+    folder an earlier deletion could not remove. Returns the bytes freed.
+    """
+    root = Path(checked_real_path(output_directory)).resolve() / 'FreeVideo'
+    trash = root / '.deleted'
+    if not trash.is_dir() or not _plain(trash):
+        return 0
+    claimed, recover = [], []
+    with _PENDING:
+        for path, value in _pending_manifests(trash):
+            try:
+                # A batch still moving folders is not touched.
+                if path.name[len(_MANIFEST):-len('.json')] in _ACTIVE or any(
+                        isinstance(item, dict) and item.get('name') in _INFLIGHT for item in value['items']):
+                    continue
+                if value.get('restore'):
+                    recover.append((path, value))
+                # Starting up, only what an earlier session left is finished; a batch of this one is still undoable.
+                elif (everything and value.get('session') != _SESSION) or time.time() >= float(value.get('due', 0)):
+                    path.unlink()
+                    claimed.append(value['items'])
+            except (OSError, ValueError, TypeError):
+                continue
+    if recover:
+        with _PENDING, _RELEASING:
+            for path, value in recover:
+                _recover(root, path, value)
+    freed = 0
+    for items in claimed:
+        rows = [item for item in items if isinstance(item, dict) and isinstance(item.get('name'), str)
+                and _TRASH_NAME.fullmatch(item['name'])]
+        _forget([item.get('continuation') for item in rows], root)
+        for item in rows:
+            folder = trash / item['name']
+            if folder.name == item['name'] and _plain(folder) and folder.is_dir():
+                freed += _remove(folder)[0]
+        _forget_results({item.get('id') for item in rows}, root)
+    return freed + _purge_trash(trash)
+
+
+class UndoBusy(ValueError):
+    """The batch is still being deleted; asking again once that is done works."""
+
+
+def undo_deleted(output_directory, token):
+    """Put a batch back while its undo time lasts; raises ValueError('expired') afterwards."""
+    output_directory = checked_real_path(output_directory)
+    root = Path(output_directory).resolve() / 'FreeVideo'
+    trash = root / '.deleted'
+    if not isinstance(token, str) or not _BATCH_NAME.fullmatch(token):
+        raise ValueError('Invalid batch')
+    manifest = trash / (_MANIFEST + token + '.json')
+    restored, lost = [], []
+    from .monitoring import save
+    with _PENDING, _RELEASING:
+        if token in _ACTIVE:
+            raise UndoBusy('busy')
+        try:
+            value = json.loads(manifest.read_text(encoding='utf-8'))
+            if value.get('restore') or time.time() >= float(value['due']):
+                raise ValueError('expired')
+            items = [item for item in value['items'] if isinstance(item, dict)]
+        except (OSError, KeyError, TypeError, AttributeError):
+            raise ValueError('expired') from None
+        rows = [item for item in items if isinstance(item.get('id'), str) and _ID.fullmatch(item['id'])
+                and isinstance(item.get('name'), str) and _TRASH_NAME.fullmatch(item['name'])]
+        # From here the record only puts things back, so whatever fails or stops half way is never removed.
+        try:
+            save(manifest, dict(value, restore=True, due=0, items=items))
+        except OSError:
+            logging.warning('FreeVideo could not record an undo, so nothing was restored.')
+            return dict(restored=[], lost=[item.get('id') for item in items])
+        for item in items:
+            if item not in rows:
+                lost.append(item.get('id'))
+                continue
+            try:
+                source, folder = trash / item['name'], root / item['id']
+                if folder.exists() or not _plain(source):
+                    raise OSError
+                folder.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(folder)
+                restored.append(item['id'])
+            except OSError:
+                lost.append(item['id'])
+        # What could not come back stays named by the record, to be put back later and never removed.
+        kept = [item for item in items if item.get('id') in lost]
+        try:
+            if kept:
+                save(manifest, dict(value, restore=True, due=0, items=kept))
+            else:
+                manifest.unlink()
+        except OSError:
+            pass
+    return dict(restored=restored, lost=lost)
+
+
+def _checked_tokens(tokens):
+    if (not isinstance(tokens, list) or len(tokens) > MAX_EXTEND
+            or not all(isinstance(name, str) and _BATCH_NAME.fullmatch(name) for name in tokens)):
+        raise ValueError('Invalid selection')
+    return list(dict.fromkeys(tokens))
+
+
+def undo_state(output_directory, tokens):
+    """What the server says about each batch: ``busy`` (folders still moving), ``ready`` with the
+    seconds left to undo it, or ``gone`` (finished, restored, expired or never made)."""
+    tokens = _checked_tokens(tokens)
+    root = Path(checked_real_path(output_directory)).resolve() / 'FreeVideo'
+    states = {}
+    with _PENDING:
+        for token in tokens:
+            if token in _ACTIVE:
+                states[token] = dict(state='busy')
+                continue
+            try:
+                value = json.loads((root / '.deleted' / (_MANIFEST + token + '.json')).read_text(encoding='utf-8'))
+                left = float(value['due']) - time.time() - _UNDO_GRACE
+                if value.get('restore') or left <= 0:
+                    raise ValueError
+                states[token] = dict(state='ready', seconds=left, count=len(value['items']))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                states[token] = dict(state='gone')
+    return states
+
+
+def hold_deleted(output_directory, tokens, *, running):
+    """Keep earlier batches of one click undoable while its next request runs (``running``), or
+    give them the normal undo time again once it is over; returns ``undo_state``.
+
+    Raises OSError when a batch's record could not be written: the caller must not go on as if it was held.
+    """
+    tokens = _checked_tokens(tokens)
+    if not isinstance(running, bool):
+        raise ValueError('Invalid selection')
+    root = Path(checked_real_path(output_directory)).resolve() / 'FreeVideo'
+    seconds = 120 if running else UNDO_SECONDS + _UNDO_GRACE
+    failed = _hold(root, tokens, time.time() + seconds)
+    states = undo_state(output_directory, tokens)
+    if any(row['state'] == 'ready' for row in states.values()):
+        # The request that would have ended their time may never come: check once the time is over.
+        timer = threading.Timer(seconds + 1, _finish_quietly, (output_directory,))
+        timer.daemon = True
+        timer.start()
+    if failed:
+        raise OSError('Could not keep the batches')
+    return states
+
+
+def folder_sizes(output_directory, identities):
+    """Bytes each creation's whole run folder holds, links not followed; unknown ids are left out."""
+    if not isinstance(identities, list) or len(identities) > MAX_BATCH:
+        raise ValueError('Invalid selection')
+    root = Path(checked_real_path(output_directory)).resolve() / 'FreeVideo'
+    sizes = {}
+    for identity in identities:
+        if not isinstance(identity, str) or not _ID.fullmatch(identity):
+            continue
+        folder = root / identity
+        total = 0
+        try:
+            if not _plain(folder):
+                continue
+            for parent, folders, files in os.walk(folder):
+                folders[:] = [name for name in folders if _plain(Path(parent) / name)]
+                for name in files:
+                    try:
+                        info = os.lstat(Path(parent) / name)
+                        total += info.st_size if stat.S_ISREG(info.st_mode) else 0
+                    except OSError:
+                        pass
+        except OSError:
+            continue
+        sizes[identity] = total
+    return sizes
 
 
 def register():
@@ -533,6 +1056,17 @@ def register():
                              result['freed_bytes'] / 1e9, result['videos'])
         except Exception:
             logging.warning('FreeVideo could not free the decoded files of earlier videos.', exc_info=True)
+        try:
+            freed = clean_interrupted(folder_paths.get_output_directory())
+            if freed:
+                logging.info('FreeVideo removed %.1f MB left by an interrupted share or export.', freed / 1e6)
+        except Exception:
+            logging.warning('FreeVideo could not remove files left by an interrupted share or export.', exc_info=True)
+        try:
+            # A deletion the last session did not finish: its undo time is long over.
+            finish_deleted(folder_paths.get_output_directory(), everything=True)
+        except Exception:
+            logging.warning('FreeVideo could not finish removing deleted creations.', exc_info=True)
     threading.Thread(target=release, name='freevideo-release-decoded', daemon=True).start()
 
     @server.routes.get('/freevideo/sampling-estimate')
@@ -543,22 +1077,63 @@ def register():
         try:
             canvas = geometry(int(request.query['width']), int(request.query['height']),
                               seconds=float(request.query['seconds']))
-            from .two_pass import plan, sampling_canvas
+            from .two_pass import SCALES, plan, sampling_canvas
             canvas = sampling_canvas(canvas)[0]
             task = request.query.get('task', 't2va')
             _, machine = installation()
             device = machine.get('device_identity') if machine.get('device_backend') == 'mps' else machine.get('gpu_uuid')
             rows = await asyncio.to_thread(local_records, folder_paths.get_output_directory(), device)
             adapters = request.query.get('adapters') == '1'
-            # A small canvas runs in one pass whatever the switch says.
-            result = {name: {str(steps): estimate(rows, canvas, base_steps=steps,
-                                                 two_pass=plan(canvas, enabled, task, base_steps=steps)['enabled'],
-                                                 task=task, adapters=adapters)
-                              for steps in ((8,) if enabled else (8, 12, 16, 20))}
+            # A small canvas runs in one pass whatever the switch says. A cached
+            # level is keyed "<steps>:<cache>", a two-pass upscale factor other
+            # than 2 "<steps>x<factor>". Without a run of it, plain runs stand
+            # in: the first-block cache is counted at full time, since the
+            # planner may not keep it on this card.
+            share = {'fbcache': 1.}
+
+            def one(steps, cache, enabled, factor):
+                sampled = plan(canvas, enabled, task, base_steps=steps, scale=factor)
+                return estimate(rows, canvas, base_steps=steps, two_pass=sampled['enabled'], task=task,
+                                adapters=adapters, step_cache=cache, cache_share=share.get(cache),
+                                upscale_factor=sampled.get('scale', 2))
+            result = {name: {(str(steps) + (':' + cache if cache else '') + ('x%g' % factor if factor != 2 else '')):
+                             one(steps, cache, enabled, factor)
+                             for steps, cache, factor in ([(8, None, factor) for factor in SCALES] if enabled else
+                                                          ((8, None, 2), (12, None, 2), (16, None, 2), (20, None, 2),
+                                                           (20, 'easycache-av', 2), (20, 'fbcache', 2)))}
                       for name, enabled in (('single', False), ('two_pass', True))}
             return web.json_response(result, headers={'Cache-Control': 'no-store'})
         except (OSError, ValueError, TypeError, KeyError):
             # Estimation is advisory; installation and generation remain usable.
+            return web.json_response({}, headers={'Cache-Control': 'no-store'})
+
+    @server.routes.get('/freevideo/request-assets')
+    async def request_assets(request):
+        """What this request still needs downloaded; advisory and read-only."""
+        from .comfy_bridge import installation
+        from .request_assets import inspect
+        query = request.query
+        try:
+            root, machine = installation()
+            value = dict(width=int(query['width']), height=int(query['height']), seconds=float(query['seconds']),
+                         task=query.get('task', 't2va'), base_steps=int(query.get('base_steps', '8')),
+                         refine_steps=int(query.get('refine_steps', '3')), two_pass=query.get('two_pass', '1') == '1',
+                         enhance=query.get('enhance') == '1', loras=query.getall('lora', [])[:32])
+            refs = []
+            for item in query.getall('ref', [])[:32]:
+                kind, _, name = item.partition(':')
+                parts = Path(name).parts
+                silent = kind == 'video-silent'
+                if (kind in ('image', 'video', 'audio') or silent) and parts and not Path(name).is_absolute() and '..' not in parts:
+                    refs.append(dict(kind='video', path=name, sound=False) if silent else dict(kind=kind, path=name))
+            if refs:
+                # The generation path's own classification decides the tables (audio track in a video).
+                value.update(references=refs, media_base=folder_paths.get_input_directory())
+            names = await asyncio.to_thread(folder_paths.get_filename_list, 'loras') if value['loras'] else None
+            result = await asyncio.to_thread(inspect, root, machine, value, lora_names=names)
+            return web.json_response(result, headers={'Cache-Control': 'no-store'})
+        except (OSError, ValueError, TypeError, KeyError):
+            # Advisory: generation still reports whatever it needs.
             return web.json_response({}, headers={'Cache-Control': 'no-store'})
 
     @server.routes.get('/freevideo/library')
@@ -594,6 +1169,62 @@ def register():
         except (OSError, ValueError, TypeError):
             raise web.HTTPNotFound(text='Saved video unavailable') from None
         return web.json_response(dict(result, deleted=True))
+
+    @server.routes.post('/freevideo/library/delete-batch')
+    async def delete_batch(request):
+        try:
+            body = await request.json()
+            result = await asyncio.to_thread(delete_videos, folder_paths.get_output_directory(),
+                                             body.get('ids') if isinstance(body, dict) else None,
+                                             queue=getattr(server, 'prompt_queue', None),
+                                             batch=body.get('batch') if isinstance(body, dict) else None,
+                                             extend=body.get('extend') or () if isinstance(body, dict) else ())
+        except (DeleteRefused, OSError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text='Invalid selection') from None
+        return web.json_response(result)
+
+    @server.routes.post('/freevideo/library/undo')
+    async def undo(request):
+        try:
+            body = await request.json()
+            result = await asyncio.to_thread(undo_deleted, folder_paths.get_output_directory(),
+                                             body.get('batch') if isinstance(body, dict) else None)
+        except UndoBusy:
+            return web.json_response(dict(restored=[], lost=[], busy=True), status=409)
+        except (OSError, ValueError, TypeError):
+            return web.json_response(dict(restored=[], lost=[], expired=True), status=410)
+        return web.json_response(result)
+
+    @server.routes.post('/freevideo/library/undo-state')
+    async def undo_status(request):
+        try:
+            body = await request.json()
+            result = await asyncio.to_thread(undo_state, folder_paths.get_output_directory(),
+                                             body.get('batches') if isinstance(body, dict) else None)
+        except (OSError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text='Invalid selection') from None
+        return web.json_response(dict(batches=result), headers={'Cache-Control': 'no-store'})
+
+    @server.routes.post('/freevideo/library/hold')
+    async def hold(request):
+        try:
+            body = await request.json()
+            result = await asyncio.to_thread(hold_deleted, folder_paths.get_output_directory(),
+                                             body.get('batches') if isinstance(body, dict) else None,
+                                             running=body.get('running', False) if isinstance(body, dict) else None)
+        except (OSError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text='Invalid selection') from None
+        return web.json_response(dict(batches=result), headers={'Cache-Control': 'no-store'})
+
+    @server.routes.post('/freevideo/library/sizes')
+    async def sizes(request):
+        try:
+            body = await request.json()
+            result = await asyncio.to_thread(folder_sizes, folder_paths.get_output_directory(),
+                                             body.get('ids') if isinstance(body, dict) else None)
+        except (OSError, ValueError, TypeError):
+            raise web.HTTPBadRequest(text='Invalid selection') from None
+        return web.json_response(dict(sizes=result), headers={'Cache-Control': 'no-store'})
 
     @server.routes.get('/freevideo/library/download')
     async def download(request):

@@ -278,6 +278,20 @@ class LiveGPUBudget:
                 self._error(error)
         return self.device_headroom()
 
+    def local_memory(self):
+        """This process's local budget and usage as the driver reports them now, or None."""
+        if self.reader is None:
+            return None
+        try:
+            local = self.reader.sample().get('local')
+        except (OSError, RuntimeError, AttributeError, ValueError) as error:
+            self._error(error)
+            return None
+        if (not isinstance(local, dict) or type(local.get('budget_bytes')) is not int
+                or type(local.get('usage_bytes')) is not int or local['budget_bytes'] <= 0):
+            return None
+        return dict(budget_bytes=local['budget_bytes'], usage_bytes=local['usage_bytes'])
+
     def _settle(self, workspace):
         """Wait for a driver budget that again covers `workspace` twice in a row."""
         deadline = self.clock() + self.settle_seconds

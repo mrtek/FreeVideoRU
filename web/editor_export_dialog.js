@@ -18,9 +18,14 @@ const el = (tag, cls, text) => {
 };
 
 export function exportSizes(record) {
-    const short = Math.min(record.width, record.height);
+    const short = Math.min(record.width, record.height), long = Math.max(record.width, record.height);
+    // Same rounding as the engine's export (nearest even long side), so the dialog and the saved work agree.
+    const sized = n => {
+        const other = Math.max(2, 2 * Math.floor((long * n + short) / (2 * short)));
+        return record.width >= record.height ? {width: other, height: n} : {width: n, height: other};
+    };
     return [{short: null, width: record.width, height: record.height}, ...[1080, 720, 480].filter(n => n < short).map(n => ({
-        short: n, width: Math.floor(record.width * n / short / 2) * 2, height: Math.floor(record.height * n / short / 2) * 2,
+        short: n, ...sized(n),
     }))];
 }
 

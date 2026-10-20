@@ -37,7 +37,7 @@ def launcher_view(status):
     """The parts of a launcher status a page may show; None without a launcher."""
     if not isinstance(status, dict):
         return None
-    view = {k: status.get(k) for k in ('version', 'phase', 'status', 'progress', 'candidate', 'engine', 'error', 'manual', 'channel', 'track')}
+    view = {k: status.get(k) for k in ('version', 'phase', 'model', 'status', 'progress', 'candidate', 'engine', 'error', 'manual', 'channel', 'track')}
     view['phase'] = str(view['phase'] or '')
     return view
 

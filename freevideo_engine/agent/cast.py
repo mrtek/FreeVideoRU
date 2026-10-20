@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import threading
 import uuid
 
@@ -38,6 +39,18 @@ PROMPT_VERSION = 1
 TURN = dict(aspect='9:16', seconds=6)
 CLOSE_UP = dict(aspect='1:1', seconds=4)
 SCENE = dict(aspect='16:9', seconds=6)
+
+# The sheet of every view a shot carries for each person, put together here from the card's own pictures: up to six
+# equal cells (three to a row) on a light grey ground, each picture scaled whole and centred, no text.
+SHEET_VERSION = 1
+SHEET_ORDER = ('front', 'three_quarter', 'side', 'back', 'face')  # then any other label, in card order
+SHEET_CELL = (736, 828)
+SHEET_GAP = 48
+SHEET_GROUND = (238, 238, 238)
+SHEET_COLUMNS = 3
+SHEET_MAX = 6
+SHEET_SIZE = (SHEET_COLUMNS * SHEET_CELL[0] + (SHEET_COLUMNS + 1) * SHEET_GAP, 2 * SHEET_CELL[1] + 3 * SHEET_GAP)  # 2400 x 1800
+_SHEETS_SEEN = set()
 
 
 def reference_prompt(card, *, face=False):
@@ -66,14 +79,16 @@ def turn_label(progress):
 class CastError(JobError):
     """A card error; conflicts carry the current card so the caller can retry from it."""
 
-    def __init__(self, code, message, next_action, *, card=None, job=None):
+    def __init__(self, code, message, next_action, *, card=None, job=None, details=None):
         super().__init__(code, message)
         self.status = errors.ERRORS[code][0]
-        self.next_action, self.card, self.job = next_action, card, job
+        self.next_action, self.card, self.job, self.details = next_action, card, job, details or []
 
     def view(self):
-        value = errors.build(self.code, validation=True, details=[], message=self.message,
+        value = errors.build(self.code, validation=True, details=deepcopy(self.details), message=self.message,
                              next_action=self.next_action)
+        if self.code in errors.IMAGE_REASONS:
+            value.update(errors.image_failure(self.code))
         if self.card is not None:
             value['card'] = deepcopy(self.card)
         if self.job is not None:
@@ -95,6 +110,9 @@ def view(card):
     if card.get('voice'):
         value['voice'] = dict(deepcopy(card['voice']), media=media_view(card['voice']['media']),
                               clip=assets.view(card['voice']['clip']['file']))
+    value['generate_error'] = errors.with_reason(value.get('generate_error'))
+    if card.get('_sheet'):
+        value['sheet'] = media_view(card['_sheet'])  # the sheet made from the pictures, when the card has none of its own
     return value
 
 
@@ -109,7 +127,8 @@ def row_view(card):
     return dict(id=card['id'], kind=card['kind'], name=card['name'], description=card['description'],
                 origin=card['origin'], revision=card['revision'], updated_at=card['updated_at'],
                 images=len(card['images']), voice=card['voice'] is not None,
-                generating=card.get('generating') is not None, thumbnail=thumbnail(card))
+                generating=card.get('generating') is not None, thumbnail=thumbnail(card),
+                generate_error=errors.with_reason(card.get('generate_error')))
 
 
 def _plain(item):
@@ -128,14 +147,23 @@ def _check(record, stem):
             or type(card['revision']) is not int or card['revision'] < 1
             or not isinstance(card['name'], str) or not isinstance(card['description'], (str, type(None)))):
         raise ValueError('Invalid card identity')
-    if set(card['edited_by_user']) != set(EDITABLE) or not all(type(v) is bool for v in card['edited_by_user'].values()):
+    marks = card.get('edited_by_user', {})
+    if not isinstance(marks, dict):
         raise ValueError('Invalid edit marks')
+    normalized = {k: marks.get(k, False) for k in EDITABLE}
+    if not all(type(v) is bool for v in normalized.values()):
+        raise ValueError('Invalid edit marks')
+    if marks != normalized:
+        logging.getLogger(__name__).warning('Normalized edit marks on a readable cast card')
+    card['edited_by_user'] = normalized
+    unknown_labels = False
     for key, limit in (('images', MAX_IMAGES), ('candidates', MAX_CANDIDATES)):
         if not isinstance(card[key], list) or len(card[key]) > limit:
             raise ValueError('Invalid pictures')
         for row in card[key]:
-            if row['label'] not in LABELS or not isinstance(row['media']['file'], str):
+            if not isinstance(row['label'], str) or not isinstance(row['media']['file'], str):
                 raise ValueError('Invalid picture')
+            unknown_labels |= row['label'] not in LABELS
     if card['voice'] is not None:
         if not isinstance(card['voice']['clip']['file'], str) or not (
                 isinstance(card['voice']['media'].get('file'), str) or isinstance(card['voice']['media'].get('library'), str)):
@@ -144,6 +172,8 @@ def _check(record, stem):
         raise ValueError('Invalid film list')
     record['receipts'] = operation_receipts.load(record['receipts'])
     json.dumps(record, allow_nan=False)
+    if unknown_labels:
+        logging.getLogger(__name__).warning('Kept unknown picture labels on a readable cast card')
 
 
 def _revision(body, header):
@@ -246,6 +276,15 @@ class Cast:
         return iso(self.jobs.clock())
 
     # Media --------------------------------------------------------------------------------------------
+    def _picture_at(self, identity, item, by, index):
+        """`_picture` for the request's images[index]; a refused picture names its place, so the dialog marks it."""
+        try:
+            return self._picture(identity, item, by)
+        except CastError as error:
+            if error.code == 'invalid_media' and not error.details:
+                error.details = [dict(field='/images/%d/media' % index)]
+            raise
+
     def _picture(self, identity, item, by):
         """Resolve one picture to an input file in this card's folder (frames, imports, edits)."""
         from ..comfy_assets import media_kind
@@ -260,6 +299,15 @@ class Cast:
         if kind != 'image':
             raise CastError('invalid_media', 'A card picture must be an image.',
                             'Upload an image, or name a video frame with from_job or library and frame.')
+        # The extension alone lets a renamed or cut-off file in; decode it once so a broken picture is refused here,
+        # not when a video first uses the card.
+        try:
+            from PIL import Image
+            with Image.open(self.jobs.port.input_path(relative)) as image:
+                image.load()
+        except Exception:  # noqa: BLE001 - any decoder failure means the picture cannot be used
+            raise CastError('invalid_media', 'A card picture must be a readable image.',
+                            'Upload another image.') from None
         entry = dict(media=dict(file=relative), by=by)
         if isinstance(source, dict) and source.get('from_job'):
             entry['from_job'] = source['from_job']
@@ -324,8 +372,8 @@ class Cast:
                 return replay
         identity = 'c' + uuid.uuid4().hex[:12]
         images = []
-        for row in value.get('images', []):
-            entry = self._picture(identity, row['media'], by)
+        for index, row in enumerate(value.get('images', [])):
+            entry = self._picture_at(identity, row['media'], by, index)
             images.append(dict(entry, label=row.get('label', 'other')))
         voice = self._voice(identity, value['voice']) if value.get('voice') else None
         with self.changed:
@@ -348,7 +396,12 @@ class Cast:
 
     def get(self, identity):
         with self.changed:
-            return view(self._record(identity)['card'])
+            card = deepcopy(self._record(identity)['card'])
+        if card.get('kind') == 'character':
+            sheet = self.sheet(card)
+            if sheet is not None:
+                card['_sheet'] = sheet
+        return view(card)
 
     def list(self, *, q=None, kind=None, origin=None, production=None, limit=50):
         with self.changed:
@@ -362,7 +415,19 @@ class Cast:
 
     def update(self, identity, value, *, by='builtin', ref=None, revision=None, local=False, client=None):
         shape = schema.cast_schema('update', local=local)
-        schema.validate(shape, value)
+        shape['properties']['images']['items']['properties']['label'] = schema.enum(LABELS)
+        checked = deepcopy(value)
+        with self.changed:
+            record = self.records.get(identity) if isinstance(identity, str) else None
+            if record is not None and isinstance(checked, dict) and isinstance(checked.get('images'), list):
+                known = {(row['media']['file'], row['label']) for key in ('images', 'candidates')
+                         for row in record['card'][key] if row['label'] not in LABELS}
+                for row in checked['images']:
+                    if isinstance(row, dict) and isinstance(row.get('label'), str):
+                        if (_plain(row.get('media')), row['label']) in known:
+                            # Let callers return a saved label unchanged; new labels still use the request schema.
+                            row.pop('label')
+        schema.validate(shape, checked)
         ref = ref if ref is not None else value.get('ref')
         value = {k: v for k, v in value.items() if k != 'ref'}
         expected = _revision(value.pop('revision', None), revision)
@@ -382,8 +447,8 @@ class Cast:
         resolved = {}
         for key, rows in changes.items():
             if key == 'images':
-                resolved['images'] = [entry if entry is not None else dict(self._picture(identity, row['media'], by),
-                                      label=row.get('label', 'other')) for row, entry in rows]
+                resolved['images'] = [entry if entry is not None else dict(self._picture_at(identity, row['media'], by, index),
+                                      label=row.get('label', 'other')) for index, (row, entry) in enumerate(rows)]
             elif key == 'voice':
                 resolved['voice'] = None if rows is None else self._voice(identity, rows)
             else:
@@ -516,10 +581,49 @@ class Cast:
 
     # Filming ------------------------------------------------------------------------------------------
     def snapshot(self, identity):
-        """The current card for a submission, or None once it is deleted or unknown."""
+        """The current card for a submission, or None once it is deleted or unknown. A card with several pictures
+        and no sheet of its own carries the one made from them as `_sheet` (never part of the public card)."""
         with self.changed:
             record = self.records.get(identity)
-            return deepcopy(record['card']) if record else None
+            card = deepcopy(record['card']) if record else None
+        if card is not None and card.get('kind') == 'character':
+            sheet = self.sheet(card)
+            if sheet is not None:
+                card['_sheet'] = sheet
+        return card
+
+    def sheet(self, card):
+        """The sheet of every view made from this card's pictures, as a media item, or None when it has no sheet to
+        make (fewer than two pictures, or one cannot be read). The file is named by what it is made from, so a
+        picture changed gives a new one and the same pictures reuse the old."""
+        if any(row['label'] == 'sheet' for row in card.get('images') or []):
+            return None
+        try:
+            port = self.jobs.port
+            rank = {label: i for i, label in enumerate(SHEET_ORDER)}
+            rows = sorted(enumerate(card.get('images') or []), key=lambda r: (rank.get(r[1]['label'], len(rank)), r[0]))
+            files = [port.input_path(row['media']['file']) for _, row in rows[:SHEET_MAX]
+                     if isinstance(row['media'].get('file'), str)]
+            if len(files) < 2:
+                return None
+            pictures = [path.read_bytes() for path in files]  # the same bytes are named and drawn, so a picture
+            digest = hashlib.sha256(str(SHEET_VERSION).encode())  # changed meanwhile cannot sit under the old name
+            for data in pictures:
+                digest.update(hashlib.sha256(data).digest())
+            relative = 'freevideo/agent/%s/sheet-%s.png' % (card['id'], digest.hexdigest()[:16])
+            target = port.input_path(relative, create=True)
+            if not _sheet_intact(target):
+                temporary = target.with_name(target.name + '.' + uuid.uuid4().hex[:8] + '.tmp')
+                try:
+                    compose_sheet(pictures, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                # A sheet is never deleted here: a queued shot or an earlier answer may still name it.
+            return dict(file=relative)
+        except Exception:  # A sheet is a help: without one the person carries the face alone.
+            logging.getLogger(__name__).warning('no sheet for card %s', card.get('id'), exc_info=True)
+            return None
 
     def used(self, identities, film):
         """Record that a film uses these cards; a film never leaves used_by once it is there."""
@@ -537,7 +641,7 @@ class Cast:
 
     # Reference pictures -------------------------------------------------------------------------------
     def generate(self, identity, value=None, *, by='builtin', ref=None, revision=None, client=None):
-        """Submit a reference clip (and a face close-up) for this card; the scheduler lands the frames."""
+        """Submit reference pictures or clips for this card; the scheduler lands the pictures."""
         value = value or {}
         shape = schema.cast_schema('generate')
         schema.validate(shape, value)
@@ -560,25 +664,78 @@ class Cast:
                                 card=view(card), job=job)
             if value['face'] and card['kind'] != 'character':
                 raise spec.SpecError([schema.diagnostic('/face', 'false for a setting card', True)])
+            ready = value.get('source') != 'video' and getattr(self.jobs.port, 'image_ready', lambda: False)()
+            source = value.get('source', 'image' if ready else 'video')
+            # An explicit image request goes through the image service even when
+            # its pack is absent: that failure owns a diagnostic report and a
+            # durable job/card, just like a picture requested directly.
             seed = secrets.randbelow(spec.MAX_SEED + 1)
             token = uuid.uuid4().hex[:12]
-            parts = [('turn', SCENE if card['kind'] == 'setting' else TURN, False)]
-            if value['face']:
-                parts.append(('face', CLOSE_UP, True))
-            items = [dict(kind='generate', prompt=reference_prompt(card, face=face), seed=seed,
-                          label=('Cast · %s · %s' % (card['name'], part))[:120],
-                          metadata=dict(cast_card=identity, cast_part=part), **shot)
-                     for part, shot, face in parts]
+            if source == 'image':
+                from ..image_gen.cast_views import VIEWS, SETTING_VIEWS
+                # A picture takes seconds, so a character always gets every view, the face close-up included.
+                views = list(SETTING_VIEWS if card['kind'] == 'setting' else VIEWS)
+                items = self._image_items(card, views[:1], seed)
+            else:
+                parts = [('turn', SCENE if card['kind'] == 'setting' else TURN, False)]
+                if value['face']:
+                    parts.append(('face', CLOSE_UP, True))
+                items = [dict(kind='generate', prompt=reference_prompt(card, face=face), seed=seed,
+                              label=('Cast · %s · %s' % (card['name'], part))[:120],
+                              metadata=dict(cast_card=identity, cast_part=part), **shot)
+                         for part, shot, face in parts]
             rows, _ = self.jobs.submit_request(dict(jobs=items), client='cast:' + identity,
                                                parent=dict(cast=identity, ref=token))
             jobs = [row['id'] for row in rows]
             card['generating'] = dict(job=jobs[0], face_job=jobs[1] if len(jobs) > 1 else None,
-                                      replace=value['replace'], at=self._now(), by=by)
+                                      jobs=list(jobs), source=source, replace=value['replace'], at=self._now(), by=by)
             card['_generating'] = dict(ref=token, seed=seed, kind=card['kind'], user_images=card.get('_user_images', 0))
+            if source == 'image':
+                card['_generating'].update(source=source, stage='front', views=views[1:],
+                                            job_views={jobs[0]: views[0]}, name=card['name'],
+                                            description=card['description'])
             result = dict(job=jobs[0], jobs=jobs, card=view(card))
             self._remember(record, ref, digest, result, client)
             self._save(record)
             return result
+
+    def _image_items(self, card, views, seed, front=None, from_photo=False):
+        from ..image_gen.cast_views import size, uses_front, view_prompt, photo_prompt
+        # A picture somebody put on the card (the user, or an agent passing on the user's photo) is the person.
+        photo = next((row['media'] for row in card.get('images', []) if not row.get('generated')), None)
+        items = []
+        for part in views:
+            width, height = size(part)
+            images = [front] if uses_front(part) else [photo] if part == 'front' and photo else []
+            # When the front was made from a photo, the photo and not the text says what the person looks like.
+            prompt = (photo_prompt() if part == 'front' and photo else
+                      view_prompt(dict(card, photo=True) if from_photo else card, part))
+            items.append(dict(kind='image', prompt=prompt, width=width, height=height, seed=seed,
+                              images=images, label=('Cast · %s · %s' % (card['name'], part))[:120],
+                              metadata=dict(cast_card=card['id'], cast_part=part)))
+        return items
+
+    def _image_views(self, identity, generating, hidden, rows):
+        """Submit edits of the finished front once, while this tick owns the card's claim."""
+        front = rows[generating['job']]
+        if hidden['stage'] != 'front' or not hidden['views'] or not front or front['status'] != 'succeeded':
+            return False
+        with self.changed:
+            record = self.records.get(identity)
+            if record is None or record['card'].get('_generating') != hidden:
+                return True
+            record = deepcopy(record)
+            card = record['card']
+            basis = dict(id=identity, kind=hidden['kind'], name=hidden['name'], description=hidden['description'])
+            items = self._image_items(basis, hidden['views'], hidden['seed'], dict(file=front['result']['file']),
+                                      from_photo=bool(front['spec'].get('images')))
+            jobs, _ = self.jobs.submit_request(dict(jobs=items, ref='cast-' + hidden['ref'] + '-views'),
+                client='cast:' + identity, parent=dict(cast=identity, ref=hidden['ref']))
+            card['generating']['jobs'].extend(row['id'] for row in jobs)
+            card['_generating']['job_views'].update({row['id']: part for row, part in zip(jobs, hidden['views'])})
+            card['_generating'].update(stage='views', views=[])
+            self._save(record)
+        return True
 
     def allows(self, parent):
         """May Jobs still start this generation? Only while its card waits for it."""
@@ -588,7 +745,7 @@ class Cast:
             return bool(hidden) and hidden['ref'] == parent.get('ref')
 
     def _finished(self):
-        """Cards whose generation jobs have all ended, with those jobs as they ended."""
+        """Cards ready to submit more views or land, with their current jobs as they ended."""
         ready = []
         with self.changed:
             for identity, record in self.records.items():
@@ -618,7 +775,11 @@ class Cast:
             if not self._claim(identity, hidden):
                 continue  # Landed already, or another tick is landing it now.
             try:
-                self._land(identity, generating, hidden, rows)
+                if hidden.get('source') == 'image':
+                    if not self._image_views(identity, generating, hidden, rows):
+                        self._land_image(identity, generating, hidden, rows)
+                else:
+                    self._land(identity, generating, hidden, rows)
             except Exception as error:  # noqa: BLE001 - one card must never stop the others
                 logging.getLogger(__name__).warning('Reference pictures could not be saved (%s)', type(error).__name__)
                 self._fail(identity, hidden, dict(code='internal_error', job=generating['job'],
@@ -632,10 +793,45 @@ class Cast:
         with self.changed:
             record = self.records.get(identity)
             if (identity in self.landing or record is None
-                    or (record['card'].get('_generating') or {}).get('ref') != hidden['ref']):
+                    or record['card'].get('_generating') != hidden):
                 return False
             self.landing.add(identity)
             return True
+
+    def _land_image(self, identity, generating, hidden, rows):
+        pictures, failure, staged = [], None, []
+        try:
+            for job in _generation_jobs(generating):
+                row = rows[job]
+                if row is None or row['status'] != 'succeeded':
+                    code = (row.get('error') or {}).get('code') if row else 'not_found'
+                    code = code or (row['status'] if row else 'not_found')
+                    detail = errors.image_failure(code, (row.get('error') or {}).get('report_id') if row else None)
+                    failure = failure or dict(code=code, job=job, error_zh=detail['reason']['zh'], message=(
+                        'The generation was cancelled.' if row and row['status'] == 'cancelled'
+                        else detail['reason']['en']), **detail)
+                    continue
+                folder = 'freevideo/agent/%s/ref-%s' % (identity, job)
+                file = folder + '-0.png'
+                temporary = self.jobs.port.input_path(folder + '-0.landing-' + uuid.uuid4().hex[:8] + '.png', create=True)
+                for left in temporary.parent.glob('ref-%s-*.landing-*.png' % job):
+                    if left != temporary:
+                        left.unlink(missing_ok=True)
+                try:
+                    shutil.copyfile(self.jobs.port.input_path(row['result']['file']), temporary)
+                except Exception:  # noqa: BLE001 - the other views still land
+                    temporary.unlink(missing_ok=True)
+                    failure = failure or dict(code='invalid_media', job=job,
+                                              message='The reference picture could not be read.')
+                    continue
+                staged.append((temporary, file))
+                part = hidden['job_views'][job]
+                pictures.append(dict(media=dict(file=file), by=generating['by'], from_job=job,
+                                     generated=True, label='other' if hidden['kind'] == 'setting' else part))
+            self._settle(identity, hidden, pictures, failure, staged)
+        finally:
+            for out, _ in staged:
+                out.unlink(missing_ok=True)
 
     def _land(self, identity, generating, hidden, rows):
         from . import media
@@ -646,7 +842,8 @@ class Cast:
                 face = job == generating.get('face_job')
                 if row is None or row['status'] != 'succeeded':
                     code = (row.get('error') or {}).get('code') if row else 'not_found'
-                    failure = failure or dict(code=code or row['status'], job=job, message=(
+                    failure = failure or dict(code=code or row['status'], job=job,
+                        error_zh=errors.failure_reason((row.get('error') or dict(code=code or row['status'])) if row else dict(code=code)), message=(
                         'The generation was cancelled.' if row and row['status'] == 'cancelled'
                         else 'The reference clip did not finish.'))
                     continue
@@ -733,6 +930,8 @@ class Cast:
                         generate_error=failure, revision=card['revision'] + 1, updated_at=self._now(), by=by,
                         generated=dict(job=generating['job'], face_job=generating.get('face_job'),
                                        seed=hidden['seed'], prompt_version=PROMPT_VERSION))
+            if hidden.get('source') == 'image':
+                card['generated']['source'] = 'image'
             card.pop('_generating', None)
             self._save(record)
 
@@ -758,6 +957,61 @@ class Cast:
             self.changed.notify_all()
 
 
+def _sheet_intact(path):
+    """Whether this is a whole sheet: a file left half written or cut short is made again. A file already checked
+    and unchanged is not decoded twice."""
+    try:
+        status = path.stat()
+        key = (str(path), status.st_size, status.st_mtime_ns)
+        if key in _SHEETS_SEEN:
+            return True
+        from PIL import Image
+        with Image.open(path) as opened:
+            if opened.size != SHEET_SIZE:
+                return False
+            opened.load()
+    except Exception:
+        return False
+    if len(_SHEETS_SEEN) > 256:
+        _SHEETS_SEEN.clear()
+    _SHEETS_SEEN.add(key)
+    return True
+
+
+def compose_sheet(pictures, out):
+    """Write one PNG of these pictures (two to six, as file bytes or paths): always three columns by two rows of
+    equal cells, a light grey ground (cells with no picture stay empty), each picture scaled whole to fit its cell
+    and centred, nothing cropped, no text."""
+    import io
+    from PIL import Image, ImageOps
+    (width, height), gap = SHEET_CELL, SHEET_GAP
+    sheet = Image.new('RGB', SHEET_SIZE, SHEET_GROUND)
+    for index, source in enumerate(pictures[:SHEET_MAX]):
+        with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as opened:
+            picture = ImageOps.exif_transpose(opened)
+            if picture.mode in ('RGBA', 'LA', 'P'):
+                flat = Image.new('RGB', picture.size, SHEET_GROUND)
+                picture = picture.convert('RGBA')
+                flat.paste(picture, mask=picture.getchannel('A'))
+                picture = flat
+            picture = ImageOps.contain(picture.convert('RGB'), (width, height), Image.LANCZOS)
+        row, column = divmod(index, SHEET_COLUMNS)
+        sheet.paste(picture, (gap + column * (width + gap) + (width - picture.width) // 2,
+                              gap + row * (height + gap) + (height - picture.height) // 2))
+    sheet.save(out, format='PNG')
+
+
+def continued_pictures(cards):
+    """The pictures a shot that continues the previous one carries for these cards (the current cards, from
+    `Cast.snapshot`), at most three: a single person carries the sheet then the face close-up; two or three people
+    carry one each, the face (else the front view, the three-quarter view, the first other picture), no sheet.
+    Each is a media item."""
+    from . import drama
+    cards = list(cards)[:spec.CONTINUED_PICTURES]
+    return [media for card in cards
+            for media in drama.person_pictures(card, alone=len(cards) == 1, continues=True)][:spec.CONTINUED_PICTURES]
+
+
 def _unreadable(error):
     """A clip that is gone or cannot be decoded, rather than a fault of ours."""
     if isinstance(error, (JobError, ValueError, OSError)):
@@ -772,4 +1026,4 @@ def _unreadable(error):
 def _generation_jobs(generating):
     if not generating:
         return []
-    return [generating['job']] + ([generating['face_job']] if generating.get('face_job') else [])
+    return generating.get('jobs') or [generating['job']] + ([generating['face_job']] if generating.get('face_job') else [])

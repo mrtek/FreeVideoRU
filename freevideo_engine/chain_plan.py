@@ -11,6 +11,10 @@ from .geometry import geometry
 
 FPS, UNIT, OVERLAP = 24, 17, 22
 SINGLE_SECONDS, BLOCK_SECONDS, SHORTEST_BLOCK = 30, 15, 5
+# A part that continues another is at least this long (the first part is not held to it).
+MIN_PART_SECONDS = 10
+MIN_PART_FRAMES = geometry(seconds=MIN_PART_SECONDS)['frames']
+SHORTEST_FIRST = 2  # whole seconds: what the first part keeps when the continuing parts take the rest
 MAX_SECONDS = 7200
 MAX_BLOCKS = MAX_SECONDS // SHORTEST_BLOCK
 
@@ -72,36 +76,51 @@ def plan(seconds, single=False, max_frames=None, single_limit_seconds=None, bloc
     fits = frames <= limit
     alone = dict(seconds=seconds, frames=new, single=True, hide_frames=0,
                  blocks=[dict(seconds=seconds, frames=frames, new_frames=new)])
+    head = following if continued else first  # the longest part this video can start with
     # Under 30 s stays one generation unless a block length was asked for; 30 s is two blocks of 15 s.
-    if fits and (single or block_seconds is None and seconds < SINGLE_SECONDS
-                 or seconds <= min(block, following if continued else first)):
+    if fits and (single or block_seconds is None and seconds < SINGLE_SECONDS or seconds <= min(block, head)):
         return alone
-    first, following = min(block, following if continued else first), min(block, following)
-    if first < SHORTEST_BLOCK or following < SHORTEST_BLOCK:
+    if block < MIN_PART_SECONDS:
+        if fits and seconds < SINGLE_SECONDS:
+            return alone  # a block this short cannot continue another: a short video stays one generation
+        raise PlanError('block_too_short', 'A block that continues another is at least %d s long' % MIN_PART_SECONDS)
+    first, following = min(block, head), min(block, following)
+    shortest = MIN_PART_SECONDS if continued else SHORTEST_BLOCK
+    if first < shortest or following < MIN_PART_SECONDS:
+        if fits and seconds < SINGLE_SECONDS:
+            return alone  # a requested block length never makes a part this device cannot do
         raise PlanError('device_limit', 'This device cannot generate this length at this size')
-    total = seconds = math.floor(seconds + .5)
-    lengths = [min(first, total)]
-    while sum(lengths) < total:
-        if len(lengths) >= MAX_BLOCKS:
-            raise PlanError('too_long', 'This length needs too many blocks')
-        lengths.append(min(following, total - sum(lengths)))
-    if len(lengths) > 1 and lengths[-1] < SHORTEST_BLOCK:
-        # No short tail: the last two blocks share their length, the earlier one gets the odd second.
-        pair = lengths[-2] + lengths[-1]
-        lengths[-2:] = [pair - pair // 2, pair // 2]
-    if fits and block_seconds is not None and total < SINGLE_SECONDS and min(lengths) < SHORTEST_BLOCK:
-        return alone  # a requested block length never makes a part under 5 s
+    # Under 30 s the length stays as asked (it may be fractional); from 30 s it is whole seconds already.
+    total = seconds
+    # Every part that continues another is at least MIN_PART_SECONDS and at most `following`. The part that
+    # starts a new video is not held to it; a rest too short for the continuing parts is taken from that part.
+    rest = total if continued else total - min(first, total)
+    count = math.ceil(round(rest, 6) / following) if rest > 0 else 0
+    rest = max(rest, MIN_PART_SECONDS * count)
+    whole = math.ceil(round(rest, 6))
+    if continued and whole > math.ceil(round(total, 6)) or not continued and total - whole < SHORTEST_FIRST:
+        if fits and seconds < SINGLE_SECONDS:
+            return alone
+        raise PlanError('length_not_splittable', 'This length cannot be cut into parts of the requested length')
+    if count > MAX_BLOCKS:
+        raise PlanError('too_long', 'This length needs too many blocks')
+    lengths = [whole // count + (index < whole % count) for index in range(count)]
+    if continued:
+        lengths[0] = round(lengths[0] - (whole - total), 6)  # a fractional request keeps its length in the first part
+    else:
+        lengths.insert(0, round(total - whole, 6))
+    frames_all = int(round(FPS * total))
     blocks, shown = [], 0
     for index, length in enumerate(lengths):
-        target = FPS * sum(lengths[:index + 1])
+        target = int(round(FPS * sum(lengths[:index + 1])))
         if index == 0 and not continued:
             new = requested = _first_frames(length)
         else:
             # Each block takes the shortest step that reaches its whole second; nothing is cut in between.
             new = max(1, math.ceil((target - shown) / UNIT)) * UNIT
             requested = new + OVERLAP
-        if requested > limit or index and length > following or not index and length > first:
+        if requested > limit or length > (first if not index else following):
             raise PlanError('device_limit', 'This device cannot generate this length at this size')
         shown += new
         blocks.append(dict(seconds=length, frames=requested, new_frames=new))
-    return dict(seconds=total, frames=FPS * total, single=False, hide_frames=shown - FPS * total, blocks=blocks)
+    return dict(seconds=total, frames=frames_all, single=False, hide_frames=shown - frames_all, blocks=blocks)

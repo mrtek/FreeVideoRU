@@ -85,35 +85,42 @@ def generate(request, resident=None):
                    'torch_num_threads': torch.get_num_threads()}}}
     save(request['metrics'], metrics)
     try:
+        from .continuation import validate_hide_tail
+        hide_tail_frames = validate_hide_tail(request.get('hide_tail_frames', 0))
+        if hide_tail_frames:
+            metrics['hide_tail_frames'] = hide_tail_frames
         if 'sampling_plan' in request:
             from .two_pass import plan
             expected = plan(request['geometry'], request['sampling_plan']['requested'],
                             request['engine_options'].get('task', 't2va'),
                             base_steps=request['engine_options'].get('steps', 8),
                             refine_steps=request['sampling_plan']['refine_steps'] if request['sampling_plan']['enabled'] else 3,
-                            staged=request['sampling_plan'].get('staged', False))
+                            staged=request['sampling_plan'].get('staged', False),
+                            scale=request['sampling_plan'].get('scale', 2))
             if request['sampling_plan'] != expected:
                 raise ValueError('Sampling plan does not match the requested canvas and task')
             metrics['sampling_plan'] = expected
         continuation = request.get('continuation')
         if continuation is not None:
-            from .continuation import (validate_route, summary, ADALN_TASK, ANCHOR_ADALN_TASK, UNSUPPORTED,
+            from .continuation import (validate_route, summary, ADALN_TASK, ANCHOR_ADALN_TASK, UNSUPPORTED_DEVICE,
                                        validate_audio_context, AUDIO_CONTEXT_DEFAULT)
             # A plan that fell back to one pass on a small canvas still has
             # the two-pass flag set and keeps its continuation; an explicit
             # single-pass request does not.
             validate_route(task=request['engine_options'].get('task', 't2va'),
                            anchor=bool(continuation.get('anchor')),
+                           **(dict(sound=True, media=dict(references=[continuation['sound']]))
+                              if continuation.get('sound') else {}),
                            two_pass=bool(request.get('sampling_plan', {}).get('requested')),
                            preview=request.get('preview', False), refine_from=request.get('resume_first_pass'))
             if isinstance(getattr(torch.version, 'hip', None), str):
-                raise ValueError(UNSUPPORTED)
+                raise ValueError(UNSUPPORTED_DEVICE)
             continuation = dict(continuation,
                 audio_context=validate_audio_context(continuation.get('audio_context', AUDIO_CONTEXT_DEFAULT)))
             request['continuation'] = continuation
             request['engine_options'] = dict(request['engine_options'],
                 adaln_task=ANCHOR_ADALN_TASK if continuation.get('anchor') else ADALN_TASK)
-            metrics['continuation'] = summary(continuation)
+            metrics['continuation'] = summary(continuation, hide_tail_frames=hide_tail_frames)
             metrics['audio_context'] = continuation['audio_context']
         metrics['device_memory'] = device_memory_report(request['gpu_budget_bytes'], request.get('allocator_limit_bytes'),
             reserve_bytes=request.get('gpu_reserve_bytes', 0), capacity_trial=request.get('capacity_trial', False))
@@ -140,6 +147,20 @@ def generate(request, resident=None):
         if live_budget is not None:
             # The pass cache grows only into memory no other process holds.
             refresh_budget.device_headroom = live_budget.device_headroom
+
+            def release_idle():
+                freed = 0
+                if resident is not None:
+                    for role in tuple(resident.entries):
+                        if role != 'engine':
+                            held = torch.cuda.memory_allocated()
+                            resident.drop(role, 'Video memory budget was cut during sampling')
+                            freed += max(0, held - torch.cuda.memory_allocated())
+                return freed
+            # Read between layers: a cut inside a step is answered there, not at the next step.
+            from types import SimpleNamespace
+            refresh_budget.pressure = SimpleNamespace(local=live_budget.local_memory, release=release_idle,
+                                                      limit=lambda: live_budget.limit)
         if resident is not None:
             # Idle models stay beside sampling only where the device holds both,
             # with this request's growth reserve left over.
@@ -150,6 +171,13 @@ def generate(request, resident=None):
                 resident.gpu_budget = min(resident.gpu_budget, limit)
         save(request['metrics'], metrics)
         manifest = json.loads((Path(request['cache']) / 'manifest.json').read_text(encoding='utf-8'))
+        if continuation is not None and 'tail' in continuation:
+            # Nothing was stored for the previous video: its ending is encoded here, before any model of
+            # this run is loaded, and every later attempt reads the same record.
+            from .continuation_tail import complete
+            continuation, metrics['continuation_encode'] = complete(
+                continuation, request['geometry'], manifest, request.get('sampling_plan'), resident=resident)
+            request['continuation'] = continuation
         if manifest.get('precision') not in ('fp8', 'int8', 'bf16'):
             raise ValueError('The Engine requires an official FP8 or int8 cache')
         options, decoder = request['engine_options'], request['decoder_options']
@@ -173,7 +201,7 @@ def generate(request, resident=None):
                     metrics.setdefault('decoder_residency', dict(planned_resident_blocks=planned))
                     metrics['decoder_residency'].update(resident_blocks=fit, allocator_limit_bytes=int(limit))
         resume = request.get('resume_decode') is not None
-        if not resume and options.get('task', 't2va') != 't2va':
+        if not resume and (options.get('task', 't2va') != 't2va' or request.get('geometry', {}).get('early_reference')):
             from .media_conditioning import describe
             canvas = request.get('geometry', {})
             value = torch.load(request['conditioning'], map_location='cpu', weights_only=True)
@@ -190,9 +218,10 @@ def generate(request, resident=None):
         # A two-pass request that runs as one pass (small canvases) continues
         # too: its first and final canvases are the same one, so one tail
         # serves both stages. An explicit single-pass request keeps nothing.
+        # Whatever media conditioned the request, the sampler returns only the
+        # generated picture and sound rows, so the tail is the same.
         plan_flags = request.get('sampling_plan') or {}
         continuable = (bool(plan_flags.get('enabled') or plan_flags.get('requested'))
-                       and (options.get('task', 't2va') == 't2va' or bool(continuation and continuation.get('anchor')))
                        and not request.get('preview'))
         first_tail = continuation_data = None
         def tail_failure(error):
@@ -216,7 +245,7 @@ def generate(request, resident=None):
                 return
             try:
                 from .continuation import tail
-                first_tail = tail(video)
+                first_tail = tail(video, **({'hide_tail_frames': hide_tail_frames} if hide_tail_frames else {}))
             except Exception as error:
                 tail_failure(error)
                 first_tail = None
@@ -229,7 +258,7 @@ def generate(request, resident=None):
                 **({'continuation_tail_callback': restore_tail} if continuable else {}))
             metrics.update(sampled, phase='decode', decode_phase='latent_transfer')
             if continuation is not None:
-                metrics['continuation'] = summary(continuation)
+                metrics['continuation'] = summary(continuation, hide_tail_frames=hide_tail_frames)
             save(request['metrics'], metrics)
             print(json.dumps(dict(event='decode_resume', sampling_source_attempt=metrics['sampling_source_attempt'])), flush=True)
             fit_decoder()
@@ -239,6 +268,8 @@ def generate(request, resident=None):
             metrics['latent_reload_seconds'] = time.perf_counter() - tick
             metrics['transformer_released_before_decode'] = resident is None or not resident.engine_on_gpu()
         else:
+            from .sampling_memory import SamplingMemory as _Counters
+            load_read_start = _Counters.process_counters().get('read_bytes')
             tick = time.perf_counter()
             # Windows charges the allocator room still to be reserved to commit;
             # the engine keeps that room out of its locked weights.
@@ -251,6 +282,8 @@ def generate(request, resident=None):
                               'epoch': time.time(), 'seconds': time.perf_counter() - started}), flush=True)
             engine, reused = resident.engine(request, factory) if resident is not None else (factory(), False)
             loaded_seconds = time.perf_counter() - tick
+            load_read_end = _Counters.process_counters().get('read_bytes')
+            load_read_bytes = (load_read_end - load_read_start) if all(isinstance(v, (int, float)) for v in (load_read_start, load_read_end)) else None
             metrics.update(config=dict(engine.config), load_seconds=loaded_seconds,
                            resident_engine_cache_hit=reused,
                            load_breakdown=({'resident_lookup_seconds': loaded_seconds} if reused else engine.load_breakdown), phase='sample',
@@ -275,8 +308,16 @@ def generate(request, resident=None):
             def read_decoder_ahead():
                 # Every offloaded layer in memory and none read in the last step.
                 decode_read_ahead.start(drive_idle=getattr(engine, 'drive_idle', False) is True)
+            if hasattr(decode_read_ahead, 'due'):
+                read_decoder_ahead.due = decode_read_ahead.due
+                if not reused and isinstance(load_read_bytes, (int, float)) and loaded_seconds > 0:
+                    decode_read_ahead.load_read_rate = load_read_bytes / loaded_seconds
+                    decode_read_ahead.result['load_read_bytes_per_second'] = round(decode_read_ahead.load_read_rate)
             from .sampling_memory import SamplingMemory
             memory_diagnostics = SamplingMemory(torch, Path(request['output']).with_suffix('.sampling-memory.json')).start()
+            from . import frame_preview
+            if not request.get('capacity_trial', False):
+                frame_preview.configure(Path(request['output']).parent)
             def sample_finalize_phase(name):
                 metrics.update(phase='sample_finalize', sample_finalize_phase=name)
                 save(request['metrics'], metrics)
@@ -297,7 +338,8 @@ def generate(request, resident=None):
                     try:
                         from .continuation import tail_data
                         continuation_data = tail_data(first_tail, latents, audio, canvas,
-                            request['sampling_plan'], manifest, continuation)
+                            request['sampling_plan'], manifest, continuation,
+                            **({'hide_tail_frames': hide_tail_frames} if hide_tail_frames else {}))
                     except Exception as error:
                         tail_failure(error)
                         continuation_data = None
@@ -395,67 +437,71 @@ def generate(request, resident=None):
                             save(request['metrics'], metrics)
                             print(json.dumps(dict(event='latent_upscale', completed_steps=sampling_plan['base_steps'],
                                                   total=sampling_plan['total_steps'])), flush=True)
-                            tick = time.perf_counter()
-                            if live_budget is not None:
-                                refresh_budget('upscale')
-                            need = upscale_workspace(sampling_plan['upscale_target']) if sampling_plan['upscaler_sha256'] else 0
-                            # Its weights go straight to the GPU. Charging 2 GiB of
-                            # host RAM evicted the second pass's own engine on
-                            # tight-RAM machines, which then reloaded every block.
-                            from .two_pass import UPSCALER_HOST_BYTES
-                            if need and resident is not None and not resident.ram_fits(UPSCALER_HOST_BYTES):
-                                resident.make_room('latent_upscaler', need, ram_need=UPSCALER_HOST_BYTES)
-                            torch.cuda.empty_cache()
-                            def upscale_available():
-                                free, _ = torch.cuda.mem_get_info()
-                                budget = metrics['device_memory'].get('effective_allocator_limit_bytes') or request['gpu_budget_bytes']
-                                return min(free - request.get('gpu_reserve_bytes', 0), budget - torch.cuda.memory_allocated())
-                            available = upscale_available()
-                            # Prefer buffer reuse before discarding useful host weights.
-                            # The estimate selects this path, not permission to run.
-                            # Actual allocation remains bounded by the worker's CUDA
-                            # allocator limit. Keep the completed first-pass latents.
-                            memory_saving = available < need
-                            torch.cuda.reset_peak_memory_stats()
-                            lift_canvas = sampling_plan['upscale_target']
-                            retry_upscale = False
-                            upscale_failures = []
-                            metrics['latent_upscale'] = dict(estimated_workspace_bytes=need,
-                                available_workspace_bytes=max(0, available), attempted_below_estimate=memory_saving,
-                                buffer_reuse=memory_saving, allocation_retries=0, allocation_failures=upscale_failures)
-                            save(request['metrics'], metrics)
-                            try:
-                                kwargs = dict(memory_saving=True) if memory_saving else {}
-                                lifted_video, lifted = upscale(latents, request.get('upscaler_checkpoint'),
-                                    lift_canvas['width'], lift_canvas['height'], **kwargs)
-                            except Exception as error:
-                                from .adaptive import classify_failure
-                                if classify_failure(error)['kind'] != 'gpu_oom' or (released(engine) and memory_saving):
-                                    raise
-                                from .diagnostic_resources import error_details
-                                upscale_failures.append(error_details(error))
-                                retry_upscale = True
-                            if retry_upscale:
-                                # Leave the failed call's traceback before retrying so
-                                # its tensors no longer occupy the allocator. Do not
-                                # sample again or change the temporal normalization.
-                                if not released(engine):
-                                    if resident is not None:
-                                        resident.drop('engine', 'Latent upscale allocation needs additional workspace')
-                                    else:
-                                        engine.close()
-                                if resident is not None:
+                            from .sampling_progress import elapsed_reports
+                            with elapsed_reports(lambda event: print(json.dumps(event), flush=True),
+                                                 dict(event='latent_upscale', completed_steps=sampling_plan['base_steps'],
+                                                      total=sampling_plan['total_steps'])):
+                                tick = time.perf_counter()
+                                if live_budget is not None:
+                                    refresh_budget('upscale')
+                                need = upscale_workspace(sampling_plan['upscale_target']) if sampling_plan['upscaler_sha256'] else 0
+                                # Its weights go straight to the GPU. Charging 2 GiB of
+                                # host RAM evicted the second pass's own engine on
+                                # tight-RAM machines, which then reloaded every block.
+                                from .two_pass import UPSCALER_HOST_BYTES
+                                if need and resident is not None and not resident.ram_fits(UPSCALER_HOST_BYTES):
                                     resident.make_room('latent_upscaler', need, ram_need=UPSCALER_HOST_BYTES)
-                                import gc
-                                gc.collect()
                                 torch.cuda.empty_cache()
-                                metrics['latent_upscale'].update(buffer_reuse=True, allocation_retries=1)
+                                def upscale_available():
+                                    free, _ = torch.cuda.mem_get_info()
+                                    budget = metrics['device_memory'].get('effective_allocator_limit_bytes') or request['gpu_budget_bytes']
+                                    return min(free - request.get('gpu_reserve_bytes', 0), budget - torch.cuda.memory_allocated())
+                                available = upscale_available()
+                                # Prefer buffer reuse before discarding useful host weights.
+                                # The estimate selects this path, not permission to run.
+                                # Actual allocation remains bounded by the worker's CUDA
+                                # allocator limit. Keep the completed first-pass latents.
+                                memory_saving = available < need
+                                torch.cuda.reset_peak_memory_stats()
+                                lift_canvas = sampling_plan['upscale_target']
+                                retry_upscale = False
+                                upscale_failures = []
+                                metrics['latent_upscale'] = dict(estimated_workspace_bytes=need,
+                                    available_workspace_bytes=max(0, available), attempted_below_estimate=memory_saving,
+                                    buffer_reuse=memory_saving, allocation_retries=0, allocation_failures=upscale_failures)
                                 save(request['metrics'], metrics)
-                                lifted_video, lifted = upscale(latents, request.get('upscaler_checkpoint'),
-                                    lift_canvas['width'], lift_canvas['height'], memory_saving=True)
-                            latents = lifted_video
-                            del lifted_video
-                            latents = crop_latents(latents, sampling_plan)
+                                try:
+                                    kwargs = dict(memory_saving=True) if memory_saving else {}
+                                    lifted_video, lifted = upscale(latents, request.get('upscaler_checkpoint'),
+                                        lift_canvas['width'], lift_canvas['height'], **kwargs)
+                                except Exception as error:
+                                    from .adaptive import classify_failure
+                                    if classify_failure(error)['kind'] != 'gpu_oom' or (released(engine) and memory_saving):
+                                        raise
+                                    from .diagnostic_resources import error_details
+                                    upscale_failures.append(error_details(error))
+                                    retry_upscale = True
+                                if retry_upscale:
+                                    # Leave the failed call's traceback before retrying so
+                                    # its tensors no longer occupy the allocator. Do not
+                                    # sample again or change the temporal normalization.
+                                    if not released(engine):
+                                        if resident is not None:
+                                            resident.drop('engine', 'Latent upscale allocation needs additional workspace')
+                                        else:
+                                            engine.close()
+                                    if resident is not None:
+                                        resident.make_room('latent_upscaler', need, ram_need=UPSCALER_HOST_BYTES)
+                                    import gc
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+                                    metrics['latent_upscale'].update(buffer_reuse=True, allocation_retries=1)
+                                    save(request['metrics'], metrics)
+                                    lifted_video, lifted = upscale(latents, request.get('upscaler_checkpoint'),
+                                        lift_canvas['width'], lift_canvas['height'], memory_saving=True)
+                                latents = lifted_video
+                                del lifted_video
+                                latents = crop_latents(latents, sampling_plan)
                             lifted.update(stage_seconds=time.perf_counter() - tick,
                                 crop=dict(sampling_plan['crop']),
                                 estimated_workspace_bytes=need,
@@ -510,10 +556,29 @@ def generate(request, resident=None):
                         if continuation is not None:
                             from .continuation import load
                             final_context = load(continuation, 'final')
+                        # The first pass/upscaler can leave a lower WDDM cap
+                        # than the one that selected the refinement's heads.
+                        # Recheck before its first allocation, not after OOM.
+                        from .policy import windows_int8_refinement_heads, windows_int8_refinement_head_need
+                        guard = dict(windows=metrics['device_memory'].get('windows_allocator_limit_enforced', False)
+                                     and not request.get('capacity_trial', False),
+                                     lora=bool(manifest.get('online_lora')))
+                        head_need = windows_int8_refinement_head_need(engine.config, canvas, **guard)
+                        second_compute = None
+                        if head_need is not None:
+                            if live_budget is not None:
+                                refresh_budget('refine')
+                            limit = metrics['device_memory'].get('effective_allocator_limit_bytes')
+                            second_compute = windows_int8_refinement_heads(engine.config, canvas, limit, **guard)
+                            if second_compute:
+                                metrics['refinement_head_planning'] = dict(planned_head_chunk=4, head_chunk=2,
+                                    allocator_limit_bytes=limit, head4_need_bytes=head_need)
+                                save(request['metrics'], metrics)
                         latents, audio, second = engine.sample(request['conditioning'], restart_seed,
                             **({'continuation': final_context} if final_context is not None else {}),
                             **sampling_plan['second'], initial_latents=(latents, audio), refine_steps=sampling_plan['refine_steps'],
                             refine_schedule=sampling_plan.get('refine_schedule'),
+                            compute_options=second_compute,
                             final_step_callback=None if decoder_cached else read_decoder_ahead,
                             step_callback=memory_diagnostics.complete, sampling_complete_callback=refined_complete,
                             progress_offset=sampling_plan['base_steps'], progress_total=sampling_plan['total_steps'],
@@ -534,6 +599,7 @@ def generate(request, resident=None):
                         gpu_reserve_bytes=request.get('gpu_reserve_bytes', 0),
                         budget_refresh=refresh_budget if live_budget is not None else None)
             finally:
+                frame_preview.clear()
                 metrics['sampling_memory'] = memory_diagnostics.close()
             metrics.update(sampled)
             metrics.pop('sample_metrics_scope', None)
@@ -589,6 +655,7 @@ def generate(request, resident=None):
                 # Older retained sampling tails predate the predecessor binding.
                 continuation_data['metadata']['source_id'] = continuation['source_id']
         metrics.update(decode_to_file(latents, audio, request['output'], base=base, artifacts_dir=artifacts,
+                                     **({'hide_tail_frames': hide_tail_frames} if hide_tail_frames else {}),
                                      **({'continuation': continuation} if continuation is not None else {}),
                                      **({'audio_lead_in_callback': keep_audio_lead_in}
                                         if continuation is not None and continuation_data is not None else {}),
@@ -607,6 +674,16 @@ def generate(request, resident=None):
                             'OutOfMemoryError', 'CancelledError', 'InterruptProcessingException'):
                         raise
                     metrics['first_frame_kept'] = dict(saved=False, error=type(error).__name__)
+                try:
+                    from .continuation import chain_first_sound
+                    sound = chain_first_sound(continuation, continuation.get('source_video'))
+                    if sound is not None:
+                        continuation_data['metadata']['first_sound'] = sound
+                except Exception as error:
+                    if isinstance(error, MemoryError) or type(error).__name__ in (
+                            'OutOfMemoryError', 'CancelledError', 'InterruptProcessingException'):
+                        raise
+                    metrics['first_sound_kept'] = dict(saved=False, error=type(error).__name__)
             try:
                 from .continuation_store import save as save_continuation
                 metrics['continuation_store'] = dict(save_continuation(request['output'], continuation_data), saved=True)

@@ -77,10 +77,12 @@ def create_ui(session, *, show=True):
 
     class Bridge(QObject):
         changed = Signal()
+        downloadsChanged = Signal()
         def __init__(self):
             super().__init__(engine)
             self.alerted = None
             self.value = session.snapshot()
+            self.download_value = session.downloads_view()
             self.timer = QTimer(self)
             self.timer.setInterval(250)
             self.timer.timeout.connect(self.refresh)
@@ -89,6 +91,10 @@ def create_ui(session, *, show=True):
         @Property('QVariantMap', notify=changed)
         def state(self):
             return self.value
+
+        @Property('QVariantMap', notify=downloadsChanged)
+        def downloadList(self):
+            return self.download_value
 
         def invoke(self, function, *args, **kwargs):
             try:
@@ -105,6 +111,10 @@ def create_ui(session, *, show=True):
                 if value != self.value:
                     self.value = value
                     self.changed.emit()
+                downloads = session.downloads_view()
+                if downloads is not self.download_value:
+                    self.download_value = downloads
+                    self.downloadsChanged.emit()
                 update = value.get('update') or {}
                 if update.get('remind') and update.get('key') != self.alerted and engine.rootObjects():
                     # Flash the taskbar button once per new reminder when the
@@ -124,10 +134,12 @@ def create_ui(session, *, show=True):
                     # The card says what to do; the details keep the cause.
                     from .failure_details import launcher_failure
                     zh = session.language.startswith('zh')
-                    self.value = dict(self.value, error=session.error, failure=launcher_failure(session.error, zh=zh))
+                    value = dict(self.value, error=session.error, failure=launcher_failure(session.error, zh=zh))
                 else:
-                    self.value = dict(self.value, error=session.error)
-                self.changed.emit()
+                    value = dict(self.value, error=session.error)
+                if value != self.value:
+                    self.value = value
+                    self.changed.emit()
 
         @Slot(str, 'QVariant')
         def edit(self, key, value):
@@ -149,6 +161,18 @@ def create_ui(session, *, show=True):
         def upgradeModel(self):
             self.invoke(session.upgrade_model)
 
+        @Slot(str)
+        def imagePackAction(self, action):
+            self.invoke(session.image_pack_action, action)
+
+        @Slot(str)
+        def promptModelAction(self, action):
+            self.invoke(session.prompt_model_action, action)
+
+        @Slot()
+        def dismissPromptHint(self):
+            self.invoke(session.dismiss_prompt_hint)
+
         @Slot()
         def cancelModelUpgrade(self):
             self.invoke(session.cancel_model_upgrade)
@@ -159,12 +183,34 @@ def create_ui(session, *, show=True):
 
         @Slot(str)
         def browse(self, key):
-            if session.controller.busy:
+            if not session.can_manage():
+                self.invoke(session.explain_busy)
                 return
             path = QFileDialog.getExistingDirectory(None, session.t('Choose folder', '选择文件夹', 'Выберите папку'),
                 str(session.form.get(key) or ''), QFileDialog.ShowDirsOnly)
             if path:
                 self.invoke(session.add_folder, path) if key == 'model_dirs' else self.invoke(session.edit, key, path)
+
+        @Slot()
+        def prepareDownloadList(self):
+            self.invoke(session.prepare_download_list)
+
+        @Slot()
+        def exportDownloadList(self):
+            if session.controller.busy:
+                return
+            path = QFileDialog.getExistingDirectory(None, session.downloads_view()['copy']['export'], '', QFileDialog.ShowDirsOnly)
+            if path:
+                self.invoke(session.export_downloads, path)
+
+        @Slot()
+        def useDownloadedFolder(self):
+            if not session.can_manage():
+                self.invoke(session.explain_busy)
+                return
+            path = QFileDialog.getExistingDirectory(None, session.downloads_view()['copy']['use_folder'], '', QFileDialog.ShowDirsOnly)
+            if path:
+                self.invoke(session.use_downloaded_folder, path)
 
         @Slot()
         def browsePackages(self):
@@ -206,6 +252,14 @@ def create_ui(session, *, show=True):
             self.invoke(session.remove_folder, index)
 
         @Slot(str)
+        def setLanPassword(self, value):
+            self.invoke(session.change_lan_password, value)
+
+        @Slot()
+        def removeLanPassword(self):
+            self.invoke(session.change_lan_password, None)
+
+        @Slot(str)
         def copy(self, value):
             app.clipboard().setText(value)
 
@@ -236,6 +290,27 @@ def create_ui(session, *, show=True):
                 self.invoke(open_text, value, **(dict(engine=engine) if engine else {}))
             else:
                 self.invoke(open_browser, value)
+
+        @Slot(str, str)
+        def reportProblem(self, error, title):
+            from . import __version__
+            from .launcher_issue import issue_url
+            from .windows_ux import open_browser
+            url = issue_url(error, session.installed_product_version() or __version__, title,
+                            zh=session.language.startswith('zh'))
+            self.invoke(open_browser, url)
+
+        @Slot()
+        def openDownloadFolder(self):
+            from PySide6.QtGui import QDesktopServices
+            folder = session.download_export
+            if folder and Path(folder).is_dir():
+                if session.action_notice == 'download_missing':
+                    session.action_notice = ''
+                self.invoke(QDesktopServices.openUrl, QUrl.fromLocalFile(str(Path(folder).resolve())))
+            else:
+                session.action_notice = 'download_missing'
+                self.refresh()
 
         @Slot(str)
         def selectSource(self, value):
@@ -292,17 +367,11 @@ def create_ui(session, *, show=True):
             self.timer.stop()
             session.close()
 
-    from .model_guidance import links, cloud_models
-    from .launcher_copy import display
+    from .model_guidance import cloud_models
     engine = QQmlApplicationEngine()
     bridge = Bridge()
     engine.rootContext().setContextProperty('backend', bridge)
     engine.rootContext().setContextProperty('initialState', bridge.value)
-    # Nested Python tuples remain opaque objects in QML. Named maps become
-    # QVariantMaps, so both the displayed label and clicked URL are available.
-    engine.rootContext().setContextProperty('modelLinks', {
-        component: [dict(label=label, label_zh=display(label, True), url=url) for label, url in rows]
-        for component, rows in links().items()})
     engine.rootContext().setContextProperty('cloudLinks', cloud_models())
     engine.rootContext().setContextProperty('theme', theme())
     engine.load(QUrl.fromLocalFile(str(Path(__file__).parent / 'launcher/Main.qml')))
@@ -331,6 +400,11 @@ def create_ui(session, *, show=True):
     return app, engine, window, bridge
 
 
+def save_screenshot(window, bridge, path):
+    if not bridge.value.get('access_links'):
+        window.grabWindow().save(str(path))
+
+
 def smoke_test(app, engine, window, bridge, destination):
     """Exercise the packaged QML, manifests and managed-Python entry point."""
     import queue
@@ -355,7 +429,7 @@ def smoke_test(app, engine, window, bridge, destination):
                 raise RuntimeError('Packaged launcher action is not visible: ' + page)
             if page == 'progress':
                 # The last setup step shows the finished ones with a check mark; keep it for the font check.
-                window.grabWindow().save(str(destination / 'launcher-steps.png'))
+                save_screenshot(window, bridge, destination / 'launcher-steps.png')
         window.setProperty('settingsOpen', True)
         app.processEvents()
         window.setProperty('settingsOpen', False)
@@ -401,7 +475,7 @@ def smoke_test(app, engine, window, bridge, destination):
         save(destination / 'smoke.json', dict(success=bool(result and result['status'] == 'complete' and not imported),
             task=result, interface='Qt Quick launcher', build=build, source=str(session.source),
             payload=payload, model_modules_imported=imported))
-        window.grabWindow().save(str(destination / 'launcher.png'))
+        save_screenshot(window, bridge, destination / 'launcher.png')
         if runner.busy:
             runner.cancel()
         timer.stop()
@@ -440,7 +514,7 @@ def smoke_connect(app, engine, window, bridge, destination, values):
             info = server_info(state['url'].split('/?')[0]) if status == 'open' else {}
             save(destination / 'connect.json', dict(success=status == 'open' and info.get('status') == 'freevideo',
                                                     status=status, error=state.get('error'), url=state.get('url'), server=info))
-            window.grabWindow().save(str(destination / 'connected.png'))
+            save_screenshot(window, bridge, destination / 'connected.png')
             timer.stop()
             app.quit()
     timer.timeout.connect(step)

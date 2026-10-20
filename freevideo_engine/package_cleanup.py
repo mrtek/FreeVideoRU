@@ -226,8 +226,36 @@ def packages(folder):
             yield Path(plain(pack)), 'models', value if isinstance(value, dict) else None
 
 
+def known_package_tree(pack, value):
+    """Retain unrecognized packages and anything added outside their inventory."""
+    from .offline_packages import inventory, VERIFIED
+    if (not isinstance(value, dict) or value.get('schema_version') != 1 or value.get('kind') != 'models'
+            or not isinstance(value.get('files'), list) or not value['files']):
+        return False
+    try:
+        inventory(value['files'])
+        if any(not row['path'].startswith('models/') for row in value['files']):
+            return False
+        files = {INNER + '/' + row['path'] for row in value['files']}
+        files.update(INNER + '/' + name for name in (MODELS_MARKER, VERIFIED, '模型包使用说明.txt'))
+        folders = {parent.as_posix() for name in files for parent in Path(name).parents}
+        pack = io_path(pack)
+        def unreadable(error):
+            raise error
+        for directory, children, names in os.walk(pack, followlinks=False, onerror=unreadable):
+            directory = Path(directory)
+            if any((directory / name).relative_to(pack).as_posix() not in folders for name in children):
+                return False
+            if any((directory / name).relative_to(pack).as_posix() not in files for name in names):
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def prune_packages(engine, comfy_root=None, index=None, running=None, dry_run=False):
     """Model package extractions the installation no longer needs."""
+    from .locking import runtime_lock
     result = dict(released_bytes=0, removed=[], kept=[])
     try:
         engine = checked_real_path(engine)
@@ -241,32 +269,39 @@ def prune_packages(engine, comfy_root=None, index=None, running=None, dry_run=Fa
     installed = installed_at(engine)
     holders = [io_path(checked_real_path(path)) for paths in index.values() for path in paths]
     for folder in package_roots(engine, comfy_root):
-        for pack, kind, value in packages(folder):
-            pack = io_path(pack)
-            if kind == 'runtime' or inside(engine, pack):
-                result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='environment package'))
-                continue
-            if any(inside(path, pack) for path in holders):
-                result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='installed files live here'))
-                continue
-            rows = [row for row in (value or {}).get('files', [])
-                    if isinstance(row, dict) and row.get('path') != PACK_INVENTORY
-                    and (pack / INNER / str(row.get('path', ''))).is_file()]
-            covered = bool(rows) and all(row.get('sha256') in index for row in rows)
-            try:
-                stale = installed is not None and max((pack / INNER).stat().st_mtime, pack.stat().st_mtime) < installed
-            except OSError:
-                stale = installed is not None
-            if not covered and not stale:
-                result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='imported after this installation'))
-                continue
-            freed = discard(pack, folder, running, dry_run)
-            if freed is None:
-                result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='in use'))
-                continue
-            result['released_bytes'] += freed
-            result['removed'].append(dict(kind='offline-package', path=plain(pack), bytes=freed,
-                                          reason='installed and verified' if covered else 'not used by this installation'))
+        try:
+            with runtime_lock(io_path(folder) / 'import.lock', inherit=False):
+                for pack, kind, value in packages(folder):
+                    pack = io_path(pack)
+                    if kind == 'runtime' or inside(engine, pack):
+                        result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='environment package'))
+                        continue
+                    if any(inside(path, pack) for path in holders):
+                        result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='installed files live here'))
+                        continue
+                    if not known_package_tree(pack, value):
+                        result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='in use'))
+                        continue
+                    rows = [row for row in (value or {}).get('files', [])
+                            if isinstance(row, dict) and row.get('path') != PACK_INVENTORY
+                            and (pack / INNER / str(row.get('path', ''))).is_file()]
+                    covered = bool(rows) and all(row.get('sha256') in index for row in rows)
+                    try:
+                        stale = installed is not None and max((pack / INNER).stat().st_mtime, pack.stat().st_mtime) < installed
+                    except OSError:
+                        stale = installed is not None
+                    if not covered and not stale:
+                        result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='imported after this installation'))
+                        continue
+                    freed = discard(pack, folder, running, dry_run)
+                    if freed is None:
+                        result['kept'].append(dict(kind='offline-package', path=plain(pack), reason='in use'))
+                        continue
+                    result['released_bytes'] += freed
+                    result['removed'].append(dict(kind='offline-package', path=plain(pack), bytes=freed,
+                                                  reason='installed and verified' if covered else 'not used by this installation'))
+        except BlockingIOError:
+            result['kept'].append(dict(kind='offline-package', path=plain(folder), reason='in use'))
     return result
 
 
@@ -364,21 +399,23 @@ def run(engine, comfy_root=None, running=None, dry_run=False):
     return result
 
 
-OPTIONAL_PREFIX = 'models/base/sampling-cache/'
-
-
 def archive_unchanged(record):
     try:
-        info = os.stat(io_path(checked_real_path(record['path'])))
-    except (OSError, KeyError, TypeError):
+        path = checked_real_path(record['path'])
+        if not path.is_absolute() or path.suffix.lower() != '.zip' or not local_path(Path(path.anchor), path):
+            return False
+        info = os.lstat(io_path(path))
+    except (OSError, KeyError, TypeError, ValueError):
         return False
-    return stat.S_ISREG(info.st_mode) and info.st_size == record.get('bytes') and info.st_mtime_ns == record.get('mtime_ns')
+    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            and info.st_size == record.get('bytes') and info.st_mtime_ns == record.get('mtime_ns'))
 
 
 def archive_rows(record):
     """The files a recorded ZIP provides: from its extraction, or else from the ZIP's own record."""
     try:
-        value = load(io_path(checked_real_path(record['root'])) / MODELS_MARKER)
+        value = load(io_path(checked_real_path(record['root']))
+                     / (RUNTIME_MARKER if record.get('kind') == 'runtime' else MODELS_MARKER))
     except AliasUnavailable:
         return None
     if not isinstance(value, dict):
@@ -399,44 +436,101 @@ def archives(records, engine, index=None):
     index = verified_files(engine) if index is None else index
     runtime = runtime_root(engine)
     runtime = io_path(runtime) if runtime is not None else None
-    paths, total = [], 0
+    paths, files, total = [], [], 0
     for record in records:
         try:
             checked_real_path(record['root'])
         except AliasUnavailable:
             continue
-        if not archive_unchanged(record):
-            continue
-        if record.get('kind') == 'runtime':
-            # The environment package was unpacked into this very installation.
-            held = runtime is not None and resolved(checked_real_path(record['root'])) == resolved(runtime)
-        else:
-            rows = archive_rows(record)
-
-            def installed(row):
-                if row.get('sha256') in index:
-                    return True
-                # Optional sampling tables an offline installation placed itself: present at full size.
-                placed = runtime / str(row.get('path', '')) if runtime is not None else None
-                return (placed is not None and str(row.get('path', '')).startswith(OPTIONAL_PREFIX)
-                        and placed.is_file() and placed.stat().st_size == row.get('bytes'))
-            held = bool(rows) and all(installed(row) for row in rows)
-        if held:
-            paths.append(plain(checked_real_path(record['path'])))
-            total += record['bytes']
-    return dict(bytes=total, paths=paths)
-
-
-def delete_archives(records, engine):
-    """Delete the user's imported ZIPs this installation holds; returns (bytes freed, paths removed)."""
-    offer = archives(records, engine)
-    freed, removed = 0, []
-    for path in offer['paths']:
         try:
-            info = os.lstat(io_path(path))
-            os.unlink(io_path(path))
-        except OSError:
-            continue  # In use or read-only: kept, offered again next time.
-        removed.append(path)
-        freed += info.st_size if info.st_nlink == 1 else 0
-    return freed, removed
+            named = plain(checked_real_path(record['path']))
+        except (OSError, KeyError, TypeError, ValueError):
+            continue
+        # One ZIP is one offer, whichever spelling its records carry.
+        if record.get('kind') not in ('runtime', 'models') or named in paths or not archive_unchanged(record):
+            continue
+        rows = archive_rows(record)
+        held = bool(rows) and all(row.get('sha256') in index for row in rows)
+        if record.get('kind') == 'runtime':
+            # Root identity alone is insufficient: the current environment must
+            # still hold every imported file with its verified hash and stamp.
+            try:
+                held = held and runtime is not None and resolved(checked_real_path(record['root'])) == resolved(runtime)
+            except AliasUnavailable:
+                continue
+        if held:
+            try:
+                real = checked_real_path(record['path'])
+                info = os.lstat(io_path(real))
+            except OSError:
+                continue
+            if not archive_unchanged(record):
+                continue
+            paths.append(plain(real))
+            total += record['bytes']
+            files.append(dict(path=plain(real), bytes=record['bytes'], mtime_ns=record['mtime_ns'],
+                              inode=info.st_ino, device=info.st_dev))
+    return dict(bytes=total, paths=paths, files=files)
+
+
+def failure_reason(error):
+    """A failure code the launcher words for the user; the raw error stays in detail."""
+    if isinstance(error, ValueError):
+        return 'changed'
+    if isinstance(error, BlockingIOError):
+        return 'busy'  # Setup or a video holds the installation's lease.
+    if isinstance(error, PermissionError):
+        return 'in-use'  # Windows reports a file open elsewhere as access denied.
+    return 'failed'
+
+
+def delete_archives(records, engine, *, offered=None):
+    """Revalidate imported ZIPs, then delete; return (freed bytes, removed paths, failures).
+
+    Each failure is dict(path, reason, detail): reason is 'changed', 'busy',
+    'in-use' or 'failed' (failure_reason). A ZIP already gone counts as removed.
+    """
+    from .locking import runtime_lock
+    engine = io_path(checked_real_path(engine))
+    offer = archives(records, engine) if offered is None else offered
+    freed, removed, failed = 0, [], []
+    by_path = {}
+    for item in records:
+        try:
+            by_path[plain(checked_real_path(item['path']))] = item
+        except (AliasUnavailable, KeyError, TypeError):
+            continue
+    try:
+        # Exclude setup/generation from other launchers as well as this UI.
+        with runtime_lock(engine / 'setup.lock', inherit=False), \
+                runtime_lock(engine / 'engine.lock', inherit=False), \
+                runtime_lock(engine / 'launcher' / 'host-setup.lock', inherit=False):
+            current = set(archives(records, engine)['paths'])
+            for row in offer['files']:
+                path = row['path']
+                try:
+                    if not os.path.lexists(io_path(path)):
+                        removed.append(path)  # Deleted elsewhere meanwhile: nothing left to free.
+                        continue
+                    record = by_path.get(path)
+                    if path not in current or not record or not archive_unchanged(record):
+                        # A ZIP another program holds open cannot be read to verify it:
+                        # that is "in use", not "changed".
+                        with open(io_path(path), 'rb'):
+                            pass
+                        raise ValueError('File or installed contents changed; kept for safety.')
+                    info = os.lstat(io_path(path))
+                    if (info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev) != (
+                            row['bytes'], row['mtime_ns'], row['inode'], row['device']):
+                        raise ValueError('File changed since the confirmation; kept for safety.')
+                    os.unlink(io_path(path))
+                except (OSError, ValueError) as error:
+                    failed.append(dict(path=path, reason=failure_reason(error), detail=str(error)))
+                    continue
+                removed.append(path)
+                # A name that was linked after the check frees nothing.
+                freed += info.st_size if info.st_nlink == 1 else 0
+    except (OSError, ValueError) as error:
+        failed.extend(dict(path=row['path'], reason=failure_reason(error), detail=str(error)) for row in offer['files']
+                      if row['path'] not in removed and row['path'] not in {r['path'] for r in failed})
+    return freed, removed, failed

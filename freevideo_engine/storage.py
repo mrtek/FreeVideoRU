@@ -83,7 +83,7 @@ def record_download(root, path, row, *, origin='download'):
     save(ledger, {'root': plain(resolved(root)), 'files': files})
 
 
-def compact_sources(plan, rows, report):
+def compact_sources(plan, rows, report, progress=None):
     """Caller must first verify the complete FP8 cache and pass GPU setup probes.
 
     Deletion uses an allowlist of pinned conversion-only filenames and a matching
@@ -138,9 +138,11 @@ def compact_sources(plan, rows, report):
             # Destructive cleanup cannot trust a metadata cache hit. Equal-size
             # edits may share a filesystem timestamp tick with the receipt.
             if row.get('sha256'):
-                matches = hash_file(path, discard_cache=True) == row['sha256']
+                matches = hash_file(path, discard_cache=True, progress=(
+                    lambda done, total: progress(path, done, total)) if progress else None) == row['sha256']
             elif row.get('git_blob'):
-                matches = hash_file(path, 'sha1', git_blob=True, discard_cache=True) == row['git_blob']
+                matches = hash_file(path, 'sha1', git_blob=True, discard_cache=True, progress=(
+                    lambda done, total: progress(path, done, total)) if progress else None) == row['git_blob']
             else:
                 raise OSError('No pinned content hash; source retained')
             if not matches:

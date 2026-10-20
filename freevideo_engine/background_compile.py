@@ -3,7 +3,8 @@
 The first request after an update, a repair, a new installation or a GPU
 driver update compiles its kernels; on a 12 GB Windows laptop that cost 50 s of
 a 564 s request. Nobody waits for this compile here. Once ComfyUI has had no
-work for START_DELAY seconds, precompile runs at the lowest CPU and disk
+work for START_DELAY seconds (OWED_DELAY when no compile is on record for this
+installation), precompile runs at the lowest CPU and disk
 priority. A queued prompt stops it within POLL seconds, and a generation, a
 prompt rewrite or a calibration stops it before taking the GPU. Kernels
 compiled by then stay in the caches, and the request compiles the rest as it
@@ -25,6 +26,9 @@ from . import processes
 from .long_paths import io_path
 
 START_DELAY = 30.
+# A compile that is owed (nothing compiled yet for this code, driver or GPU)
+# starts this soon after ComfyUI loads, before the user's first request.
+OWED_DELAY = 5.
 MAX_DELAY = 600.
 POLL = .25
 # Longer than the Linux supervisor takes to end every descendant (4.5 s):
@@ -35,6 +39,27 @@ STOP_GRACE = 6.
 # outlive the top process by seconds.
 RELEASE_SECONDS = 15.
 ATTEMPTS = 8
+
+
+def compile_owed(root):
+    """True when no finished compile on record matches this installation's code.
+
+    Reads only the receipt and the compute sources, without tensors or a GPU
+    query; the compile itself decides again with the full identity, so a wrong
+    "owed" costs one early start that ends at once with the receipt's skip.
+    """
+    import json
+    try:
+        previous = json.loads((Path(root) / 'precompile.json').read_text(encoding='utf-8'))
+        identity = previous['identity']
+        if not previous.get('success') or not identity:
+            return True
+        from .tuning import COMPUTE_FILES, digest
+        package = Path(__file__).parent
+        return (identity.get('source_sha256') != {name: digest(package / name) for name in COMPUTE_FILES}
+                or identity.get('dependency_manifest_sha256') != digest(package / 'dependencies.json'))
+    except Exception:
+        return True
 
 
 class BackgroundCompile:
@@ -112,9 +137,12 @@ class BackgroundCompile:
         return True
 
     def _work(self, command, environment, cwd, log, busy, delay):
+        # The first wait may be shorter than the retry backoff, which always
+        # starts from START_DELAY: a stopped or crowded-out run is not hammered.
+        pause = START_DELAY
         for attempt in range(ATTEMPTS):
             if attempt:
-                delay = min(2 * delay, MAX_DELAY)
+                pause = delay = min(2 * pause, MAX_DELAY)
             if not self._quiet(busy, delay):
                 return
             with self.guard:
@@ -125,6 +153,8 @@ class BackgroundCompile:
                 row = dict(started=time.time())
                 self.attempts.append(row)
                 with io_path(log).open('ab') as stream:
+                    from .triton_compat import temporary_environment
+                    environment = temporary_environment(environment.get('FREEVIDEO_HOME') or self.lock.parent, environment)
                     process = self.process = processes.popen(
                         command, env=environment, cwd=cwd, stdin=subprocess.DEVNULL, stdout=stream,
                         stderr=subprocess.STDOUT, start_new_session=True, supervise=True)

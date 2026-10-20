@@ -123,6 +123,8 @@ def register():
     root = Path(folder_paths.__file__).resolve().parent
     info = dict(protocol=1, source=str(source), engine_root=str(installation_root(source)),
                 comfy_root=str(root), data_root=str(Path(folder_paths.base_path).resolve()))
+    from comfy.cli_args import args
+    info['listen'] = args.listen
     from .comfy_console import install
     try:
         info['console_log'] = str(install(info['engine_root']))
@@ -137,6 +139,13 @@ def register():
     @server.routes.get('/freevideo/launcher/workflow')
     async def workflow(request):
         value = json.loads((source / 'example_workflows' / 'FreeVideo-All-in-One.json').read_text(encoding='utf-8'))
+        # The tab restored from an older version is replaced when this stamp differs.
+        from .release_notes import installed_details
+        version = installed_details(Path(__file__).parent).get('version')
+        if isinstance(version, str) and version:
+            for node in value['nodes']:
+                if node.get('type') == 'FreeVideoGenerate':
+                    node.setdefault('properties', {})['freevideo_version'] = version
         return web.json_response(value)
 
     # web/health.js posts what it found; the launcher shows a failure to the

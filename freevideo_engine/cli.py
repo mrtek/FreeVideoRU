@@ -97,6 +97,10 @@ def main():
                           help='With --continue-from: also give the model the first frame of the whole film as a '
                                'reference picture. Reduces drift over many parts; holds framing and motion close to '
                                'the opening, so leave it off when later parts should move away from it')
+    generate.add_argument('--hide-tail', action='store_true',
+                          help='Generate and discard 17 extra frames for dialogue segments.')
+    generate.add_argument('--voice-reference', action='store_true',
+                          help='With --continue-from: use the opening six seconds as a voice reference when the prompt has dialogue')
     generate.add_argument('--continue-anchor', type=Path, metavar='IMAGE',
                           help='Experimental: a reference picture of your own for a continuation, with no prompt note')
     generate.add_argument('--allocator-limit-gib', type=float,
@@ -109,10 +113,15 @@ def main():
     generate.add_argument('--seed', type=int, default=2026090901)
     generate.add_argument('--two-pass', action=argparse.BooleanOptionalAction, default=True,
                           help='Sample a smaller canvas, upscale latents and refine (default: on; 8 + 3 steps)')
+    generate.add_argument('--step-cache', choices=('easycache-av', 'fbcache'),
+                          help='Approximate reuse between sampling steps (disabled by default)')
     generate.add_argument('--base-steps', type=int, choices=range(1, 33), metavar='1..32',
                           help='First-pass steps (default: 8, or explicit profile). Changes may reduce quality.')
     generate.add_argument('--refine-steps', type=int, choices=range(1, 32), default=3, metavar='1..31',
                           help='Second-pass steps (default: 3, independent schedule). Other counts use the original tail.')
+    generate.add_argument('--upscale-factor', type=float, choices=(2., 1.5, 1.2), default=2., metavar='{2,1.5,1.2}',
+                          help='Two-pass learned upscale factor (default 2: half-size first pass). 1.5 and 1.2 sample '
+                               'a larger first pass (44%% / 69%% of the pixels) for the same output size.')
     upscale = generate.add_mutually_exclusive_group()
     upscale.add_argument('--preview', action='store_true',
                          help='Two-pass only: stop after the half-resolution first pass, save it as a quick preview, '

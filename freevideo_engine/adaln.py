@@ -4,12 +4,45 @@ The optimization is inspired by NVIDIA's Sol-H3 AdaLN precompute: timesteps are
 known before sampling, so retain the small modulation outputs instead of 26 GB
 of immutable projection weights. FL2VA has a separate keyframe timestep schedule.
 """
+import contextlib
 import hashlib
 import json
 from pathlib import Path
 
 from safetensors.torch import load_file, save_file
 import torch
+
+
+@contextlib.contextmanager
+def serial_ops():
+    """Run the small CPU tensor work of a table on this thread alone.
+
+    A table is a few hundred kilobytes. Spread over the full intra-op pool each
+    operation waits for its workers, and on a machine whose cores are busy that
+    wait is hundreds of times the work (about 0.3 s per block for a cat that
+    takes 0.2 ms alone). The thread count is a setting of the whole process, so
+    it is restored on exit and other threads running torch ops meanwhile see 1.
+    """
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+def all_finite(tensor):
+    """Whether every element is finite; reads half-precision bits instead of calling isfinite.
+
+    A bfloat16 or float16 table is finite exactly when its exponent field is not
+    all ones, so one integer mask answers the question about ten times faster on
+    the CPU than isfinite() on those dtypes.
+    """
+    mask = {torch.bfloat16: 0x7F80, torch.float16: 0x7C00}.get(tensor.dtype)
+    if mask is None:
+        return bool(torch.isfinite(tensor).all())
+    bits = tensor.reshape(-1).view(torch.int16)
+    return not bool((bits & mask).eq(mask).any())
 
 
 class ScheduleCursor:
@@ -36,8 +69,9 @@ class CachedModulation(torch.nn.Module):
         super().__init__()
         self.cursor = cursor
         self.steps = len(values)
-        for index, values_at_step in enumerate(values):
-            self.register_buffer(f'step_{index}', torch.cat(values_at_step, dim=-1))
+        with serial_ops():
+            for index, values_at_step in enumerate(values):
+                self.register_buffer(f'step_{index}', torch.cat(values_at_step, dim=-1))
         # Steps differ in how many distinct timesteps they carry: the first H3
         # step has video and audio at the same t, so its rows are fewer. The
         # fused pre/post kernels compile for static shapes and recompiled in the
@@ -174,7 +208,9 @@ class TableCache:
         # These are small immutable constants; their producer's GPU/runtime is
         # deliberately irrelevant. Validate before transferring to this device.
         state = load_file(path, device=self.device)
-        if any(not bool(torch.isfinite(tensor).all()) for tensor in state.values()):
+        with serial_ops():
+            finite = all(all_finite(tensor) for tensor in state.values())
+        if not finite:
             raise ValueError('Nonfinite AdaLN model asset')
         return [state[f'step_{i}'].chunk(6, dim=-1) for i in range(steps)]
 
@@ -199,7 +235,7 @@ class TableCache:
         path = self.root / f'{index:02d}.safetensors'
         temporary = path.with_suffix('.partial')
         state = {name: tensor.cpu() for name, tensor in module.state_dict().items()}
-        if any(not bool(torch.isfinite(tensor).all()) for tensor in state.values()):
+        if any(not all_finite(tensor) for tensor in state.values()):
             raise ValueError('Cannot save nonfinite AdaLN constants')
         save_file(state, temporary)
         row = {'bytes': temporary.stat().st_size, 'sha256': assets.file_hash(temporary)}

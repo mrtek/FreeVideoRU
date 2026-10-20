@@ -217,10 +217,11 @@ class Service:
                                pass_fds=() if descriptor is None else (descriptor,),
                                supervise=True, start_new_session=True)
 
-    def info(self):
+    def info(self, wait=True):
+        """wait=False answers from the cheap check, for callers on an event loop or UI thread."""
         root, machine = self.installation()
         spec = assets.catalog()
-        return dict(ready=assets.ready(root), model=spec['repo'], license=spec['license'],
+        return dict(ready=assets.settle(root) if wait else assets.ready(root), model=spec['repo'], license=spec['license'],
                     bytes=sum(row['bytes'] for row in spec['files']), busy=self.busy(),
                     ram_bytes=self.ram_bytes(machine))
 
@@ -228,11 +229,12 @@ class Service:
         """Available RAM the model usually needs on this computer, for the download card.
 
         The worker decides from free VRAM when it loads: 8 GB and larger NVIDIA
-        cards hold the whole model. Asks the driver once, without CUDA; anything
+        cards keep their layers on the GPU; 6 GB cards stream from RAM the layers
+        that do not fit, which needs more of it. Asks the driver once, without CUDA; anything
         unknown states the larger figure.
         """
         if self.ram is None:
-            from .worker import MAPPED_RAM, RESIDENT_RAM
+            from .worker import MAPPED_RAM, RESIDENT_RAM, STREAMED_RAM
             self.ram = MAPPED_RAM
             if machine.get('device_backend', 'cuda') == 'cuda':
                 from .. import processes
@@ -245,6 +247,8 @@ class Service:
                     total = totals.get(machine.get('gpu_uuid')) or (len(totals) == 1 and next(iter(totals.values())))
                     if total and total >= 7.5 * 1024:
                         self.ram = RESIDENT_RAM
+                    elif total and total >= 5.5 * 1024:
+                        self.ram = STREAMED_RAM
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                     pass
         return self.ram
@@ -262,7 +266,7 @@ class Service:
 
     def start(self, action, value):
         received_epoch = time.time()
-        if action not in ('install', 'rewrite', 'ask'):
+        if action not in ('install', 'rewrite', 'ask', 'split'):
             raise ValueError('invalid_request')
         if self.busy():
             raise ValueError('busy')
@@ -271,11 +275,15 @@ class Service:
             if value.get('accept_download') is not True:
                 raise ValueError('consent_required')
         elif action == 'ask':
-            if not assets.ready(root):
+            if not assets.settle(root):
                 raise ValueError('model_missing')
             value = self.ask_images(rules.ask_request(value))
+        elif action == 'split':
+            if not assets.settle(root):
+                raise ValueError('model_missing')
+            value = rules.split_request(value)
         else:
-            if not assets.ready(root):
+            if not assets.settle(root):
                 raise ValueError('model_missing')
             value = rules.request(value)
             from ..comfy_assets import resolve_assets
@@ -290,7 +298,7 @@ class Service:
         with self.mutex:
             if self.busy():
                 raise ValueError('busy')
-            if action in ('rewrite', 'ask'):
+            if action != 'install':
                 self.prestart_ticket += 1  # Invalidate pending imports before the worker starts.
             self.key = secrets.token_urlsafe(24)
             self.stop.clear()
@@ -326,6 +334,7 @@ class Service:
             if self.result_expires and time.monotonic() > self.result_expires:
                 self.state.pop('text', None)
                 self.state.pop('answers', None)
+                self.state.pop('parts', None)
                 self.state.update(phase='failed', error='expired')
             row = dict(self.state)
             # The browser may immediately queue video work or the next rewrite.
@@ -334,6 +343,7 @@ class Service:
                 row['phase'] = 'finishing'
                 row.pop('text', None)
                 row.pop('answers', None)
+                row.pop('parts', None)
             return row
 
     def cancel(self, key):
@@ -350,6 +360,16 @@ class Service:
             from .. import processes
             processes.stop(process, grace=5)
 
+    @staticmethod
+    def release_idle_image_worker():
+        # An image worker that is only waiting out its idle time still holds the engine lease.
+        try:
+            from server import PromptServer
+            from ..image_gen.service import release_idle_worker
+            release_idle_worker(PromptServer.instance)
+        except Exception:
+            pass
+
     def work(self, root, machine, action, value):
         from ..locking import runtime_lock
         from ..monitoring import save
@@ -357,7 +377,8 @@ class Service:
         try:
             from ..background_compile import COMPILE
             COMPILE.stop()
-            if action in ('rewrite', 'ask'):
+            self.release_idle_image_worker()
+            if action != 'install':
                 from ..resident_process import OWNER
                 if OWNER.active:
                     raise BlockingIOError('busy')
@@ -367,7 +388,9 @@ class Service:
             with runtime_lock(Path(root) / 'engine.lock', inherit=False) as descriptor:
                 self.check()
                 if action == 'install':
-                    assets.install(root, self.progress, self.check)
+                    # The launcher's background download writes the same partial files under this lock.
+                    with runtime_lock(Path(root) / 'prompt-vlm-install.lock', inherit=False):
+                        assets.install(root, self.progress, self.check)
                     self.check()
                     self.progress(dict(phase='complete'))
                 else:
@@ -377,13 +400,14 @@ class Service:
         except BlockingIOError:
             self.progress(dict(phase='failed', error='busy'))
         except Exception as error:
-            known = {'disk_space', 'ram_space', 'rewrite_failed', 'worker_exit', 'timeout', 'worker_cleanup_failed'}
+            known = {'disk_space', 'ram_space', 'rewrite_failed', 'split_failed', 'worker_exit', 'timeout', 'worker_cleanup_failed'}
             self.progress(dict(phase='failed', error=str(error) if str(error) in known
                                else 'download_failed' if action == 'install'
-                               else 'ask_failed' if action == 'ask' else 'rewrite_failed',
+                               else 'ask_failed' if action == 'ask' else 'split_failed' if action == 'split'
+                               else 'rewrite_failed',
                                exception=type(error).__name__))
         finally:
-            if action in ('rewrite', 'ask'):
+            if action != 'install':
                 self.stop_prestart(self.prewarm_state.get('reason', 'none'))
             if self.stop.is_set():
                 self.progress(dict(phase='cancelled'))
@@ -437,6 +461,7 @@ class Service:
         if env.get(resident_process.ENV) and Path(env[resident_process.ENV]).is_file():
             try:
                 resident_process.release_idle_cache(env, descriptor)
+                resident_process.OWNER.record(action='released', reason='prompt_model')
             except resident_process.SessionRestarted:
                 pass  # That worker already exited, which is the release we need.
             env.pop(resident_process.ENV, None)
@@ -552,6 +577,8 @@ class Service:
             if result.get('phase') == 'complete':
                 if value.get('mode') == 'ask':
                     rules.validate_answers(result.get('answers'), value)
+                elif value.get('mode') == 'split':
+                    rules.validate_parts(result.get('parts'), value)
                 else:
                     rules.validate_output(result.get('text'), value)
             self.progress(dict(result, worker_returncode=child.returncode))
@@ -559,8 +586,9 @@ class Service:
             releasing = result_received_at[0] if result_received_at else time.monotonic()
             if child.poll() is None:
                 # Killing only the Linux supervisor bypasses its descendant
-                # cleanup. Stop the owned group/Windows Job and wait instead.
-                processes.stop(child, grace=5)
+                # cleanup. Stop the owned group/Windows Job and wait instead;
+                # the worker finishes its current GPU operation and exits.
+                processes.stop(child, grace=15)
             child.wait()
             writer.join(timeout=5)
             session.close()
@@ -603,6 +631,7 @@ def stop_prestart_for_generation(server):
 
 
 def register():
+    import asyncio
     from aiohttp import web
     from server import PromptServer
     import folder_paths
@@ -617,7 +646,7 @@ def register():
     @server.routes.get('/freevideo/prompt-vlm')
     async def info(request):
         try:
-            return web.json_response(dict(service.info(), token=token))
+            return web.json_response(dict(await asyncio.to_thread(service.info), token=token))
         except (OSError, ValueError):
             return web.json_response(dict(error='setup_required'), status=400)
 
@@ -646,6 +675,10 @@ def register():
                 running, pending = server.prompt_queue.get_current_queue()
                 if running or pending:
                     raise ValueError('busy')
+                if name in ('ask', 'split', 'rewrite'):
+                    # A moved modified time is checked by content here, off the event loop;
+                    # start() then finds the remembered answer.
+                    await asyncio.to_thread(assets.settle, service.installation()[0])
                 result = service.start(name, value)
             return web.json_response(result)
         except (ValueError, OSError) as error:

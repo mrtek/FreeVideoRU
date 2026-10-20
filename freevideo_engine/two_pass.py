@@ -22,9 +22,23 @@ def validate_steps(base_steps=8, refine_steps=3, enabled=True):
         raise ValueError('Second-pass steps must be fewer than first-pass steps')
 
 
+# The learned latent lift and the three refinement steps were built and checked
+# for the 8-step first pass only. Any other first-pass count runs in one pass.
+TWO_PASS_BASE_STEPS = 8
+
+
+def one_pass_note(base_steps):
+    """The sentence a request gets when its step count rules out two-pass, else None."""
+    if base_steps == TWO_PASS_BASE_STEPS:
+        return None
+    return ('Two-pass generation runs only with %d first-pass steps; this request runs in one pass of %d step%s.'
+            % (TWO_PASS_BASE_STEPS, base_steps, '' if base_steps == 1 else 's'))
+
+
 # A first pass below this many pixels is too small for the learned lift: about
 # a third of the clips at 768x512 and every clip at 512x512 had coloured
-# bursts, and none did from 480x288 (960x544) upward. Those sizes run in one pass.
+# bursts, and none did from 480x288 (960x544) upward. Those sizes sample both
+# passes at the target size, without the lift.
 SMALL_FIRST_PASS_PIXELS = 138240
 
 
@@ -85,18 +99,42 @@ def sampling_canvas(canvas, *, staged=False, media=None, conditioned=False):
     return render_canvas(canvas)
 
 
-def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, staged=False):
+# Learned-upscale factors a level may ask for. 2 is the original half-size
+# first pass; 1.5 and 1.2 sample a larger first pass (44% and 69% of the final
+# pixels: 896x512 and 1120x640 for 1344x768) and lift it by that factor.
+SCALES = (2, 1.5, 1.2)
+
+
+def first_canvas(target, scale):
+    """The first-pass canvas and its lift for a factor below 2: multiples of 32 whose
+    lift by `scale` is also a multiple of 32 and covers the target (center-cropped)."""
+    from fractions import Fraction
+    factor = Fraction(scale).limit_denominator(10)  # exactly 3/2 or 6/5, not the binary float
+
+    def side(length):
+        units = -(-Fraction(length, 32) // factor)  # ceil(length / 32 / factor)
+        units = -(-units // factor.denominator) * factor.denominator  # the lift stays a multiple of 32
+        return 32 * int(units), int(32 * units * factor)
+    (w, lift_w), (h, lift_h) = side(target['width']), side(target['height'])
+    return dict(width=w, height=h, frames=target['frames']), dict(width=lift_w, height=lift_h, frames=target['frames'])
+
+
+def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, staged=False, scale=2):
     """Align the smaller canvas, lift, center-crop, then refine at the target.
 
     Odd multiples of 32 need up to 32 extra pixels before the latent crop.
     Small canvases use a smaller factor or same-size refinement. A first pass
-    below SMALL_FIRST_PASS_PIXELS is replaced by one pass at the target size,
-    unless the first pass itself is wanted (a preview or its upscale: staged).
-    Memory pressure never changes this math.
+    below SMALL_FIRST_PASS_PIXELS is sampled at the target size instead (same-size
+    refinement), unless the first pass itself is wanted (a preview or its upscale: staged).
+    Memory pressure never changes this math. `scale` below 2 samples a larger
+    first pass (SCALES) on canvases of at least 512 on the short side; 2 is the
+    original plan, byte for byte.
     """
     from .geometry import geometry
     from .media_request import TASKS
     validate_steps(base_steps, refine_steps, enabled)
+    if scale not in SCALES:
+        raise ValueError('Two-pass upscale factor must be one of ' + ', '.join('%g' % value for value in SCALES))
     if task not in TASKS:
         raise ValueError('Unsupported two-pass conditioning task: ' + str(task))
     target = geometry(canvas['width'], canvas['height'], frames=canvas['frames'])
@@ -107,6 +145,15 @@ def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, sta
     if not enabled:
         result['reason'] = 'Two-pass generation is disabled.'
         return result
+    if base_steps != TWO_PASS_BASE_STEPS:
+        if not staged:
+            single = plan(canvas, False, task, base_steps=base_steps)
+            return dict(single, requested=True, reason=one_pass_note(base_steps))
+        # A preview and its upscale keep the first pass they were made with; the
+        # receipt says so, because a replay without the flag would take the one-pass rule.
+        result['staged'] = True
+    if min(target['width'], target['height']) < 512:
+        scale = 2  # a small canvas keeps its own factor below
     if min(target['width'], target['height']) >= 512:
         first = dict(width=((target['width'] + 63) // 64) * 32,
                      height=((target['height'] + 63) // 64) * 32, frames=target['frames'])
@@ -119,16 +166,22 @@ def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, sta
         multiple = max((divisor + 1) // 2, (8 + unit_w - 1) // unit_w, (8 + unit_h - 1) // unit_h)
         first = dict(width=32 * unit_w * multiple, height=32 * unit_h * multiple, frames=target['frames'])
         lift = dict(shape)
-    crop = dict(left=(lift['width'] - target['width']) // 2,
-                top=(lift['height'] - target['height']) // 2,
-                width=target['width'], height=target['height'])
     upscaling = first != lift
     if upscaling and first['width'] * first['height'] < SMALL_FIRST_PASS_PIXELS:
-        if not staged:
-            single = plan(canvas, False, task, base_steps=base_steps)
-            return dict(single, requested=True,
-                        reason='Small canvas: one pass at the target size.')
-        result['staged'] = True
+        # Judged on the 2x first pass, so a smaller factor never samples less than 2x does.
+        if staged:
+            result['staged'] = True
+        else:
+            first = lift = dict(shape)
+            upscaling, scale = False, 2
+    if upscaling and scale != 2:
+        first, lift = first_canvas(target, scale)
+    if not upscaling:
+        crop = dict(left=0, top=0, width=target['width'], height=target['height'])
+    else:
+        crop = dict(left=(lift['width'] - target['width']) // 2,
+                    top=(lift['height'] - target['height']) // 2,
+                    width=target['width'], height=target['height'])
     result.update(enabled=True, mode='vdn%d-lbh-tail%d' % (base_steps, refine_steps),
                   refine_steps=refine_steps, total_steps=base_steps + refine_steps,
                   first=first, second=shape, upscale_target=lift, crop=crop,
@@ -143,6 +196,10 @@ def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, sta
         result.update(version=3, mode='vdn%d-lbh-community3' % base_steps,
             refine_schedule=COMMUNITY, video_sigmas=list(VIDEO_SIGMAS),
             reason='%d steps on a smaller canvas, learned latent upscale, then three independent refinement steps.' % base_steps)
+    if scale != 2 and upscaling:
+        # Recorded only off the original factor, so 2x plans (and their cache keys) are unchanged.
+        result.update(scale=scale, mode=result['mode'] + '-x%g' % scale,
+                      reason=result['reason'].replace('learned latent upscale', 'learned %gx latent upscale' % scale))
     if not upscaling:
         result['reason'] = 'Small canvas: %d steps and %d refinement steps at the same target size, without upscaling.' % (base_steps, refine_steps)
     return result
@@ -181,6 +238,20 @@ def steps(sampling_plan=None):
 
 def same_strategy(left, right):
     """Do not mix mixed-resolution timings with ordinary full-resolution steps."""
+    def reference_schedule(value):
+        # Worker receipts add step traces and describe subsets at the smaller
+        # canvas. Neither changes the reference schedule's identity.
+        source = value.get('geometry') or value
+        schedule = source.get('early_reference', value.get('early_reference'))
+        if schedule is None:
+            return None
+        return dict(early_steps=schedule.get('early_steps'), conditions=[
+            {key: row.get(key) for key in ('start_step', 'task', 'text_tokens',
+                                         'reference_video_tokens', 'reference_audio_tokens')}
+            for row in schedule.get('conditions', [])])
+
+    if reference_schedule(left) != reference_schedule(right):
+        return False
     a, b = left.get('sampling_plan'), right.get('sampling_plan')
     try:
         if steps(a) != steps(b):
@@ -189,6 +260,59 @@ def same_strategy(left, right):
         return False
     # Until a two-resolution cost model is calibrated, use exact-plan evidence.
     return a == b if (a or {}).get('enabled') or (b or {}).get('enabled') else True
+
+
+def stage_tokens(canvas):
+    """Video/reference activation rows for an encoded early-reference schedule.
+
+    Counts are the scalar metadata from media_conditioning.describe, never
+    conditioning tensors. Ordinary requests retain their historical envelope.
+    The loaded engine must cover both passes; pass-local caching cannot shrink
+    its resident prefix during the first steps.
+    """
+    fields = ('reference_video_tokens', 'reference_audio_tokens')
+
+    def references(row):
+        counts = [row.get(name, 0) for name in fields]
+        if any(type(n) is not int or n < 0 for n in counts):
+            raise ValueError('Reference token counts must be nonnegative integers')
+        return sum(counts)
+
+    maximum = references(canvas)
+    full = canvas['video_tokens'] + maximum
+    schedule = canvas.get('early_reference')
+    if schedule is None:
+        return dict(first=full, refinement=full, engine=full)
+    conditions = schedule.get('conditions') if isinstance(schedule, dict) else None
+    if not isinstance(conditions, list) or not conditions or any(not isinstance(row, dict) for row in conditions):
+        raise ValueError('Early reference planning requires described condition counts')
+    starts = [row.get('start_step') for row in conditions]
+    if (any(type(n) is not int or n < 0 for n in starts) or starts[0] != 0
+            or starts != sorted(set(starts))):
+        raise ValueError('Invalid early reference planning boundaries')
+    counts = [references(row) for row in conditions]
+    if any(max(row.get(name, 0) for row in conditions) > canvas.get(name, 0) for name in fields):
+        raise ValueError('Early reference counts exceed the request allowance')
+    sampling = canvas.get('sampling_plan') or {}
+    first = canvas['video_tokens']
+    refinement = None
+    if sampling.get('enabled'):
+        steps(sampling)
+        expected = plan(canvas, task=canvas.get('task', 't2va'),
+                        base_steps=sampling['base_steps'], refine_steps=sampling['refine_steps'])
+        if any(sampling.get(key) != expected[key] for key in ('first', 'second')):
+            raise ValueError('Early reference sampling geometry disagrees with the request')
+        from .geometry import geometry
+        first = geometry(**sampling['first'])['video_tokens']
+        # Permanent image/video/audio references still participate in refinement.
+        refinement = canvas['video_tokens'] + counts[-1]
+    first += maximum
+    return dict(first=first, refinement=refinement, engine=max(first, refinement or 0))
+
+
+def placement_tokens(canvas):
+    """Shared activation envelope for fixed GPU and host placement."""
+    return stage_tokens(canvas)['engine']
 
 
 def checkpoint_path():

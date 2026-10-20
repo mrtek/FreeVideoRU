@@ -44,6 +44,7 @@ export async function openCompatibility() {
     if (current?.open) { current.focus(); return; }
     const panel = dialog(t('Compatibility', '兼容性')); current = panel;
     const status = element('p', t('Loading settings…', '正在读取设置…')); status.className = 'fv-muted';
+    status.setAttribute('role', 'status');
     panel.actions.before(status);
     show(panel);
     try {
@@ -66,14 +67,32 @@ export async function openCompatibility() {
         status.before(name, slider, autoLabel, note);
         const render = () => { name.textContent = value.levels[Number(slider.value)][cn ? 'zh' : 'en']; }; render();
         slider.oninput = () => { render(); if (Number(slider.value) === 0) automatic.checked = false; };
-        button(panel, t('Cancel', '取消'), () => panel.close());
-        button(panel, t('Save', '保存'), async () => {
+        let saving = false;
+        panel.addEventListener('cancel', event => { if (saving) event.preventDefault(); });
+        const close = panel.querySelector('.fv-close');
+        const cancel = button(panel, t('Cancel', '取消'), () => panel.close());
+        const save = button(panel, t('Save', '保存'), async () => {
+            if (saving) return;
+            saving = true;
+            for (const control of [slider, automatic, save, cancel, close]) control.disabled = true;
+            save.textContent = t('Saving…', '正在保存…');
+            panel.setAttribute('aria-busy', 'true');
+            panel.tabIndex = -1; panel.focus();
+            status.textContent = ''; status.className = 'fv-muted';
             try {
                 const saved = await request('save', {level: Number(slider.value), automatic: automatic.checked});
-                if (!saved.available) { slider.disabled = true; automatic.disabled = true; status.textContent = unavailable(); return; }
+                if (!saved.available) { status.className = 'fv-failure'; status.textContent = unavailable(); return; }
                 panel.close();
             }
-            catch (error) { status.textContent = error.message; }
+            catch (error) { status.className = 'fv-failure'; status.textContent = t('Save failed: ', '保存失败：') + error.message; }
+            finally {
+                saving = false;
+                for (const control of [slider, automatic, save, cancel, close]) control.disabled = false;
+                save.textContent = t('Save', '保存');
+                panel.setAttribute('aria-busy', 'false');
+                panel.removeAttribute('tabindex');
+                if (panel.open) save.focus();
+            }
         }, true);
     } catch (error) {
         status.textContent = error.message;

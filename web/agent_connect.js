@@ -1,25 +1,15 @@
-import {agentGet} from './agent_session.js';
-
+import {issueButton} from './issue_button.js';
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 
-// null means no connection has been seen; '' remembers a connection without a name.
-export function connectionState(copied, status, previousName, t) {
-    if (status?.connected === true) return {color: 'green', text: status.client?.trim() || t('Connected', '已连接'), buttonText: t('Copy', '复制')};
-    if (previousName != null) {
-        const name = previousName || 'Agent';
-        return {color: 'gray', text: t(`${name} disconnected`, `${name} 已断开`), buttonText: t('Reconnect', '重新连接')};
-    }
-    return {color: 'gray', text: copied ? t('Waiting for connection…', '等待连接…') : t('Not connected', '未连接'), buttonText: t('Copy', '复制')};
+// The one place a page says whether an agent is connected: its name while it is, never a client id.
+export function connectionLabel(agent, t) {
+    if (agent?.connected !== true) return {color: 'gray', text: t('Not connected', '未连接')};
+    return {color: 'green', text: String(agent.name || '').trim() || t('Connected', '已连接')};
 }
 
 export function connectionSentence(address, t) {
     const url = address + '/freevideo/agent';
     return t(`Connect to FreeVideo: open ${url} and follow the instructions.`, `请连接 FreeVideo：打开 ${url} 并按说明操作。`);
-}
-
-// Shown under the status line, only when the service says editing cannot run here; connecting still works.
-export function editingNote(status, t) {
-    return status?.editing === false ? t('The agent cannot edit videos or images for now.', 'Agent 暂时不能剪辑和修图。') : '';
 }
 
 // Whether this FreeVideo has the Agent interface on. Any failure counts as off: the surface shows nothing.
@@ -30,42 +20,58 @@ export async function agentInterfaceEnabled(api) {
     } catch { return false; }
 }
 
-// The card alone: who can connect, the sentence, one light and one button. It belongs to whichever surface
-// shows it. shown() says whether the user can see it now; the surface calls sync() whenever that may have changed.
+const ICONS = {plug: ['M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5', 1.8], copy: ['M11 9h7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2zM5 15V5a2 2 0 0 1 2-2h8', 2]};
+function icon(name) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', ICONS[name][0]);
+    svg.setAttribute('stroke-width', String(ICONS[name][1])); svg.append(path);
+    return svg;
+}
+
+// The card alone: who can connect and one button that copies the sentence to paste to the agent. The sentence
+// stays out of sight; it shows, selected, only when the browser refuses the clipboard. shown() says whether the
+// user can see the card now; the surface calls sync() whenever that may have changed.
 export function agentConnectCard(t, api, shown = () => true) {
     const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = new URL('./agent_connect.css', import.meta.url).href; document.head.append(css);
-    const body = el('div', 'fv-agent-connect-body');
+    const body = el('section', 'fv-agent-connect-body');
+    const mark = el('span', 'fv-agent-connect-icon'); mark.append(icon('plug'));
+    const title = el('h2', null, t('Connect an agent', '连接 Agent'));
+    const intro = el('p', 'fv-agent-connect-intro', t('Once connected, describe the video you want. It generates and edits it for you.', '连上后，说想做什么视频，它来生成和剪辑。'));
     const subtitle = el('p', 'fv-muted', t('Claude Code, Codex, FreeToken and others', 'Claude Code、Codex、FreeToken 等'));
-    const sentence = el('p', 'fv-agent-sentence');
-    const note = el('p', 'fv-agent-note'); note.hidden = true;
     const actions = el('div', 'fv-agent-connect-actions');
-    const status = el('div', 'fv-agent-connect-status'); status.setAttribute('role', 'status');
-    const dot = el('span', 'fv-agent-connect-dot'); dot.setAttribute('aria-hidden', 'true');
-    const label = el('span'); status.append(dot, label);
     const button = el('button', 'fv-primary'); button.type = 'button'; button.disabled = true;
-    actions.append(status, button); body.append(subtitle, sentence, actions, note);
+    const label = el('span'); button.append(icon('copy'), label);
+    let issue = null;
+    const arrow = el('span', 'fv-agent-connect-arrow', '→'); arrow.setAttribute('aria-hidden', 'true');
+    actions.append(button, arrow, el('span', 'fv-agent-connect-hint', t('Paste to your agent', '粘贴给 Agent')));
+    const sentence = el('p', 'fv-agent-sentence'); sentence.hidden = true;
+    const status = el('p', 'fv-agent-connect-status', t('Getting the connection address…', '正在获取连接地址…')); status.setAttribute('role', 'status');
+    body.append(mark, title, intro, subtitle, actions, sentence, status);
 
-    let copied = false, feedback = false, previousName = null, value = null;
+    let feedback = false, text = '', failures = 0;
     let timer, feedbackTimer, controller, generation = 0;
     const active = () => body.isConnected && shown();
-    function render() {
-        const state = connectionState(copied, value, previousName, t);
-        dot.dataset.color = state.color; label.textContent = state.text;
-        button.textContent = feedback ? t('Copied', '已复制') : state.buttonText;
-        note.textContent = editingNote(value, t); note.hidden = !note.textContent;
-    }
+    const render = () => {
+        label.textContent = !text && failures >= 3 ? t('Could not get address. Retry', '获取失败，重试') : feedback ? t('Copied', '已复制') : t('Copy', '复制');
+        if (!text && failures >= 3) {
+            if (!issue) { issue = issueButton(t, () => ({where: ['Agent connection', 'Agent 连接'], message: label.textContent})); button.after(issue); }
+        } else if (issue) { issue.remove(); issue = null; }
+        button.disabled = !text && failures < 3;
+        button.title = !text && failures < 3 ? t('Getting the connection address…', '正在获取连接地址…') : '';
+        status.hidden = !!text; status.textContent = !text && failures < 3 ? t('Getting the connection address…', '正在获取连接地址…') : '';
+    };
     render();
 
     button.onclick = async () => {
-        const text = sentence.textContent;
-        try { await navigator.clipboard.writeText(text); }
+        if (!text) { failures = 0; render(); await load(); return; }
+        try { await navigator.clipboard.writeText(text); sentence.hidden = true; }
         catch {
+            sentence.textContent = text; sentence.hidden = false;
             const range = document.createRange(); range.selectNodeContents(sentence);
             const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
         }
         if (!active()) return;
-        copied = true;
-        if (value?.connected !== true) previousName = null;
         feedback = true; render();
         clearTimeout(feedbackTimer);
         feedbackTimer = setTimeout(() => { feedback = false; render(); }, 2000);
@@ -76,71 +82,31 @@ export function agentConnectCard(t, api, shown = () => true) {
         controller?.abort(); controller = null;
         clearTimeout(feedbackTimer); feedback = false; render();
     }
-    async function poll() {
+    // Only the sentence is read here, until it is known; who is connected comes from the surface that holds the card.
+    async function load() {
         const current = generation;
         const request = new AbortController(); controller = request;
         try {
-            if (!sentence.textContent) {
-                // The sentence carries no parameter: the server gives the agent the language this card showed.
-                const response = await api.fetchApi('/freevideo/agent/connect?lang=' + t('en', 'zh'), {cache: 'no-store', signal: request.signal});
-                if (!response.ok) return;
-                const connect = await response.json();
-                if (current !== generation || !active()) return;
-                if (!connect.address) return;
-                sentence.textContent = connectionSentence(connect.address, t);
-                button.disabled = false;
-            }
-            const response = await agentGet(api, '/freevideo/agent/v1/connect/status', {signal: request.signal});
-            if (!response.ok) return;
-            const next = await response.json();
-            if (current !== generation || !active()) return;
-            value = next;
-            if (value.connected === true) previousName = value.client?.trim() || previousName || '';
-            render();
-        } catch { /* Keep the last observed state and retry while expanded. */ }
+            // The sentence carries no parameter: the server gives the agent the language this card showed.
+            const response = await api.fetchApi('/freevideo/agent/connect?lang=' + t('en', 'zh'), {cache: 'no-store', signal: request.signal});
+            const connect = response.ok ? await response.json() : null;
+            if (current !== generation) return;
+            if (!connect?.address) throw new Error('Missing address');
+            text = connectionSentence(connect.address, t);
+            failures = 0; render();
+        } catch { if (current === generation) { failures++; render(); } }
         finally {
             if (current === generation) {
                 controller = null;
-                if (active()) timer = setTimeout(poll, 3000);
+                if (!text && active() && failures < 3) timer = setTimeout(() => { timer = null; void load(); }, 3000);
             }
         }
     }
     function sync() {
         if (!active()) { stop(); return; }
-        if (!controller && !timer) poll();
+        if (!text && failures < 3 && !controller && !timer) load();
     }
     // Resolves to whether this FreeVideo has the Agent interface on; a surface shows nothing when it is off.
     const enabled = agentInterfaceEnabled(api);
-    return {element: body, title: t('Connect an agent', '连接 Agent'), enabled, sync, stop};
-}
-
-// Settings: the card as one collapsible section of the dialog.
-export function agentConnect(t, api) {
-    let observer, dialog;
-    const section = el('details', 'fv-agent-connect');
-    section.hidden = true;
-    const card = agentConnectCard(t, api, () => !section.hidden && section.open && section.dataset.expanded !== 'false'
-        && (!dialog || dialog.open && dialog.dataset.closing !== 'true'));
-    section.append(el('summary', null, card.title), card.element);
-    function close() {
-        card.stop(); observer?.disconnect(); observer = null;
-        dialog?.removeEventListener('close', close); dialog = null;
-    }
-    section.addEventListener('toggle', () => {
-        if (!observer) {
-            dialog = section.closest('dialog');
-            observer = new MutationObserver(card.sync);
-            observer.observe(section, {attributes: true, attributeFilter: ['open', 'hidden', 'data-expanded']});
-            if (dialog) {
-                observer.observe(dialog, {attributes: true, attributeFilter: ['open', 'data-closing']});
-                dialog.addEventListener('close', close);
-            }
-        }
-        card.sync();
-    });
-    card.enabled.then(on => {
-        if (on) section.hidden = false;
-        else { close(); section.remove(); }
-    });
-    return section;
+    return {element: body, enabled, sync, stop};
 }

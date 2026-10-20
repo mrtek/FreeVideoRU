@@ -55,6 +55,27 @@ def load(directory, chain, index, previous, output=None):
         return None
 
 
+def copy(directory, source, target, index):
+    """Give chain `target` the seam sound `source` kept for block `index`; False when there is none."""
+    import os
+    import uuid
+    origin, path = _path(directory, source, index), _path(directory, target, index)
+    try:
+        data = origin.read_bytes()
+    except FileNotFoundError:
+        return False
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex[:8] + '.tmp')
+    try:
+        with temporary.open('wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
 def has(directory, chain, index):
     try:
         return _path(directory, chain, index).is_file()

@@ -632,7 +632,39 @@
       0.0,
       1.9429229278016131
     ],
-    "training_requests": 1
+    "training_requests": 5,
+    "chip_factors": {
+      "note": "[step, decode] time multipliers on the shared Apple prior (fitted on M4 Max); measured from Mac reports: M1 Max, M4 Pro, M4 Max, M5, M5 Pro. Chips without a report borrow, see _apple_factors.",
+      "lower_tier_slowdown": 1.4,
+      "chips": {
+        "1": {
+          "Max": [
+            3.2,
+            1.5
+          ]
+        },
+        "4": {
+          "Pro": [
+            1.7,
+            2.1
+          ],
+          "Max": [
+            1.0,
+            1.0
+          ]
+        },
+        "5": {
+          "base": [
+            0.7,
+            1.0
+          ],
+          "Pro": [
+            0.5,
+            0.6
+          ]
+        }
+      }
+    }
   },
   "uncertainty": {
     "prior": {

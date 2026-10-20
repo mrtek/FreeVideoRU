@@ -187,6 +187,36 @@ def stop_read_ahead(trace):
         trace.data['encoder_read_ahead'] = reader.close()
 
 
+def start_layer_window(trace, clip, path):
+    """Read the streamed layers ahead of the forward pass when the whole-file read-ahead could not.
+
+    Speculative like the readers above: any failure leaves the encode exactly as before. Once per request."""
+    if getattr(trace, 'layer_window', None) is not None or 'encoder_window' in trace.data:
+        return
+    if os.environ.get('FREEVIDEO_ENCODER_WINDOW', 'auto').lower() in ('off', '0', 'false'):
+        trace.data['encoder_window'] = dict(state='skipped', reason='Disabled by FREEVIDEO_ENCODER_WINDOW')
+        return
+    if (trace.data.get('encoder_read_ahead') or {}).get('state') == 'ready':
+        trace.data['encoder_window'] = dict(state='skipped', reason='The whole checkpoint is already in the OS cache')
+        return
+    try:
+        from .encoder_checkpoint import owns_readonly_tensor
+        from .encoder_window import LayerWindow, layer_modules
+        modules = layer_modules(clip.cond_stage_model, owns_readonly_tensor)
+        release = os.environ.get('FREEVIDEO_ENCODER_WINDOW_RELEASE', 'auto').lower() not in ('off', '0', 'false')
+        trace.layer_window = window = LayerWindow(path, modules, release=release)
+        window.start()
+    except Exception as error:
+        trace.data['encoder_window'] = dict(state='failed', reason=type(error).__name__ + ': ' + str(error))
+
+
+def stop_layer_window(trace):
+    """Stop the layer window, once, and keep what it did in the metrics."""
+    window = getattr(trace, 'layer_window', None)
+    if window is not None and 'encoder_window' not in trace.data:
+        trace.data['encoder_window'] = window.close()
+
+
 def start_model_read_ahead(trace, request):
     """On a slow drive, read the video model's files while the encoder computes.
 
@@ -221,6 +251,7 @@ def encode(args, request, resident=None, diagnostics=None):
         metrics = _encode(args, request, resident, trace)
     except BaseException:
         stop_read_ahead(trace)
+        stop_layer_window(trace)
         stop_model_read_ahead(trace)
         trace.finish(False)
         raise
@@ -236,6 +267,12 @@ def _encode(args, request, resident, trace):
     loading = trace.data
     def phase(name, **metrics):
         trace.stage(name, **metrics)
+        if args.check_library:
+            from .install_activity import step
+            labels = {'encoder_torch_import': 'Runtime libraries importing',
+                      'encoder_options': 'Encoder configuring', 'encoder_native_import': 'Encoder importing'}
+            if name in labels:
+                step(labels[name])
         if name in ('encoder_oom', 'encoder_retry'):
             print(json.dumps(dict(event=name, attempt=len(loading.get('encoder_attempts', [])))), flush=True)
         if name == 'encoder_oom' and request.get('metrics') and request.get('diagnostic_output'):
@@ -306,6 +343,8 @@ def _encode(args, request, resident, trace):
             raise RuntimeError('Unexpected application modules: ' + repr(forbidden))
         print(json.dumps({'native_encoder_library_import': True, 'application_modules_loaded': [],
                           'torch': str(torch.__version__), 'source': str(args.comfy_root)}), flush=True)
+        from .install_activity import step
+        step('Encoder ready')
         return
     phase('encoder_media_prepare')
     keyframes = request.get('keyframes')
@@ -313,12 +352,18 @@ def _encode(args, request, resident, trace):
     normalized = None
     media_kwargs = {}
     task = 't2va'
+    early_reference = None
     if request.get('media'):
-        from .media_request import task_for
+        from .media_request import task_for, reference_stages
         from .media_encoding import prepare
-        task = task_for(request['media'])
+        stages = reference_stages(request['media'])
+        early = [dict(reference_index=i, early_steps=row['early_steps'])
+                 for i, row in enumerate(request['media'].get('references', [])) if 'early_steps' in row]
+        if early:
+            early_reference = dict(version=1, early_steps=early, conditions=[])
+        task = task_for(stages[0][1])
         if task != 't2va':
-            normalized, media_kwargs = prepare(request['media'], request['geometry'], Path(request['output']).parent / 'media')
+            normalized, media_kwargs = prepare(stages[0][1], request['geometry'], Path(request['output']).parent / 'media')
             # Saved with the conditioning, so a reused input cache still reports them.
             loading['reference_trims'] = [row['trimmed'] for row in normalized if row.get('trimmed')]
     if keyframes is not None:
@@ -469,8 +514,10 @@ def _encode(args, request, resident, trace):
         guard.arm()
         from .encoder_memory import snapshot
         phase('encoder_compute', load_seconds=load_seconds, device_load_seconds=transfer_seconds[0],
-              gpu=snapshot(torch, clip, memory))
+              gpu=snapshot(torch, clip, memory, windows_memory=True))
         print(json.dumps({'event': 'encoder_compute_start'}), flush=True)
+        if not encoder_cache_hit:
+            start_layer_window(trace, clip, path)
         return result
     @contextmanager
     def attempt(index, failure):
@@ -508,14 +555,35 @@ def _encode(args, request, resident, trace):
             encoded, attempts = encode_with_recovery(clip, tokens, memory, torch, phase, max_attempts=4,
                                                      attempt=attempt)
         loading['encoder_attempts'] = attempts
+        if early_reference is not None:
+            # Reuse this loaded Qwen instance, its precision and recovery policy.
+            # Re-tokenize: removing visual rows alone does not remove VL features.
+            from .media_encoding import reference_options
+            extra_started = time.perf_counter()
+            for step, stage_media in stages[1:]:
+                tokens = clip.tokenize(prompt, **reference_options(normalized, media_kwargs, step))
+                size = input_size(tokens)
+                current.clear()
+                with readonly_pinning(torch, memory):
+                    stage_encoded, stage_attempts = encode_with_recovery(
+                        clip, tokens, memory, torch, phase, max_attempts=4, attempt=attempt)
+                stage_task = task_for(stage_media)
+                stage_value = to_cache(stage_encoded, prompt, task=stage_task)
+                stage_value['task'] = stage_task
+                early_reference['conditions'].append(dict(start_step=step, value=stage_value))
+                loading.setdefault('early_reference_attempts', []).append(dict(start_step=step, attempts=stage_attempts))
+                del stage_encoded
+            torch.cuda.synchronize()
+            loading['early_reference_extra_encode_seconds'] = time.perf_counter() - extra_started if stages[1:] else 0.
         # Finish async forward work at the existing conditioning boundary, so
         # it is not attributed to packing/saving on the host.
         torch.cuda.synchronize()
         from .encoder_memory import release_cast_buffers, snapshot
         loading['cast_buffers'] = release_cast_buffers(memory, torch)
-        phase('encoder_conditioning_pack', gpu=snapshot(torch, clip, memory))
+        phase('encoder_conditioning_pack', gpu=snapshot(torch, clip, memory, windows_memory=True))
     finally:
         del clip.load_model
+        stop_layer_window(trace)
         guard.disarm()
         if reader is not None:
             reader.close()
@@ -524,6 +592,8 @@ def _encode(args, request, resident, trace):
     task = 'fl2va' if images is not None else task
     value = to_cache(encoded, prompt, task=task)
     value['task'] = task
+    if early_reference is not None:
+        value['early_reference'] = early_reference
     torch.cuda.synchronize()
     prompt_encode_seconds = time.perf_counter() - encode_started
     # Keyframe and reference-media encoding read the drive themselves.
@@ -575,9 +645,14 @@ def _encode(args, request, resident, trace):
         add_vdn()
         from .media_encoding import encode_latents
         tick = time.perf_counter()
-        info = encode_latents(normalized, value, request['base'], request['geometry'], resident=resident)
+        info = encode_latents(normalized, value, request['base'], request['geometry'], resident=resident,
+                              cache_root=request.get('reference_latent_cache'))
         keyframe_metrics.update(media_vae_encode_seconds=time.perf_counter() - tick, conditioning_info=info)
         task = info['task']
+    elif early_reference is not None:
+        from .media_conditioning import describe
+        keyframe_metrics['conditioning_info'] = describe(value, **{
+            k: request['geometry'][k] for k in ('width', 'height', 'frames')})
     phase('encoder_save')
     output = Path(request['output'])
     output.parent.mkdir(parents=True, exist_ok=True)

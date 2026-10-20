@@ -1,4 +1,5 @@
 import { referenceItems } from './prompt_references.js';
+import { effortFor, effortsFrom, stepCacheOf, upscaleOf } from './sampling_effort.js';
 
 const PRESETS = [.5, .75, .98, 1.5, 2];
 const COLUMN_SPACING = 'equal'; // 'equal' or 'width'
@@ -44,7 +45,7 @@ export function aboutTime(seconds, t) {
 // documented task fallback, rather than pretending the known subset is all of it.
 export function capabilityContext(node, state) {
     if (linked(node, 'conditioning') || linked(node, 'width') || linked(node, 'height')
-            || ['base_steps', 'refine_steps', 'two_pass'].some(name => linked(node, name))) return null;
+            || ['base_steps', 'refine_steps', 'two_pass', 'step_cache', 'upscale_factor'].some(name => linked(node, name))) return null;
     let items, assets;
     try { items = referenceItems(node); assets = JSON.parse(value(upstream(node, 'media'), 'assets') || '[]'); }
     catch { return null; }
@@ -53,7 +54,7 @@ export function capabilityContext(node, state) {
         const source = assets[item.assetIndex] || {}, row = {kind: item.kind};
         if (item.kind !== 'audio') { row.width = source.width; row.height = source.height; }
         if (item.kind !== 'image') row.seconds = source.seconds;
-        if (item.kind === 'video' && positive(source.audio_seconds)) row.audio_seconds = source.audio_seconds;
+        if (item.kind === 'video' && item.sound !== false && positive(source.audio_seconds)) row.audio_seconds = source.audio_seconds;
         return row;
     });
     const audio = refs.some((r, i) => r.kind === 'audio' || positive(rows[i].audio_seconds));
@@ -76,12 +77,17 @@ export function capabilityContext(node, state) {
     return query.toString();
 }
 
+// Shared recognition includes legacy Max and the Mac-only legacy High.
+const gridTier = (grid, steps, twoPass, refine, stepCache, upscale = 2) => {
+    const level = effortFor(steps, twoPass, refine, stepCache, effortsFrom(grid), upscale);
+    return grid.tiers?.[level?.name.toLowerCase()];
+};
+
 export function capabilitySurface(grid, state) {
     if (grid?.version !== 1 || grid.status !== 'ready' || typeof grid.revision !== 'string' || !grid.machine?.system
             || /darwin|mac|apple/i.test(grid.machine.system)
             || !Array.isArray(grid.sizes) || !grid.sizes.length || !Array.isArray(grid.lengths)) return null;
-    const tier = Object.values(grid.tiers || {}).find(v => v.steps === state.steps && v.two_pass === state.twoPass
-        && (!v.two_pass || state.refine === 3));
+    const tier = gridTier(grid, state.steps, state.twoPass, state.refine, state.stepCache, state.upscale);
     if (!tier || !Array.isArray(tier.estimate_seconds) || !Array.isArray(tier.max_seconds)) return null;
     const lengths = grid.lengths.map(l => l.seconds);
     if (!lengths.length || lengths.some((s, i) => !Number.isInteger(s) || s < 2 || (i && s <= lengths[i - 1]))) return null;
@@ -118,7 +124,22 @@ export function capabilitySurface(grid, state) {
         const point = points.reduce((best, p) => Math.abs(p.seconds - seconds) < Math.abs(best.seconds - seconds) ? p : best);
         return {...point, width: sizes[i].width, height: sizes[i].height, pixels: sizes[i].pixels, size: i};
     }
-    return {sizes, xs, top, edge, snap, at: seconds => curve(available.map(i => xs[i]), available.map(i => curves[i](seconds)))};
+    function nearest(x, y) {
+        if (![x, y].every(Number.isFinite) || x < 0 || x > 1 || y < 0 || y > 1) return null;
+        let best = null, distance = Infinity;
+        sizes.forEach((size, i) => {
+            for (const point of size.points) {
+                if (point.seconds > top) continue;
+                const d = (xs[i] - x) ** 2 + (1 - point.seconds / top - y) ** 2;
+                if (d < distance) {
+                    distance = d;
+                    best = {...point, width: size.width, height: size.height, pixels: size.pixels, size: i};
+                }
+            }
+        });
+        return best;
+    }
+    return {sizes, xs, top, edge, snap, nearest, at: seconds => curve(available.map(i => xs[i]), available.map(i => curves[i](seconds)))};
 }
 
 // Iris's blue ramp in OKLab, interpolated in linear light; transparent beyond
@@ -156,7 +177,7 @@ export function surfacePixels(surface, width, height) {
 }
 
 let serial = 0;
-export function createCapabilityView({node, api, t, getState, onPick, onEstimate}) {
+export function createCapabilityView({node, api, t, getState, onPick, onEstimate, onGrid}) {
     if (!document.querySelector('link[data-fv-capability]')) {
         const css = el('link', ''); css.rel = 'stylesheet'; css.dataset.fvCapability = '';
         css.href = new URL('./capability_view.css', import.meta.url).href; document.head.append(css);
@@ -172,7 +193,8 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
     for (const item of [canvas, previous, now, mark]) item.setAttribute('aria-hidden', 'true');
     tip.setAttribute('role', 'status'); tip.append(time, configuration); plot.append(canvas, previous, now, mark, tip);
     plot.tabIndex = 0; plot.setAttribute('role', 'group'); plot.setAttribute('aria-label', t('Available sizes and lengths', '可生成范围'));
-    chart.append(yAxis, plot, xAxis); element.append(entry, chart);
+    const notice = el('p', 'fv-muted'); notice.hidden = true; notice.setAttribute('role', 'status');
+    chart.append(yAxis, plot, xAxis); element.append(entry, chart, notice);
     let opened = false;
     try { opened = localStorage.getItem('freevideo.range-open') === '1'; } catch {}
     const fold = () => { chart.hidden = !opened; entry.setAttribute('aria-expanded', String(opened)); };
@@ -225,7 +247,7 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
     function paint(animate = false) {
         if (!surface || !opened || element.hidden || !plot.clientWidth) return;
         const dpr = Math.max(1, window.devicePixelRatio || 1), width = Math.round(plot.clientWidth * dpr), height = Math.round(plot.clientHeight * dpr);
-        const key = `${grid.revision}:${getState().steps}:${getState().twoPass}:${width}:${height}:${query}`;
+        const key = `${grid.revision}:${getState().steps}:${getState().twoPass}:${stepCacheOf(getState().stepCache)}:${upscaleOf(getState().upscale)}:${width}:${height}:${query}`;
         if (key === drawn) { current(); return; }
         drawn = key;
         if (animate && canvas.width && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -250,6 +272,7 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
         current(); hideHover();
     }
     function applyGrid(animate = false) {
+        if (grid?.version === 1 && grid.status === 'ready') onGrid?.(grid);
         surface = capabilitySurface(grid, getState()); element.hidden = !surface;
         onEstimate?.();
         if (!surface) { hideHover(); return; }
@@ -293,10 +316,25 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
     function point(event) {
         if (!surface) return;
         const box = plot.getBoundingClientRect(), x = clamp(event.clientX - box.left, 0, box.width), y = clamp(event.clientY - box.top, 0, box.height);
+        if (!box.width || !box.height) return;
         const snapped = surface.snap(x / box.width, y / box.height);
         if (snapped) show(snapped, x, y); else hideHover();
+        return {x: x / box.width, y: y / box.height};
     }
-    const pick = () => { if (hover && !getState().disabled) { const point = hover; onPick(point); current(); } };
+    const pick = position => {
+        if (!surface || getState().disabled) return;
+        let selected = hover, adjusted = Boolean(selected?.adjusted);
+        if (!selected) {
+            const x = position?.x ?? surface.xs[Math.max(0, currentSize())];
+            const y = position?.y ?? clamp(1 - Number(value(node, 'seconds')) / surface.top, 0, 1);
+            selected = surface.snap(x, y);
+            if (!selected) { selected = surface.nearest(x, y); adjusted = true; }
+        }
+        if (!selected) return;
+        onPick(selected); current();
+        notice.hidden = !adjusted;
+        notice.textContent = adjusted ? t('Moved to the nearest available spot.', '已挪到最近的可用位置。') : '';
+    };
     plot.onpointermove = point;
     plot.onpointerdown = event => {
         if (event.button !== 0) return;
@@ -304,14 +342,14 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
     };
     plot.onpointerup = event => {
         if (event.pointerId !== pointer) return;
-        point(event); pointer = null; plot.releasePointerCapture(event.pointerId); pick();
+        const position = point(event); pointer = null; plot.releasePointerCapture(event.pointerId); pick(position);
     };
     plot.onpointercancel = () => { pointer = null; hideHover(); };
     plot.onlostpointercapture = () => { pointer = null; };
     plot.onpointerleave = event => { if (pointer === null && event.pointerType !== 'touch') hideHover(); };
     plot.onblur = hideHover;
     plot.onkeydown = event => {
-        if (!surface) return;
+        if (!surface || event.ctrlKey || event.metaKey || event.altKey) return;
         if (['Enter', ' '].includes(event.key)) { event.preventDefault(); pick(); return; }
         const delta = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1]}[event.key];
         if (!delta) return;
@@ -319,10 +357,12 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
         const base = hover || {size: Math.max(0, currentSize()), seconds: Math.round(Number(value(node, 'seconds')))};
         let i = clamp(base.size + delta[0], 0, surface.sizes.length - 1);
         while (!surface.sizes[i].points.length && delta[0] && i + delta[0] >= 0 && i + delta[0] < surface.sizes.length) i += delta[0];
-        if (!surface.sizes[i].points.length) return;
-        const seconds = clamp(base.seconds + delta[1], 2, Math.min(surface.top, surface.sizes[i].max));
+        const available = surface.sizes[i].points.length > 0;
+        const seconds = clamp(base.seconds + delta[1], 2, available ? Math.min(surface.top, surface.sizes[i].max) : surface.top);
         const x = surface.xs[i], y = 1 - seconds / surface.top, snapped = surface.snap(x, y);
-        if (snapped) show(snapped, x * plot.clientWidth, y * plot.clientHeight);
+        const selected = snapped || surface.nearest(x, y);
+        if (selected) show({...selected, adjusted: !snapped}, surface.xs[selected.size] * plot.clientWidth,
+            (1 - selected.seconds / surface.top) * plot.clientHeight);
     };
     function changed(event) {
         if (event.detail?.revision === grid?.revision) return;
@@ -337,9 +377,9 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
     api.addEventListener('freevideo_capabilities', changed);
     const outside = event => { if (!plot.contains(event.target)) hideHover(); };
     node && window.addEventListener('pointerdown', outside);
-    return {element, update, estimate(steps, twoPass, refine) {
+    return {element, update, estimate(steps, twoPass, refine, stepCache = null, upscale = 2) {
         if (!grid || !surface) return '';
-        const tier = Object.values(grid.tiers || {}).find(v => v.steps === steps && v.two_pass === twoPass && (!twoPass || refine === 3));
+        const tier = gridTier(grid, steps, twoPass, refine, stepCache, upscale);
         const i = grid.sizes.findIndex(s => s.width === Number(value(node, 'width')) && s.height === Number(value(node, 'height')));
         const j = grid.lengths.findIndex(l => l.seconds === Number(value(node, 'seconds')));
         const seconds = tier?.estimate_seconds?.[i]?.[j];

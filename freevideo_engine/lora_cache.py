@@ -20,6 +20,7 @@ import time
 from safetensors.torch import save_file
 import torch
 
+from .lora_names import INT8_UNMERGEABLE, MODULATION, _targets, adapter_keys, int8_skip_reason, resolve_target
 from .tensor_io import open_tensors
 from .media_request import digest, verify_files
 from .monitoring import save
@@ -27,52 +28,10 @@ from .storage import fingerprint
 from . import disk_space
 
 
-def _targets(name):
-    prefixes = ('base_model.model.', 'diffusion_model.', 'model.diffusion_model.', 'transformer.')
-    while any(name.startswith(prefix) for prefix in prefixes):
-        prefix = next(prefix for prefix in prefixes if name.startswith(prefix))
-        name = name[len(prefix):]
-    # Community H3 trainers also export Kohya-style flattened module names.
-    # Only the known H3 block grammar is expanded; underscores inside qkv_proj
-    # and out_proj are meaningful and must not become dots.
-    name = re.sub(r'^lora_unet_blocks_(\d+)_(attn|mlp)_(out_proj|qkv_proj|fc1|fc2)(?=\.|$)',
-                  r'blocks.\1.\2.\3', name)
-    name = re.sub(r'^blocks\.', 'transformer_blocks.', name)
-    name = name.replace('token_refiner.blocks.', 'token_refiner.refiner_blocks.')
-    name = name.replace('final_layer.adaln_proj.linear', 'norm_out.linear')
-    # Original H3 fc1 uses [gate; value], including token-refiner MLPs.
-    # Diffusers adapters already name ff.net.0.proj and need no swap.
-    swap = '.mlp.fc1' in name
-    for before, after in (('.mlp.fc1', '.ff.net.0.proj'), ('.mlp.fc2', '.ff.net.2'), ('.attn.out_proj', '.attn.to_out.0')):
-        name = name.replace(before, after)
-    if '.attn.qkv_proj' in name:
-        return [(name.replace('.attn.qkv_proj', '.attn.' + suffix), i, False) for i, suffix in enumerate(('to_q', 'to_k', 'to_v'))]
-    return [(name, None, swap)]
-
-
-def index_adapter(row, targets):
-    pairs = {}
-    full = []
+def index_adapter(row, targets, skipped=None):
     with open_tensors(row['path']) as source:
         metadata = source.metadata() or {}
-        keys = source.keys()
-        for key in keys:
-            canonical = key.replace('.default.', '.').replace('.lora_down.weight', '.lora_A.weight').replace('.lora_up.weight', '.lora_B.weight')
-            match = re.fullmatch(r'(.+)\.lora_([AB])\.weight', canonical)
-            if match:
-                pair = pairs.setdefault(match[1], {})
-                if match[2] in pair:
-                    raise ValueError('Duplicate LoRA factor: ' + key)
-                pair[match[2]] = key
-            elif canonical.endswith('.alpha'):
-                pairs.setdefault(canonical[:-6], {})['alpha'] = key
-            elif canonical.endswith(('.diff', '.diff_b')):
-                bias = canonical.endswith('.diff_b')
-                full.append((canonical[:-7] if bias else canonical[:-5], key, bias))
-            else:
-                raise ValueError('Unsupported LoRA tensor (no patches are ignored): ' + key)
-        if not pairs and not full:
-            raise ValueError('Adapter contains no LoRA factors')
+        pairs, full = adapter_keys(source.keys())
         global_alpha = row.get('alpha') is not None or 'alpha' in metadata
         if global_alpha:
             ranks = {source.get_slice(pair['A']).get_shape()[0] for pair in pairs.values() if 'A' in pair
@@ -92,8 +51,11 @@ def index_adapter(row, targets):
             if not math.isfinite(alpha):
                 raise ValueError('Nonfinite LoRA alpha')
             for target, split, swap in _targets(name):
-                if target not in targets and '.attn.' in target:
-                    target = target.replace('.attn.', '.attn.orig.', 1)
+                target = resolve_target(target, targets)
+                reason = int8_skip_reason(target, targets) if skipped is not None else None
+                if reason:
+                    skipped.append((reason, target))
+                    continue
                 expected = targets.get(target)
                 rows = bshape[0] if split is None else bshape[0] // 3
                 if (expected is None or (split is not None and bshape[0] % 3)
@@ -105,8 +67,12 @@ def index_adapter(row, targets):
             shape = source.get_slice(key).get_shape()
             for target, split, swap in _targets(name):
                 target += '#bias' if bias else ''
-                if target not in targets and '.attn.' in target:
-                    target = target.replace('.attn.', '.attn.orig.', 1)
+                target = resolve_target(target, targets)
+                if skipped is not None:
+                    # Quantized weights cannot take a full difference, and the int8 package
+                    # keeps no bias or non-linear patch path yet: count each one, apply the rest.
+                    skipped.append((int8_skip_reason(target, targets, full=True), target))
+                    continue
                 expected = targets.get(target)
                 actual = list(shape)
                 if split is not None:
@@ -178,8 +144,7 @@ def prepare(cache, adapters, output_root=None):
     manifest_path = cache / 'manifest.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     if manifest.get('precision') == 'int8':
-        raise ValueError('This LoRA changes parts of the model that the int8 version cannot merge yet, '
-                         'so it cannot be used for now. LoRAs that change only linear layers work.')
+        raise ValueError(INT8_UNMERGEABLE)
     if manifest.get('precision') != 'fp8':
         raise ValueError('LoRA variants require the prepared FP8 model')
     from .adaln_assets import SLIM_FORMATS, restore_projections
@@ -193,6 +158,7 @@ def prepare(cache, adapters, output_root=None):
                     changes_embedding |= target.startswith(('time_embedder.', 'time_proj.'))
                     changes_modulation |= bool(re.match(r'transformer_blocks\.\d+\.adaln_proj\.', target))
     identity = {'source_manifest_sha256': digest(manifest_path), 'implementation_sha256': digest(__file__),
+                'names_sha256': digest(Path(__file__).with_name('lora_names.py')),
                 'torch': str(torch.__version__), 'adapters': [{k: v for k, v in row.items() if k != 'path'} for row in adapters],
                 'arithmetic': 'prepared FP8 dequantization; FP32 delta, weight-dtype merge; original FP8 granularity'}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()

@@ -5,8 +5,10 @@ import {app} from '../../scripts/app.js';
 export async function openEditorView(node, options) {
     try {
         const entry = await import('./editor_entry.js');
+        if (options?.isCurrent?.() === false) return null;
         return entry.openEditorView(node, options);
     } catch (error) {
+        if (options?.isCurrent?.() === false) return null;
         console.warn('FreeVideo edit view:', error);
         const language = new URLSearchParams(location.search).get('freevideo_lang')
             || (typeof localStorage !== 'undefined' ? localStorage.getItem('freevideo_lang') : null);

@@ -3,7 +3,7 @@ import time
 import webbrowser
 
 from . import branding
-from .launcher_update import error_text, release_page, launch_download, DownloadedLauncherUnavailable
+from .launcher_update import error_text, manual_install, release_page, launch_download, DownloadedLauncherUnavailable
 
 
 class UpdateUI:
@@ -68,7 +68,7 @@ class UpdateUI:
                 self.closed = True
                 app.close()
             elif row['status'] == 'available' or (row['status'] in ('error', 'cancelled') and row.get('candidate')):
-                if getattr(self.client, 'current', {}).get('packaging') == 'onedir':
+                if manual_install(getattr(self.client, 'current', {}), self.client):
                     webbrowser.open(release_page(self.client.current))
                 else:
                     self.client.run('download', row['candidate'])

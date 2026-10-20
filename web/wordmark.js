@@ -9,6 +9,7 @@ export function wordmark() {
     image.className = 'fv-wordmark';
     image.src = new URL('./assets/freevideo.svg', import.meta.url).href;
     image.alt = 'FreeVideo'; image.width = 2016; image.height = 337;
+    image.setAttribute('translate', 'no');
     image.draggable = false;
     return image;
 }

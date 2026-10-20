@@ -99,7 +99,7 @@ def live_pin_capacity(*, headroom_bytes=None, nonlocal_reserve_bytes=None, commi
 
 @torch.no_grad()
 def pin_layer_weights(layers, max_bytes=None, *, headroom_bytes=None, nonlocal_reserve_bytes=None,
-                      commit_reserve_bytes=0):
+                      commit_reserve_bytes=0, progress=None):
     """Pack immutable CPU parameters into persistent pinned planes, one per dtype.
 
     This optional mode trades pageable/mapped storage for locked host residency.
@@ -174,6 +174,8 @@ def pin_layer_weights(layers, max_bytes=None, *, headroom_bytes=None, nonlocal_r
             offset += parameter.numel()
             parameter.data = view
         pinned += sum(p.numel() * p.element_size() for p in parameters)
+        if progress is not None:
+            progress(pinned, required)
     return pinned
 
 
@@ -511,6 +513,41 @@ class LayerOffloader:
                 lambda module, args, index=index: self._before(index)))
             self.hooks.append(layer.register_forward_hook(
                 lambda module, args, result, index=index: self._after(index), always_call=True))
+
+    @property
+    def at_boundary(self):
+        """No layer pass is open, so the next pass can start; False after a failure inside one."""
+        return not (self.expected or self.pending or self.host_pending)
+
+    def end_pass_early(self):
+        """Finish a successful partial traversal after its last forward hook.
+
+        Indices belong to this offloaded subset, not the transformer's blocks.
+        Block zero may be resident, so an already idle traversal is valid too.
+        Keep admitted weight caches and live reader pools for the next step.
+        """
+        if self.closed:
+            raise RuntimeError('Cannot finish a closed offloader')
+        # _stage may still be submitting copies or filling an admitted cache.
+        # Join producers before waiting on the final events they recorded.
+        for future in self.pending.values():
+            future.result()
+        for read in self.host_pending.values():
+            if not read.future.cancel():
+                read.future.result()
+        # A skipped prefetch has copy_done but no new compute_done. Likewise,
+        # the first block's compute may still read its slot after Python returns.
+        # Never reset/reuse either plane until both operations have completed.
+        for slot in [*self.slots, *self.cached.values(), *self.host_slots]:
+            for event in (slot.copy_done, slot.compute_done):
+                if event is not None:
+                    event.synchronize()
+        if self.read_ahead is not None:
+            self.read_ahead.end_pass_early()
+        self.pending.clear()
+        self.host_pending.clear()
+        self.host_cursor = 0
+        self.expected = 0
 
     def cache_between_steps(self, max_bytes, *, max_layers=None, allow_growth=True):
         """Retain affordable device planes until this sampling pass closes.

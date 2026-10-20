@@ -5,6 +5,57 @@ from .continuation import (INVALID_FILE, INVALID_FRAMES, LEAD_IN_SAMPLES,
                            LEAD_IN_FADE, LEAD_IN_RATE)
 
 
+_EMPTY_TEXT = frozenset(('none', 'null', 'undefined', 'nan'))
+
+
+def optional_text(value, default=''):
+    """Return an optional text input, or default when it was not given.
+
+    A missing optional widget can arrive as None, a blank string or the word a
+    script or an older workflow wrote for "nothing" ("None", "null",
+    "undefined", "NaN"). Other values are returned unchanged for the caller's
+    own checks, so a real value is never reinterpreted.
+    """
+    if value is None or isinstance(value, str) and (
+            not value.strip() or value.strip().lower() in _EMPTY_TEXT):
+        return default
+    return value
+
+
+def node_frames(value):
+    """The node's Total frames, or 0 (follow Duration) for anything that is not a count the model makes.
+
+    Workflows saved by earlier versions and restored tabs can leave '', None, a word or another
+    widget's number in this optional input. Such a value is not a request for that length, so it
+    is read as "not given" instead of refusing the whole request.
+    """
+    if isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            return 0
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if type(value) is not int or value < 39 or (value - 5) % 17:
+        return 0
+    return value
+
+
+def part_steps(base_steps, refine_steps, step_cache):
+    """(base_steps, refine_steps, step_cache, note) for a continued part or any part of a video made in parts.
+
+    The engine continues a video only in two passes, and two passes run only with 8 first-pass steps
+    (two_pass.TWO_PASS_BASE_STEPS). Other steps would let the first part finish and refuse the next,
+    so every part samples 8 + 3, the same for the whole film. note is None when nothing changed.
+    """
+    from .two_pass import TWO_PASS_BASE_STEPS
+    if base_steps == TWO_PASS_BASE_STEPS:
+        return base_steps, refine_steps, step_cache, None
+    return (TWO_PASS_BASE_STEPS, 3, 'none',
+            'Parts of a long video and continued parts use %d + 3 steps with "Two-pass acceleration". '
+            '%d first-pass steps apply only to a single video.' % (TWO_PASS_BASE_STEPS, base_steps))
+
+
 def request_frames(value):
     """Translate the node's duration sentinel into the bridge's optional count."""
     if type(value) is not int or value != 0 and (value < 39 or (value - 5) % 17):
@@ -49,6 +100,7 @@ def resolve_continue_from(value, output_directory, input_directory):
 
 def request_options(continue_from='', frames=0):
     count = request_frames(frames)
+    continue_from = optional_text(continue_from)
     if not isinstance(continue_from, str):
         raise ValueError(INVALID_FILE)
     previous = None

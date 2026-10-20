@@ -38,6 +38,16 @@ class Int8Linear(nn.Module):
         bias = source.bias
         self.register_buffer('bias', None if bias is None else bias.detach().to(device))
 
+    def offload(self):
+        """Keep the int8 rows in (pinned, when possible) host memory; a Streamer lends them to the GPU."""
+        host = self.weight_int8.cpu()
+        try:
+            host = host.pin_memory()
+        except RuntimeError:
+            pass  # Pageable memory copies slower but works.
+        self.host = host
+        self.weight_int8 = None
+
     def forward(self, x):
         shape = x.shape
         rows = x.reshape(-1, self.in_features)
@@ -121,3 +131,87 @@ def install(layer, device):
         source = getattr(parent, name)
         setattr(parent, name, Int8Linear(source, device))
         del source
+
+
+def layer_bytes(stored):
+    """{layer index: GPU bytes of its int8 projections and their scales}."""
+    import re
+    projection = re.compile(r'model\.language_model\.layers\.(\d+)\.(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)\.weight$')
+    rows = {}
+    for name, row in stored.items():
+        match = projection.match(name)
+        if match:
+            index = int(match.group(1))
+            rows[index] = rows.get(index, 0) + row['bytes'] // 2 + 4 * row['shape'][0]
+    return rows
+
+
+PREFETCH = 2  # Layers copied ahead of the one running.
+
+
+def resident_layers(weights, stored, room):
+    """How many leading layers stay on the GPU as int8 when the rest are streamed
+    from host memory one layer at a time; None when even the fixed part and the
+    staging buffers do not fit `room`. Returns (layers, host_bytes)."""
+    sizes = layer_bytes(stored)
+    count = len(sizes)
+    if not count:
+        return None
+    projections = sum(row['bytes'] for name, row in stored.items() if name.startswith('model.language_model.layers.')
+                      and name.endswith('_proj.weight'))
+    fixed = weights - projections
+    largest = max(sizes.values())
+    free = room - fixed - (PREFETCH + 1) * largest
+    kept, used = 0, 0
+    while kept < count and used + sizes[kept] <= free:
+        used += sizes[kept]
+        kept += 1
+    if free < 0:
+        return None
+    return kept, sum(sizes[i] for i in range(kept, count))
+
+
+class Streamer:
+    """Lends host-held int8 rows to the GPU one layer ahead of use.
+
+    The copies run on their own stream into pinned memory; a layer's
+    forward waits only for its own copy and drops the GPU rows afterwards.
+    """
+
+    def __init__(self, torch, layers):
+        self.torch = torch
+        self.layers = layers
+        self.linears = [[getattr(parent, name) for parent, name in projections(layer)] for layer in layers]
+        self.stream = torch.cuda.Stream()
+        self.pending = {}
+        for position, layer in enumerate(layers):
+            layer.register_forward_pre_hook(lambda module, args, kwargs, p=position: self.before(p), with_kwargs=True)
+            layer.register_forward_hook(lambda module, args, output, p=position: self.after(p))
+
+    def fetch(self, position):
+        if position in self.pending:
+            return
+        torch = self.torch
+        with torch.cuda.stream(self.stream):
+            tensors = [linear.host.to('cuda', non_blocking=True) for linear in self.linears[position]]
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        self.pending[position] = (event, tensors)
+
+    def before(self, position):
+        torch = self.torch
+        self.fetch(position)
+        event, tensors = self.pending.pop(position)
+        current = torch.cuda.current_stream()
+        current.wait_event(event)
+        for linear, tensor in zip(self.linears[position], tensors):
+            tensor.record_stream(current)
+            linear.weight_int8 = tensor
+        count = len(self.layers)
+        for ahead in range(1, PREFETCH + 1):
+            self.fetch((position + ahead) % count)  # The next token starts at the first streamed layer.
+        return None
+
+    def after(self, position):
+        for linear in self.linears[position]:
+            linear.weight_int8 = None

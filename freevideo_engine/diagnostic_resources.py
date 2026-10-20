@@ -47,6 +47,21 @@ ENCODER_DTYPES = ('uint8', 'int8', 'int16', 'int32', 'int64', 'float16', 'bfloat
 TENSOR_VARIABLES = ('input', 'output', 'x', 'q', 'scale', 'indices', 'qdata', 'weight', 'mat1', 'mat2')
 
 
+def commit_exhausted(error):
+    """Windows error 1455 anywhere in the chain: the system commit limit is spent.
+
+    Rust-backed file readers raise a plain OSError carrying only the localized
+    system message plus "(os error 1455)", so the numeric attributes are unset.
+    """
+    seen = set()
+    while isinstance(error, BaseException) and id(error) not in seen:
+        seen.add(id(error))
+        if getattr(error, 'winerror', None) == 1455 or re.search(r'(?:os error|winerror)\s*1455\b', str(error), re.I):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def error_details(error):
     """Extract fixed classifications and numbers, never the exception message.
 
@@ -59,7 +74,7 @@ def error_details(error):
         result.update(category='cuda_out_of_memory', error_code=2)
     elif 'CUDA out of memory' in message:
         result['category'] = 'torch_allocator_out_of_memory'
-    elif isinstance(error, MemoryError) or getattr(error, 'winerror', None) == 1455:
+    elif isinstance(error, MemoryError) or commit_exhausted(error):
         result['category'] = 'host_memory_allocation'
     elif 'CUDA error:' in message:
         result['category'] = 'cuda_error'
@@ -228,7 +243,7 @@ def decoder_measurements(value):
     result = numbers(value, ('vae_load_seconds', 'video_decode_seconds',
         'audio_load_decode_seconds', 'video_postprocess_seconds', 'encode_seconds',
         'decoded_artifact_save_seconds', 'decode_save_seconds', 'vae_resident_blocks',
-        'vae_pinned_weight_bytes'))
+        'vae_pinned_weight_bytes', 'audio_rms', 'audio_peak', 'audio_samples'))
     for key in ('vae_linear_compute_cache', 'resident_vae_cache_hit', 'resident_audio_vae_cache_hit',
                 'streamed_video_output', 'streamed_vae_weights'):
         if type(value.get(key)) is bool:
@@ -325,6 +340,49 @@ def encoder_discard(value):
              for row in (mapping(raw),) if row.get('action') == 'evict' and row.get('role') == 'encoder'
              and type(row.get('encoder_discarded_without_cpu_copy')) is bool]
     return {'encoder_discarded_without_cpu_copy': all(modes)} if modes else {}
+
+
+ROOM_READINGS = ('cuda_free_bytes', 'local_budget_bytes', 'local_usage_bytes', 'process_budget_bytes',
+                 'allocated_bytes', 'reserved_bytes')
+RESIDENT_ACTIONS = ('admit', 'reuse', 'evict', 'park', 'unpark', 'keep_declined')
+RESIDENT_ROLES = ('encoder', 'engine', 'video_vae', 'audio_vae', 'input_video_vae', 'input_audio_vae', 'latent_upscaler')
+RESIDENT_BYTES = ('gpu_bytes', 'estimated_peak_bytes', 'released_gpu_bytes', 'parked_bytes', 'moved_bytes',
+                  'device_ceiling_bytes')
+
+
+def room_readings(value):
+    value = mapping(value)
+    result = numbers(value, ROOM_READINGS)
+    if value.get('bound') in ('cuda_free', 'local_budget', 'process_budget'):
+        result['bound'] = value['bound']
+    return result
+
+
+def encoder_workspace(value):
+    """Text-encode room before and after making space: each reading and the bound that decided."""
+    rows = []
+    for raw in sequence(value)[:6]:
+        raw = mapping(raw)
+        row = numbers(raw, ('whole_need_bytes', 'blocks_need_bytes', 'capacity_bytes', 'need_bytes',
+                            'room_before_bytes', 'room_after_bytes', 'loaded_before_bytes', 'loaded_after_bytes',
+                            'unloaded_bytes'))
+        if raw.get('mode') in ('whole', 'blocks'):
+            row['mode'] = raw['mode']
+        for key in ('readings', 'readings_after'):
+            if isinstance(raw.get(key), dict):
+                row[key] = room_readings(raw[key])
+        rows.append(row)
+    return rows
+
+
+def resident_decisions(value):
+    """Which models were resident, admitted, kept or released around this request."""
+    rows = []
+    for raw in sequence(value)[-24:]:
+        raw = mapping(raw)
+        if raw.get('action') in RESIDENT_ACTIONS and raw.get('role') in RESIDENT_ROLES:
+            rows.append(dict(numbers(raw, RESIDENT_BYTES), action=raw['action'], role=raw['role']))
+    return rows
 
 
 def sampling_checkpoint(value):
@@ -466,7 +524,8 @@ WINDOWS_BUDGET = ('peak_usage_bytes', 'minimum_budget_bytes', 'maximum_budget_by
                  'first_budget_bytes', 'last_budget_bytes', 'budget_changes', 'over_budget_samples', 'samples')
 # Whole-device NVML samples inside one sampling step (monitoring.step_activity).
 STEP_ACTIVITY = ('samples', 'busy_samples', 'gpu_util_mean_percent', 'sm_clock_mean_mhz', 'power_mean_mw',
-                 'device_used_peak_bytes', 'device_used_minimum_bytes', 'device_total_bytes')
+                 'device_used_peak_bytes', 'device_used_minimum_bytes', 'device_total_bytes',
+                 'other_programs_checks', 'other_programs_percent_mean', 'other_programs_percent_peak')
 
 
 def dynamic_budget(value):
@@ -611,6 +670,15 @@ def sampling_passes(value):
         preparation = mapping(row.get('refinement_schedule_preparation'))
         if preparation.get('schedule') == 'community-sigma3-v1':
             item['schedule_cache'] = numbers(preparation, ('seconds', 'table_cache_hits'))
+        pressure = mapping(row.get('step_pressure'))
+        if pressure:
+            item['step_pressure'] = dict(numbers(pressure, ('planned_head_chunk', 'head_chunk_at_end', 'polls', 'unread',
+                'over_polls', 'held_up_layers', 'wide_peak_reserved_bytes')),
+                narrowed_at_end=pressure.get('narrowed_at_end') is True,
+                actions=[dict(action=row['action'], **numbers(row, ('step', 'layer', 'budget_bytes', 'usage_bytes',
+                    'freed_bytes', 'head_chunk_from', 'head_chunk_to', 'layer_seconds')))
+                    for row in map(mapping, sequence(pressure.get('actions'))[:32])
+                    if row.get('action') in ('release_idle', 'narrow', 'restore', 'nothing_left')])
         item['step_seconds'] = [duration for duration in sequence(row.get('step_seconds'))[:32]
                                 if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0]
         if row.get('device_backend') == 'mps':
@@ -656,6 +724,11 @@ def failure(value):
     if isinstance(value.get('memory_collection_error'), list):
         result['memory_collection_error'] = [trace(row) for row in value['memory_collection_error'][:4]]
     result['allocation'] = numbers(value.get('allocation'), ('fp8_ff_activation_stash_bytes',))
+    from .exit_diagnostics import clean_reading, clean_sample
+    if isinstance(value.get('worker_exit'), dict):
+        result['worker_exit'] = clean_reading(value['worker_exit'])
+    if isinstance(value.get('memory_at_start'), dict):
+        result['memory_at_start'] = clean_sample(value['memory_at_start'])
     if value.get('kind') in ('gpu_oom', 'ram_pressure', 'cuda_error', 'timeout', 'cancelled',
                             'code_error', 'unknown_worker_exit', 'worker_stop_unconfirmed'):
         result['kind'] = value['kind']

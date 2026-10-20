@@ -251,6 +251,24 @@ class LayerReadAhead:
             self.cursor = 0
         self._fill()
 
+    def end_pass_early(self):
+        """Cancel the unread window and rewind without reading the skipped layers."""
+        self.stop.set()
+        for _, future in self.pending.values():
+            future.cancel()
+        for _, future in self.pending.values():
+            if not future.cancelled():
+                try:
+                    future.result()
+                except Exception as error:
+                    self.failed = self.failed or type(error).__name__ + ': ' + str(error)
+        self.pending.clear()
+        self.pending_bytes = 0
+        self.cursor = 0
+        if not self.failed and not self.closed:
+            self.stop.clear()
+        # before() will refill on demand; cached steps need no speculative I/O.
+
     def stats(self):
         with self.lock:
             return dict(self.counters, enabled=True, failure=self.failed,

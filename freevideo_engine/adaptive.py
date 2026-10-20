@@ -36,6 +36,11 @@ def cuda_runtime_error(error):
     return False
 
 
+def commit_exhausted(error):
+    from .diagnostic_resources import commit_exhausted as found
+    return found(error)
+
+
 def classify_failure(error, metrics=None):
     """Only positively identified resource failures are retriable.
 
@@ -63,7 +68,7 @@ def classify_failure(error, metrics=None):
         kind, outcome, retry = 'timeout', 'cancelled', False
     elif details.get('kind') == 'gpu_oom' or 'cuda out of memory' in text or 'cuda error: out of memory' in text:
         kind, outcome, retry = 'gpu_oom', 'resource_failure', True
-    elif isinstance(error, MemoryError) or details.get('kind') == 'ram_pressure':
+    elif isinstance(error, MemoryError) or details.get('kind') == 'ram_pressure' or commit_exhausted(error):
         kind, outcome, retry = 'ram_pressure', 'resource_failure', True
     elif isinstance(error, WorkerExit) and not (metrics or {}).get('error'):
         kind, outcome, retry = 'unknown_worker_exit', 'discarded', False
@@ -96,6 +101,13 @@ def classify_failure(error, metrics=None):
         result['ram_guard'] = {key: telemetry['ram_guard'].get(key) for key in
             ('reasons', 'working_bytes', 'budget_bytes', 'available_bytes', 'emergency_floor_bytes',
              'physical_available_bytes', 'commit_available_bytes') if key in telemetry['ram_guard']}
+    if isinstance(error, WorkerExit) and isinstance(telemetry, dict):
+        # The worker is gone; these are the controller's readings at its start and at its exit.
+        from .exit_diagnostics import clean_reading, clean_sample
+        if isinstance(telemetry.get('worker_exit'), dict):
+            result['worker_exit'] = clean_reading(telemetry['worker_exit'])
+        if isinstance(telemetry.get('memory_at_start'), dict):
+            result['memory_at_start'] = clean_sample(telemetry['memory_at_start'])
     if cleanup:
         result['cleanup_evidence'] = [str(item) for item in cleanup]
     if getattr(error, 'worker_stop_confirmed', None) is False:
@@ -434,7 +446,12 @@ def next_placement(profile, failure, phase, canvas=None, *, previous_ram_retries
     host_pins = failure['kind'] == 'gpu_oom' and nonlocal_exhausted(failure)
     compute = None
     if failure['kind'] == 'gpu_oom':
-        if host_pins and phase in ('load', 'sample') and (engine.get('pin_host_gb', 0.) > 0 or engine.get('pin_host_weights')):
+        if phase == 'sample' and engine.get('step_cache') == 'fbcache' and not host_pins:
+            # Its two packed residuals are the newest GPU allocation in the
+            # pass; sample every step in full before moving any weights.
+            changes['engine.step_cache'] = {'from': 'fbcache', 'to': None}
+            del engine['step_cache']
+        elif host_pins and phase in ('load', 'sample') and (engine.get('pin_host_gb', 0.) > 0 or engine.get('pin_host_weights')):
             # Page-locked memory ran out, not VRAM: return pinned weights and
             # keep every GPU setting. Halve once, then pin nothing.
             change('engine', 'pin_host_gb', 0. if previous_gpu_retries else round(engine.get('pin_host_gb', 0.) / 2, 3))
@@ -660,11 +677,13 @@ def complete_observation(metrics, canvas, output, artifacts, telemetry):
     from .validation import _retained_array_header, finite_number
     expected = canvas['frames']
     continuation = metrics.get('continuation')
-    output_frames = expected
+    from .continuation import validate_hide_tail
+    hidden = validate_hide_tail(metrics.get('hide_tail_frames', 0))
+    output_frames = expected - hidden
     if continuation is not None:
         from .continuation import OVERLAP_FRAMES
         if (not isinstance(continuation, dict) or continuation.get('overlap_frames') != OVERLAP_FRAMES
-                or continuation.get('new_frames') != expected - OVERLAP_FRAMES):
+                or continuation.get('new_frames') != expected - hidden - OVERLAP_FRAMES):
             raise ValueError('Invalid continuation output geometry')
         output_frames = continuation['new_frames']
     preview = metrics.get('preview') is True

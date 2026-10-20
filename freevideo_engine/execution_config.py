@@ -18,7 +18,7 @@ ENGINE_DEFAULTS = MappingProxyType({
     'window_batch': 1, 'linear_compute': 'native-fp8', 'fp8_gemm': 'auto',
     'window_varlen': False, 'varlen_smooth_k': True, 'task': 't2va',
     'stream_weights': False, 'head_parallelism': 1, 'residual_offload': False,
-    'adaln_task': None,
+    'adaln_task': None, 'step_cache': None,
 })
 DECODER_DEFAULTS = MappingProxyType({
     'offload': False, 'prefetch': True, 'tile_group': False,

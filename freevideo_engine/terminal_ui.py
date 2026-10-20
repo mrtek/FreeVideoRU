@@ -322,11 +322,31 @@ class LogProgress:
     def __init__(self, path):
         self.path, self.offset, self.pending = Path(path), 0, ''
         self.packages = {}
+        self.downloaded_packages = set()
         self.installing_packages = False
         self.model_source = ''
         self.model_backend = ''
         self.parallel_tasks = {}
         self.model_groups = None
+        # Ninja runs several times during one build, each with its own count.
+        self.compile_last, self.compile_runs = (0, 0), 0
+
+    COMPILE_LINE = 'Compile acceleration for your GPU · the first build takes longer'
+
+    def compile_fraction(self):
+        """How far the compile has advanced, never reaching 1; None before any step.
+
+        The number of runs is unknown until the build ends, so a finished run
+        cannot mean "done": each run advances the share of the range still left
+        by half, in proportion to its own counter. A first run of two steps
+        followed by one of a hundred keeps moving instead of stopping at the
+        end of the first.
+        """
+        done, total = self.compile_last
+        if total <= 0:
+            return None
+        inside = min(1., max(0., done / total))
+        return 1 - .5 ** self.compile_runs + .5 ** (self.compile_runs + 1) * inside
 
     def take_tasks(self):
         tasks, self.parallel_tasks = self.parallel_tasks, {}
@@ -382,23 +402,59 @@ class LogProgress:
                 self.packages[name] = float(size) * {'KiB': 2**10, 'MiB': 2**20, 'GiB': 2**30}[unit]
                 amount = sum(self.packages.values()) / 2**30
                 size_text = '%.1f GiB' % amount if amount >= 1 else '%.0f MiB' % (amount * 1024)
-                update(done=0, total=0, scope='package-download', activity='note', name='Downloading runtime packages',
+                update(done=len(self.downloaded_packages), total=len(self.packages), unit='items',
+                       scope='package-download', activity='count', name='Downloading runtime packages',
                               detail='Downloading packages · about %s across %d files' % (size_text, len(self.packages)))
+            elif re.fullmatch(r'Downloaded [\w.+-]+', text):
+                name = text.split(' ', 1)[1]
+                if name in self.packages:
+                    self.downloaded_packages.add(name)
+                    update(done=len(self.downloaded_packages), total=len(self.packages), unit='items',
+                           scope='package-download', activity='count', name='Downloading runtime packages',
+                           detail='Downloading runtime packages')
             elif re.match(r'Resolved \d+ packages? in ', text):
                 self.packages.clear()
+                self.downloaded_packages.clear()
                 self.installing_packages = False
-                update(done=0, total=0, scope='package-resolve', detail='Dependencies resolved · preparing downloads')
+                update(done=0, total=0, scope='package-resolve', activity='note', name='Packages resolving',
+                       detail='Dependencies resolved · preparing downloads')
             elif re.match(r'Prepared \d+ packages? in ', text):
                 self.installing_packages = True
-                update(done=0, total=0, scope='package-install', detail='Downloads ready · installing packages')
+                update(done=0, total=0, scope='package-install', activity='note', name='Packages installing',
+                       detail='Downloads ready · installing packages')
             elif re.match(r'Installed \d+ packages? in ', text):
-                update(done=0, total=0, scope='package-finish', detail='Packages installed · finishing checks')
+                update(done=0, total=0, scope='package-finish', activity='note', name='Packages ready',
+                       detail='Packages installed · finishing checks')
+            elif re.match(r'Uninstalled \d+ packages? in ', text):
+                update(done=0, total=0, scope='package-remove', activity='note', name='Packages installing',
+                       detail='Packages installing')
+            elif text.startswith('Creating virtual environment'):
+                update(done=0, total=0, scope='venv-create', activity='note', name='Environment creating', detail='Environment creating')
+            elif text.startswith('Installing seed packages'):
+                update(done=0, total=0, scope='venv-seed', activity='note', name='Base packages installing', detail='Base packages installing')
+            elif text.startswith('Installed Python '):
+                update(done=0, total=0, scope='python-ready', activity='note', name='Python ready', detail='Python ready')
             match = re.search(r'\[(\d+)/(\d+)\]', line)
             if match:
                 self.installing_packages |= 'Installing wheels' in text
-                update(done=int(match[1]), total=int(match[2]),
-                              detail='Installing packages' if self.installing_packages else 'Compiling CUDA kernels',
-                              scope='package-install' if self.installing_packages else 'compile', unit='items')
+                package_phase = ('remove', 'Packages removing') if 'Uninstalling' in text else (
+                    ('prepare', 'Packages preparing') if 'Preparing packages' in text else (
+                    ('install', 'Packages installing') if self.installing_packages else ('compile', 'GPU acceleration building')))
+                if package_phase[0] == 'compile':
+                    done, total = int(match[1]), int(match[2])
+                    if total != self.compile_last[1] or done < self.compile_last[0]:
+                        self.compile_runs += self.compile_last[1] > 0
+                    self.compile_last = (done, total)
+                if package_phase[0] == 'compile':
+                    # The runs have different sizes and their number is unknown, so a count
+                    # would grow in jumps; the line keeps the step's own sentence, which says
+                    # the wait is expected, and the bar keeps the progress.
+                    update(done=0, total=0, activity='note', name=self.COMPILE_LINE,
+                           detail='Compiling CUDA kernels', scope='package-compile', unit='items')
+                else:
+                    update(done=int(match[1]), total=int(match[2]), activity='count', name=package_phase[1],
+                           detail='Installing packages' if self.installing_packages else 'Compiling CUDA kernels',
+                           scope='package-' + package_phase[0], unit='items')
             try:
                 event = json.loads(line)
             except (ValueError, TypeError):
@@ -406,7 +462,23 @@ class LogProgress:
             if not isinstance(event, dict):
                 continue
             kind = event.get('event')
-            if kind == 'model_groups':
+            if kind == 'installation_step':
+                update(done=event.get('done', 0), total=event.get('total', 0), unit='items',
+                       activity='count' if event.get('total') else 'note', name=event['name'],
+                       detail=event['name'], scope='install-' + event['name'])
+            elif kind == 'freevideo_ui' and event.get('kind') in ('task', 'progress'):
+                # A nested Comfy environment has its own phases. Forward work,
+                # never its percentage into the outer installation's one bar.
+                update(done=event.get('done', 0), total=event.get('total', 0), unit=event.get('unit'),
+                       activity=event.get('activity') or 'note', name=event.get('name') or event.get('label', ''),
+                       detail=event.get('detail', ''), scope='comfy-' + str(event.get('key', '')))
+            elif kind in ('verify_progress', 'assemble_progress') or (kind == 'network' and event.get('action') == 'verify-progress'):
+                update(done=event['done_bytes'], total=event['total_bytes'], unit='bytes',
+                       activity='assemble' if kind == 'assemble_progress' else 'verify',
+                       name=event.get('name') or model_download_name(event['file']).split(' · ')[0],
+                       detail='Model files verifying' if kind != 'assemble_progress' else 'Model files assembling',
+                       scope=kind + '-' + event['file'])
+            elif kind == 'model_groups':
                 self.model_groups = event['groups']
                 continue
             if kind in ('loaded', 'sampling_start', 'sampling_progress', 'step', 'sample_finalize'):
@@ -441,9 +513,11 @@ class LogProgress:
             elif kind == 'prepare_fp8_phase':
                 work = 'Verify cached weights' if event['phase'] == 'verify_cache' else 'Read and convert source weights'
                 update(done=max(0, event['index'] - 1), total=event['total'],
+                              activity='count', name='Model files verifying' if event['phase'] == 'verify_cache' else 'Model files preparing',
                               detail=work + ' · ' + event['group'], scope='prepare-fp8-' + event['phase'], unit='items')
             elif kind == 'prepared_fp8_group':
                 update(done=event.get('index', 0), total=event.get('total', 0),
+                              activity='count', name='Model files preparing',
                               detail=('Reuse verified FP8 ' if event.get('reused') else 'Prepare FP8 ') + event['group'], scope='prepare-fp8', unit='items')
             elif kind == 'storage_compacted':
                 update(done=0, total=0, activity='', name='',
@@ -513,7 +587,7 @@ class LogProgress:
                 state = event.get('state', 'running')
                 active = state == 'running'
                 self.parallel_tasks['verify-models'] = dict(label='Verify / reuse local models', state=state,
-                    activity='check' if active else '',
+                    activity='verify' if active else '',
                     name=(event.get('name') or model_download_name(event.get('file', '')).split(' · ')[0]) if active else '',
                     done=event.get('done_bytes', 0) if active else event.get('files_done', 0),
                     total=event.get('total_bytes', 0) if active else event.get('files_total', 0),
@@ -540,7 +614,7 @@ class LogProgress:
                 speed = event.get('network_bytes_per_second')
                 shown_speed = speed if speed is not None else event['bytes_per_second']
                 update(done=done, total=total, scope=description + self.model_source, rate=event['bytes_per_second'], unit='bytes',
-                    activity='download', name=event.get('name') or ('PyTorch' if description == 'torch'
+                    activity='download', name=event.get('name') or ('Python' if description.startswith('cpython-') else 'Runtime components' if description == 'torch' or event.get('counter_source') == 'uv-terminal'
                         else model_download_name(description).split(' · ')[0]),
                     detail='%s%s%.1f MiB/s · %.1f / %.1f MiB · %s' %
                     (source + ' · ' if source else '',

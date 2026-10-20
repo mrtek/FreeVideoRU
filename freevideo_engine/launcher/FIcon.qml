@@ -19,6 +19,7 @@ Canvas {
         else if (kind === "text") { c.moveTo(5,5); c.lineTo(19,5); c.moveTo(12,5); c.lineTo(12,20); c.moveTo(8,20); c.lineTo(16,20) }
         else if (kind === "disk") { c.rect(3,7,18,10); c.moveTo(3,13); c.lineTo(21,13); c.moveTo(16.5,15.2); c.lineTo(17.5,15.2) }
         else if (kind === "decoder") { c.rect(3,5,18,14); c.moveTo(8,9); c.lineTo(5,12); c.lineTo(8,15); c.moveTo(16,9); c.lineTo(19,12); c.lineTo(16,15) }
+        else if (kind === "eye" || kind === "eyeoff") { c.moveTo(2,12); c.quadraticCurveTo(12,3,22,12); c.quadraticCurveTo(12,21,2,12); c.moveTo(15,12); c.arc(12,12,3,0,Math.PI*2); if (kind === "eyeoff") { c.moveTo(4,4); c.lineTo(20,20) } }
         else { c.rect(3,4,18,16); c.moveTo(9,8); c.lineTo(16,12); c.lineTo(9,16); c.closePath() }
         c.stroke()
     }

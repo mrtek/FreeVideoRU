@@ -22,8 +22,10 @@ import time
 import uuid
 
 from . import drama, production, schema, spec, errors, operation_receipts
-from .jobs import DONE, JobError, iso
+from .jobs import DONE, JobError, iso, parts_problems
 from .forecast import generation_estimate
+
+SHEET_LEAST, SHEET_MOST = 6, 24  # frames per take when the caller gives no count: one per second
 
 MAX_GENERATION = 4  # Generations are zero-based: original 0, reshoots 1 through 4.
 MAX_CHILDREN = 60   # Includes assembly, rejected submissions and resumed attempts.
@@ -63,6 +65,11 @@ def _rows(error):
     return rows
 
 
+def pictures_each(resolved):
+    """Pictures per person a shot used; None when no card was carried."""
+    return resolved['pictures_each'] if resolved['people'] else None
+
+
 class MaterialRejected(JobError):
     """External callers named material the content-only boundary does not admit: the job validation error."""
     status = 422
@@ -84,8 +91,12 @@ class ProductionFailure(JobError):
         super().__init__(error.code, error.message)
         self.status = errors.PRODUCTION_STATUS.get(error.code, errors.ERRORS[error.code][0])
         message = production._public(error.message) if isinstance(error.message, str) else ''
-        self.error = errors.build(error.code, validation=True, message=message[:300],
-            details=_rows(error), next_action=(FILM_STOPPED_NEXT if error.code == 'stopped_by_user' else error.next))
+        rows = _rows(error)
+        if error.code == 'invalid_screenplay' and rows and all('field' in row for row in rows):
+            # Like a request validation error: every problem with its field, as the tool text shows only this.
+            message = '; '.join(row['message'] for row in rows)[:2000]
+        self.error = errors.build(error.code, validation=True, message=message[:2000],
+            details=rows, next_action=(FILM_STOPPED_NEXT if error.code == 'stopped_by_user' else error.next))
         if error.code == 'not_ready':
             self.error['retryable'] = False
 
@@ -134,7 +145,22 @@ def _safe_error(error):
     rows = [_safe_row(row) for row in details] if isinstance(details, list) and details else []
     if rows and all(rows):
         result.update(details=rows, message='; '.join(row['message'] for row in rows))
-    return result
+    return dict(result, error_zh=errors.failure_reason(error))
+
+
+def failure(view):
+    """The current failure, excluding old takes superseded by a usable take."""
+    if view.get('stalled'):
+        return view['stalled'], None
+    join = view.get('join') or {}
+    if join.get('state') in ('failed', 'interrupted') and join.get('error'):
+        return join['error'], join.get('task')
+    for shot in view.get('shots', []):
+        if shot['state'] == 'failed':
+            take = next((t for t in reversed(shot['takes']) if t.get('error') and not t['stale']), {})
+            if take:
+                return take['error'], take.get('task')
+    return None, None
 
 
 class Productions:
@@ -162,10 +188,8 @@ class Productions:
                     raise ValueError('Invalid execution receipts')
                 record['receipts'] = operation_receipts.load(record['receipts'])
                 json.dumps(record, allow_nan=False)
-                checked = production.plan(dict(screenplay=state['screenplay'],
-                    takes_per_shot=state['takes_per_shot'], director=state['director']))
-                if [s['id'] for s in state['shots']] != [s['id'] for s in checked['preview']['shots']]:
-                    raise ValueError('Invalid shot receipts')
+                request = dict(screenplay=state['screenplay'],
+                    takes_per_shot=state['takes_per_shot'], director=state['director'])
                 for ref, child in record['children'].items():
                     schema.validate(schema.REF, ref)
                     if child['status'] not in DONE:
@@ -174,10 +198,15 @@ class Productions:
                     raise ValueError('Invalid submission marker')
                 production.view(state)
                 try:
+                    checked = production.plan(request, fields=False)
+                    if [s['id'] for s in state['shots']] != [s['id'] for s in checked['preview']['shots']]:
+                        raise JobError('internal_error', 'Saved shots differ from the current plan')
                     production.advance(deepcopy(state), deepcopy(record['children']), now=state['updated_at'])
-                except production.ProductionError as error:
+                except (production.ProductionError, JobError) as error:
                     # A readable record that cannot advance yet is kept, never renamed away.
                     record['stalled'] = self._stalled(error)
+                    logging.getLogger(__name__).warning('Kept a readable production receipt stalled (%s)',
+                                                        record['stalled']['code'])
                 self.records[state['id']] = record
             except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError, OSError):
                 path.replace(path.with_name(path.name + '.bad-' + uuid.uuid4().hex))
@@ -185,7 +214,7 @@ class Productions:
 
     def _stalled(self, error):
         code = error.code if isinstance(getattr(error, 'code', None), str) and error.code in errors.ERRORS else 'internal_error'
-        return dict(code=code, message=errors.ERRORS[code][2], at=iso(self.jobs.clock()))
+        return errors.with_reason(dict(code=code, message=errors.ERRORS[code][2], at=iso(self.jobs.clock())))
 
     def _save(self, record):
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -306,6 +335,16 @@ class Productions:
                     problems.append(dict(row, path=new, field=prefix + row.get('field', old),
                         message=row['message'].replace(old, new, 1), next=row['next'].replace(old, new, 1)))
                 continue
+            if continued or shot['continues']:
+                # The same length rule as at submission, with this computer's single-run limit rather than the
+                # 15 s default: a shot that cannot be cut into parts of at least 10 s is refused here instead of
+                # starting a film in which that shot never gets a job. A shot not yet submitted carries no parent.
+                try:
+                    pinned = spec.normalize(dict(item, continue_from=dict(from_job=placeholder)), port=self.jobs.port)
+                except spec.SpecError:
+                    pinned = None  # Its other problems are reported where they are found.
+                if pinned is not None:
+                    problems.extend(parts_problems(pinned, None, prefix))
             for dependency in normalized['depends_on']:
                 if not (continued and dependency == placeholder) and dependency not in self.jobs.jobs:
                     problems.append(schema.diagnostic(prefix + '/first', 'a job that exists on this server', dependency))
@@ -324,11 +363,12 @@ class Productions:
         problems = []
         for i, (row, source, shot) in enumerate(zip(result['preview']['shots'], play['shots'], state['shots'])):
             # The same resolution a take gets when it is submitted, with the cards as they are now.
-            resolved = drama.cast_references(play, source, cards, continues=shot['continues'])
+            first = next((t for s, t in self._takes(state) if s is shot), None)
+            resolved = self._carry(play, source, cards, first and first['spec'], continues=shot['continues'])
             row['prompt'] = drama.with_cast(row['prompt'], resolved)
             row.update(cast_reference=resolved['cast_reference'], cast=resolved['people'],
                        cast_omitted=resolved['omitted'], cast_voice_omitted=resolved['voice_omitted'],
-                       cast_missing=resolved['missing'],
+                       cast_missing=resolved['missing'], cast_pictures_each=pictures_each(resolved),
                        references=len(resolved['references']))
             try:
                 spec._text(row['prompt'], '/screenplay/shots/%d/prompt' % i, 20000)
@@ -355,12 +395,11 @@ class Productions:
                 item['continue_from'] = dict(from_job='j000000000000')
             if item.get('continue_from', {}).get('ref'):
                 item['continue_from'] = dict(from_job='j000000000000')
-            resolved = drama.cast_references(state['screenplay'],
-                state['screenplay']['shots'][shot['index'] - 1], self._current(state['screenplay']),
-                continues=shot['continues'])
+            resolved = self._carry(state['screenplay'], state['screenplay']['shots'][shot['index'] - 1],
+                                   self._current(state['screenplay']), item, continues=shot['continues'])
             if resolved['references']:
                 item['media'] = dict(references=deepcopy(resolved['references']))
-            estimate, revision = generation_estimate(self.jobs.port, spec.normalize(item))
+            estimate, revision = generation_estimate(self.jobs.port, spec.normalize(item, port=self.jobs.port))
             return dict(estimate, revision=revision)
         except Exception:  # Timing is optional; a forecast failure must not reject a film or job.
             return dict(seconds=None, basis=None, reason='unavailable')
@@ -375,7 +414,7 @@ class Productions:
                 return dict(seconds=None, basis=None, reason='no_matching_estimate')
             item = deepcopy(take['spec'])
             item.pop('continue_from', None)
-            normalized = spec.normalize(item)
+            normalized = spec.normalize(item, port=self.jobs.port)
             shapes.append([normalized[k] for k in ('width', 'height', 'frames')])
         current = next((j for j in state['joins'] if j['ref'] == state['current_join']), None)
         transition = current['transition'] if current else state['screenplay'].get('transition', 'cut')
@@ -547,6 +586,8 @@ class Productions:
             if ref:
                 record['receipts'].append(dict(key=ref, digest=digest, result=result,
                                                **({'client': client} if client else {})))
+            if self.jobs.session_open is not None and record.get('session'):
+                self.jobs.session_open(record['session'])  # Deleting a conversation checks for films under this same lock.
             self._save(record)
             if cards:
                 self.jobs.cast.used(sorted(cards), identity)
@@ -567,7 +608,7 @@ class Productions:
         value = production.view(record['state'])
         tasks = record.get('tasks', {})
         def contextual(error, join=False):
-            error = deepcopy(error)
+            error = errors.with_reason(deepcopy(error))
             if error and 'next' in error:
                 action = self._context_next(record, join)
                 if action:
@@ -583,9 +624,11 @@ class Productions:
             ref = record['state']['current_join']
             join = next(j for j in record['state']['joins'] if j['ref'] == ref)
             value['join'].update(ref=ref, task=tasks.get(ref), error=contextual(join['error'], True))
-        value['stalled'] = deepcopy(record.get('stalled'))
+        value['stalled'] = errors.with_reason(deepcopy(record.get('stalled')))
         value['progress'] = self._progress(record)
         value['over_budget'] = self._elapsed_budget(value['progress'])
+        error, _ = failure(value)
+        value['error_zh'] = errors.failure_reason(error) if error else None
         return value
 
     def get(self, identity, *, since=None, wait=0, compact=True):
@@ -604,9 +647,15 @@ class Productions:
         changed = record['state']['revision'] != since
         if not changed and compact:
             progress = self._progress(record)
-            return dict(id=identity, revision=since, changed=False, status=record['state']['status'],
+            value = dict(id=identity, revision=since, changed=False, status=record['state']['status'],
                         paused=deepcopy(record['state'].get('paused')), fraction=progress['fraction'],
                         elapsed_seconds=progress['elapsed_seconds'])
+            state = record['state']
+            join = next((j for j in state['joins'] if j['ref'] == state['current_join']), None)
+            error, _ = failure(dict(stalled=record.get('stalled'), join=join, shots=state['shots']))
+            if error:
+                value['error_zh'] = errors.failure_reason(error)
+            return value
         return dict(self._view(record), changed=changed)
 
     async def get_async(self, identity, *, since=None, wait=0, compact=True):
@@ -655,7 +704,7 @@ class Productions:
                 shot = next((s for s in view['shots'] if s['chosen'] is None), view['shots'][-1])
                 result.append(dict(id=view['id'], title=view['title'], status=view['status'], revision=view['revision'],
                     shot=shot['index'], shots=len(view['shots']), next=view['todo'][0] if view['todo'] else None,
-                    paused=view['paused'], stalled=view['stalled'], session=record.get('session')))
+                    paused=view['paused'], stalled=view['stalled'], session=record.get('session'), error_zh=view['error_zh']))
             return result
 
     def _mutate(self, action, identity, *, by, ref=None, client=None, **values):
@@ -864,7 +913,8 @@ class Productions:
                     saved.update(cast=dict(resolved['cards']), cast_reference=resolved['cast_reference'],
                                  cast_omitted=list(resolved['omitted']),
                                  cast_voice_omitted=list(resolved['voice_omitted']),
-                                 cast_missing=list(resolved['missing']))
+                                 cast_missing=list(resolved['missing']),
+                                 cast_pictures_each=pictures_each(resolved))
                 self._save(marker)  # Durable before Jobs may accept it.
                 self.jobs.submit(item, client='production:' + identity, parent=dict(production=identity, ref=ref))
             except spec.SpecError as error:
@@ -887,8 +937,8 @@ class Productions:
         """Read the cast cards now, at submission: later takes and reshoots use the cards as they are then."""
         play = state['screenplay']
         shot = next(s for s in state['shots'] if any(t['job'] == take['job'] for t in s['takes']))
-        resolved = drama.cast_references(play, play['shots'][shot['index'] - 1], self._current(play),
-                                         continues=shot['continues'])
+        resolved = self._carry(play, play['shots'][shot['index'] - 1], self._current(play), item,
+                               continues=shot['continues'])
         if resolved['cast_reference'] is None:
             return resolved
         if resolved['references']:
@@ -898,6 +948,11 @@ class Productions:
                                 cast_reference=resolved['cast_reference'])
         return resolved
 
+    def _carry(self, play, shot, cards, item, *, continues):
+        """The cast a shot carries: each person's sheet and face close-up on every device (one picture a person when
+        a continuing shot has several people). Plan previews and submissions both come here, so they agree."""
+        return drama.cast_references(play, shot, cards, continues=continues)
+
     def _current(self, play):
         """Cards as they are now; a card deleted since the film started is None (the shot uses text)."""
         cast = getattr(self.jobs, 'cast', None)
@@ -905,25 +960,31 @@ class Productions:
                       if isinstance(p, dict) and isinstance(p.get('card'), str)}
         return {i: cast.snapshot(i) if cast is not None else None for i in identities}
 
-    def sheet(self, identity, shot, *, frames=6):
-        """Return bytes in process; HTTP converts these to inline image content."""
+    def sheet(self, identity, shot, *, frames=None):
+        """Return bytes in process; HTTP converts these to inline image content.
+
+        Without a count each take shows one frame per second: H3 may caption a spoken line for only a
+        second or so, which a sparser sheet steps over.
+        """
         from . import media
-        schema.validate(schema.drama_schema('sheet'), dict(frames=frames))
+        if frames is not None:
+            schema.validate(schema.drama_schema('sheet'), dict(frames=frames))
         with self.changed:
             record = self._record(identity)
             row = _domain(production._shot, record['state'], shot)
-            takes = [(t['take'], t['library_id']) for t in row['takes']
+            takes = [(t['take'], t['library_id'], t.get('seconds')) for t in row['takes']
                      if t['state'] == 'succeeded' and not t['stale']]
             parent = production._parent(record['state'], row)
             previous = parent['library_id'] if parent else None
         result = dict(takes=[], previous=None)
         self.directory.mkdir(parents=True, exist_ok=True)
         with self.jobs.cpu, tempfile.TemporaryDirectory(dir=self.directory) as folder:
-            for number, library in takes:
+            for number, library, seconds in takes:
                 if not library:
                     raise JobError('no_video', 'Take has no saved video')
                 output = Path(folder) / ('take-%d.jpg' % number)  # media never overwrites a finished file
-                media.contact_sheet(self.jobs.port.library_video(library), output, count=frames, columns=min(4, frames))
+                count = frames or min(SHEET_MOST, max(SHEET_LEAST, math.ceil(seconds or 0)))
+                media.contact_sheet(self.jobs.port.library_video(library), output, count=count, columns=min(4, count))
                 result['takes'].append(dict(take=number, image=output.read_bytes()))
             if previous:
                 output = Path(folder) / 'previous.png'

@@ -30,7 +30,7 @@ This approves FreeVideo only. It doesn't turn off Gatekeeper or change your othe
 
 ## Generation time
 
-On an M5 with 24 GB of unified memory and about 14 GB available:
+On an M5 with 24 GB of unified memory and about 14 GB available, at the Light level:
 
 | Resolution | Length | Time |
 | --- | --- | --- |

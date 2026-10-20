@@ -3,12 +3,13 @@ from copy import deepcopy
 import json
 import logging
 import math
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import random
 import threading
 import time
 import uuid
 
-from . import chain_leads
+from . import chain_leads, chain_plan
 from . import chain_store as store
 
 
@@ -24,6 +25,16 @@ class ChainTooLong(ValueError):
         super().__init__('This video can have up to %d parts. Make it shorter.' % limit)
         self.parts, self.limit = parts, limit
         self.message_zh = '这条视频最多 %d 段，请缩短一些。' % limit
+
+
+class ChainPartTooShort(ValueError):
+    """A continuing part shorter than a continued video may have."""
+    code = 'chain_part_too_short'
+
+    def __init__(self, seconds, limit):
+        super().__init__('Each continued part must be at least %d seconds. Make it longer.' % limit)
+        self.seconds, self.limit = seconds, limit
+        self.message_zh = '接着生成的每一段至少 %d 秒，请加长一些。' % limit
 
 
 def _work_key(path):
@@ -58,9 +69,11 @@ def node_prompt(prompt, node):
 
 class ChainRunner:
     def __init__(self, store_dir, host, clock=time.monotonic, wall=time.time, estimate=None, poll=0.5, inputs=None,
-                 max_parts=None):
+                 max_parts=None, min_part_frames=None, seeds=None):
         self.store_dir, self.host = store_dir, host
+        self.seeds = seeds or random.SystemRandom()
         self.max_parts = max_parts or store.MAX_PARTS
+        self.min_part_frames = chain_plan.MIN_PART_FRAMES if min_part_frames is None else min_part_frames
         self.clock, self.wall, self.estimate, self.poll = clock, wall, estimate, poll
         self.inputs = inputs or host.inputs
         self.lock = threading.RLock()
@@ -107,11 +120,60 @@ class ChainRunner:
             if isinstance(value, str):
                 source = next(row for row in record['blocks'] if row['id'] == value)
                 sources[key] = dict(block=value, output=source['output'])
+            elif isinstance(value, dict) and 'chain' in value:
+                source = self._referenced_block(value)
+                sources[key] = dict(work=source['output'], output=source['output'])
             elif value is not None:
                 sources[key] = dict(work=value['work'], output=value['work'])
             else:
                 sources[key] = None
         return sources
+
+    def _referenced_block(self, value):
+        source = self.records.get(value['chain'])
+        if source is None:
+            # A recent dependent may outlive the list's bounded startup window.
+            try:
+                self.load(value['chain'])
+            except KeyError:
+                raise ValueError('Referenced chain does not exist') from None
+            source = self.records[value['chain']]
+        block = next((row for row in source['blocks'] if row['id'] == value['block']), None)
+        if block is None:
+            raise ValueError('Referenced chain block does not exist')
+        return block
+
+    def _dependency_state(self, record):
+        waiting = False
+        for block in record['blocks']:
+            for key in ('after', 'before'):
+                value = block[key]
+                if not isinstance(value, dict) or 'chain' not in value:
+                    continue
+                try:
+                    source = self._referenced_block(value)
+                except ValueError:
+                    return 'interrupted'
+                parent = self.records[value['chain']]
+                if parent['state'] in ('cancelling', 'cancelled', 'failed', 'interrupted'):
+                    return 'interrupted'
+                if parent['state'] == 'done':
+                    if source['state'] != 'done' or not source['output']:
+                        return 'interrupted'
+                else:
+                    waiting = True
+        return 'queued' if waiting else 'ready'
+
+    def _interrupt_dependants(self):
+        # Repeat so a stopped ancestor reaches descendants in any receipt order.
+        changed = True
+        while changed:
+            changed = False
+            for waiting in list(self.records.values()):
+                if waiting['state'] == 'queued' and self._dependency_state(waiting) == 'interrupted':
+                    waiting['state'] = 'interrupted'
+                    self._save(waiting)
+                    changed = True
 
     def _elapsed(self, block):
         start = self.starts.get(block['prompt_id'])
@@ -150,12 +212,20 @@ class ChainRunner:
                     rest.append(identity)
                     continue
                 depth[identity] = 1 + sum(depth[value] if isinstance(value, str)
-                                          else self._work_parts(value['work'], seen + (record['id'],))
+                                          else self._source_parts(value, seen + (record['id'],))
                                           for value in sources)
             if len(rest) == len(pending):
                 raise ValueError('Block references cannot contain a cycle or self reference')
             pending = rest
         return depth
+
+    def _source_parts(self, value, seen):
+        if 'chain' not in value:
+            return self._work_parts(value['work'], seen)
+        self._referenced_block(value)
+        if value['chain'] in seen:
+            raise ValueError('Chain references cannot contain a cycle')
+        return self._depths(self.records[value['chain']], seen)[value['block']]
 
     def _work_parts(self, work, seen):
         key = _work_key(work)
@@ -172,9 +242,16 @@ class ChainRunner:
         return 1
 
     def create(self, payload):
+        from .lora_triggers import apply_chain_triggers
         record = store.validate(payload)
+        apply_chain_triggers(record)
         with self.lock:
             # Before anything is written or queued: a refused chain leaves every record and file as it was.
+            short = [row['inputs']['frames'] for row in record['blocks']
+                     if (row['after'] is not None or row['before'] is not None)
+                     and row['inputs']['frames'] < self.min_part_frames]
+            if short:
+                raise ChainPartTooShort(min(short) / chain_plan.FPS, chain_plan.MIN_PART_SECONDS)
             parts = max(self._depths(record).values())
             if parts > self.max_parts:
                 raise ChainTooLong(parts, self.max_parts)
@@ -191,7 +268,32 @@ class ChainRunner:
             if record['state'] in store.ACTIVE and record['state'] != 'cancelling':
                 record['state'] = 'cancelling'
                 self._save(record)
+                self._interrupt_dependants()
                 self.wake.set()
+            return self._view(record)
+
+    def set_text(self, chain_id, block_id, text):
+        """The description of a part that has not started; the user's own words, used as written."""
+        if not isinstance(text, str) or not text.strip() or len(text) > 20000:
+            raise ValueError('Text must be a nonempty string of at most 20000 characters')
+        with self.lock:
+            record = self.records[chain_id]
+            block = next((row for row in record['blocks'] if row['id'] == block_id), None)
+            if block is None:
+                raise KeyError(block_id)
+            if (record.get('split') or {}).get('state') in ('pending', 'running'):
+                raise ChainBusy('The descriptions of the parts are not written yet')
+            if block['state'] != 'pending' or block['prompt_id'] is not None:
+                raise ChainBusy('This part has already started')
+            previous = block['inputs']['text']
+            block['inputs']['text'] = text
+            try:
+                from .lora_triggers import apply_chain_triggers
+                apply_chain_triggers(record)
+            except Exception:
+                block['inputs']['text'] = previous
+                raise ValueError('Text must be at most 20000 characters with LoRA triggers') from None
+            self._save(record)
             return self._view(record)
 
     def resume(self, chain_id, client_id=None):
@@ -213,6 +315,12 @@ class ChainRunner:
                                  seconds=None, output=None, report_id=None, error=None,
                                  fraction=0., remaining_seconds=None, continuation=None,
                                  skip_frames=0, skip_audio_samples=0)
+            split = record.get('split')
+            if (split is not None and split['state'] == 'failed' and split['reason'] in ('busy', 'memory')
+                    and all(row['state'] != 'done' for row in record['blocks'])
+                    and len({row['inputs']['text'] for row in record['blocks']}) == 1):
+                # Busy and memory pass; nothing has started and no part was rewritten, so split again.
+                split.update(state='pending', reason=None)
             if client_id is not None:
                 record['client_id'] = client_id
             record['state'] = 'queued'
@@ -227,6 +335,81 @@ class ChainRunner:
             self.queue = [identity for identity in self.queue if identity != chain_id]
             self.queue.append(chain_id)
             self._save(record)
+            self.wake.set()
+            return self._view(record)
+
+    def redo(self, chain_id, block_id, text=None, client_id=None):
+        """A new chain that keeps the parts before `block_id` and makes that part and every later one
+        again with new seeds. Later parts continue the part before them, so redoing one part alone would
+        break the next seam. The original chain, its parts and its joined video stay as they are."""
+        if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > 20000):
+            raise ValueError('Text must be a nonempty string of at most 20000 characters')
+        if client_id is not None and not isinstance(client_id, str):
+            raise ValueError('Client ID must be a string')
+        from .lora_triggers import apply_chain_triggers
+        with self.lock:
+            source = self.records[chain_id]
+            start = next((row for row in source['blocks'] if row['id'] == block_id), None)
+            if start is None:
+                raise KeyError(block_id)
+            if source['state'] in store.ACTIVE or source['output_state'] == 'joining':
+                raise ChainBusy('This chain is already active')
+            kept = [row for row in source['blocks'] if row['index'] < start['index']]
+            if any(row['state'] != 'done' or not row['output'] for row in kept):
+                raise ValueError('The parts before this one are not finished')
+            names = {row['id'] for row in kept}
+            if any(isinstance(row[key], str) and row[key] not in names for row in kept for key in ('after', 'before')):
+                raise ValueError('A kept part depends on a part that is made again')
+            record = deepcopy(source)
+            identity = source['id']
+            while identity in self.records or (Path(self.store_dir) / (identity + '.json')).exists():
+                identity = 'c-' + uuid.uuid4().hex[:12]
+            for key in ('last_report_id', 'last_heartbeat_at', 'output_seams', 'join_final_state'):
+                record.pop(key, None)
+            now = self.wall()
+            record.update(id=identity, created=now, state='queued', redo_of=dict(chain=chain_id, block=block_id),
+                          output=None, output_state='pending' if record['join'] else 'none',
+                          output_error=None, output_blocks=0)
+            if client_id is not None:
+                record['client_id'] = client_id
+            if record.get('split') is not None and record['split']['state'] == 'running':
+                record['split']['state'] = 'pending'
+            for block in record['blocks'][start['index']:]:
+                seed = block['inputs']['seed']
+                while seed == block['inputs']['seed']:
+                    seed = self.seeds.randrange(2 ** 31)
+                block['inputs']['seed'] = seed
+                block.update(state='pending', prompt_id=None, attempts=0, started=None, finished=None,
+                             seconds=None, output=None, report_id=None, error=None,
+                             fraction=0., remaining_seconds=None, continuation=None,
+                             skip_frames=0, skip_audio_samples=0)
+            if text is not None:
+                # Only the new words take the LoRA triggers; the other parts keep their texts as written.
+                probe = dict(node=record['node'], snapshot=deepcopy(record['snapshot']),
+                             blocks=[dict(inputs=dict(text=text))])
+                try:
+                    apply_chain_triggers(probe)
+                except Exception:
+                    raise ValueError('Text must be at most 20000 characters with LoRA triggers') from None
+                record['blocks'][start['index']]['inputs']['text'] = probe['blocks'][0]['inputs']['text']
+            short = [row['inputs']['frames'] for row in record['blocks']
+                     if (row['after'] is not None or row['before'] is not None)
+                     and row['inputs']['frames'] < self.min_part_frames]
+            if short:
+                raise ChainPartTooShort(min(short) / chain_plan.FPS, chain_plan.MIN_PART_SECONDS)
+            parts = max(self._depths(record).values())
+            if parts > self.max_parts:
+                raise ChainTooLong(parts, self.max_parts)
+            # The kept seams are repaired with the sound the original chain kept for them. Copies left by
+            # a failed save have no record, so the next start prunes them.
+            try:
+                for row in kept[1:]:
+                    chain_leads.copy(self.store_dir, chain_id, identity, row['index'])
+                self._save(record)
+            except OSError:
+                raise ValueError('The kept parts could not be copied') from None
+            self.records[identity] = record
+            self.queue.append(identity)
             self.wake.set()
             return self._view(record)
 
@@ -281,6 +464,12 @@ class ChainRunner:
                 if block is not None:
                     return record, block
         return None, None
+
+    def owns(self, prompt_id):
+        """True while a chain block submitted this host request; its order is the chain's."""
+        with self.lock:
+            return any(row['prompt_id'] == prompt_id and row['state'] in ('queued', 'running')
+                       for record in self.records.values() for row in record['blocks'])
 
     def _start(self, block):
         if block['started'] is None:
@@ -415,6 +604,8 @@ class ChainRunner:
         self.success.pop(prompt_id, None)
         self.cancel_sent.discard(prompt_id)
         self._save(record)
+        if record['state'] in ('cancelled', 'failed', 'interrupted'):
+            self._interrupt_dependants()
 
     def step(self):
         """Run one scheduler pass; tests can drive the same loop without sleeping."""
@@ -436,11 +627,16 @@ class ChainRunner:
                         self._save(record)
                 if self.active is not None and self.records[self.active]['state'] not in store.ACTIVE:
                     self.active = None
-                while self.active is None and self.queue:
-                    identity = self.queue.pop(0)
-                    waiting = self.records[identity]
-                    if waiting['state'] == 'queued' or waiting['state'] == 'cancelling' and waiting['output_state'] == 'joining':
-                        self.active = identity
+                self._interrupt_dependants()
+                for queued_id in list(self.queue):
+                    waiting = self.records[queued_id]
+                    if waiting['state'] not in store.ACTIVE:
+                        self.queue.remove(queued_id)
+                    elif self.active is None and (waiting['state'] == 'queued'
+                            and self._dependency_state(waiting) == 'ready'
+                            or waiting['state'] == 'cancelling' and waiting['output_state'] == 'joining'):
+                        self.queue.remove(queued_id)
+                        self.active = queued_id
                 identity = self.active
             for recovering_id, snapshot in recovering:
                 if not self.closed.is_set():
@@ -467,8 +663,18 @@ class ChainRunner:
             else:
                 prompt_id, node = block['prompt_id'], record['node']
                 action = 'status'
+            split = record.get('split')
             if action == 'join':
                 pass
+            elif (prompt_id is None and split is not None and split['state'] == 'pending'
+                  and record['state'] != 'cancelling' and block['index'] == 0):
+                # Before the first part: one description per part, so later parts carry on instead of replaying.
+                split['state'] = 'running'
+                record['state'] = 'running'
+                self._save(record)
+                value = dict(text=block['inputs']['text'], continued=block['after'] is not None,
+                             seconds=[row['new_frames'] / chain_plan.FPS for row in record['blocks']])
+                action = 'split'
             elif prompt_id is None:
                 self.progress_messages.pop(identity, None)
                 self.progress_values.get(identity, {}).pop('remaining_seconds', None)
@@ -479,6 +685,7 @@ class ChainRunner:
                 self._save(record)
                 prompt = deepcopy(record['snapshot']['prompt'])
                 block_inputs = dict(block['inputs'])
+                block_inputs.update(index=block['index'], count=len(record['blocks']))
                 sources = self._sources(record, block)
                 extra = deepcopy(record['snapshot']['extra_data'])
                 if record['client_id'] is not None:
@@ -495,6 +702,11 @@ class ChainRunner:
         if action == 'join':
             self._join(identity, snapshot)
             return
+        if action == 'split':
+            self._split(record, value)
+            if record['split']['state'] != 'pending':
+                self._step_chain(identity)  # The first part starts in the same pass.
+            return
         if action == 'submit':
             try:
                 for key, source in sources.items():
@@ -506,6 +718,13 @@ class ChainRunner:
                     block_inputs[key] = (source['output'] or '') if source is not None else ''
                 for name in getattr(self.host, 'continuation_inputs', ()):
                     prompt[node]['inputs'].pop(name, None)
+                # A part that continues footage takes no keyframes of its own: it starts from the footage.
+                # The host's media inputs name what only a part that starts fresh keeps.
+                if any(source is not None for source in sources.values()):
+                    for name in getattr(self.host, 'media_inputs', ()):
+                        prompt[node]['inputs'].pop(name, None)
+                    if hasattr(self.host, 'continued'):
+                        self.host.continued(prompt, node)
                 prompt[node]['inputs'].update(self.inputs(block_inputs))
                 self.host.submit(prompt_id, node_prompt(prompt, node), extra)
             except Exception as error:
@@ -554,6 +773,39 @@ class ChainRunner:
                     else:
                         block['state'] = desired
                     self._save(record)
+
+    def _split(self, record, value):
+        def cancelled():
+            return record['state'] == 'cancelling' or self.closed.is_set()
+        split = getattr(self.host, 'split_texts', None)
+        parts, reason = None, 'unavailable'
+        if split is not None:
+            try:
+                parts, reason = split(value, cancelled)
+            except Exception:
+                logging.exception('[FreeVideo] Splitting the description failed')
+                parts, reason = None, 'failed'
+        with self.lock:
+            if parts is None and cancelled():
+                record['split']['state'] = 'pending'  # Split again when resumed.
+            elif parts is not None and len(parts) == len(record['blocks']) and all(
+                    isinstance(part, str) and part.strip() for part in parts):
+                for row, part in zip(record['blocks'], parts):
+                    row['inputs']['text'] = part
+                try:
+                    from .lora_triggers import apply_chain_triggers
+                    apply_chain_triggers(record)
+                    record['split'].update(state='done', reason=None)
+                except Exception:
+                    for row in record['blocks']:
+                        row['inputs']['text'] = value['text']
+                    record['split'].update(state='failed', reason='failed')
+            else:
+                # The whole description goes to every part, as before; the page says why.
+                if parts is not None:
+                    reason = 'unusable'
+                record['split'].update(state='failed', reason=reason if reason in store.SPLIT_REASONS else 'failed')
+            self._save(record)
 
     def _join(self, identity, snapshot):
         final_state = snapshot.get('join_final_state', 'done')

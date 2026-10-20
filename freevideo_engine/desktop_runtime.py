@@ -20,6 +20,20 @@ from .long_paths import io_path, resolved, plain, plain_text, plain_errors
 from .system import install_root, windows
 
 
+def parse_progress_line(line):
+    """Decode the worker's UI protocol; ordinary terminal output stays a log."""
+    if line.startswith('{'):
+        try:
+            message = json.loads(line)
+            if message.get('event') == 'freevideo_ui':
+                return message
+            if message.get('event') == 'local_model_progress':
+                return local_model_ui(message)
+        except (ValueError, AttributeError):
+            pass
+    return None
+
+
 def launcher_root():
     if os.environ.get('FREEVIDEO_LAUNCHER_HOME'):
         return Path(os.environ['FREEVIDEO_LAUNCHER_HOME'])
@@ -29,20 +43,30 @@ def launcher_root():
     return Path(home) / 'FreeVideo-launcher'
 
 
+NOTICE_FILES = ('LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md')
+
+
 def source_files(root):
-    names = ['pyproject.toml', 'README.md', 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'MANIFEST.in', '__init__.py',
+    names = ['pyproject.toml', 'README.md', 'MANIFEST.in', '__init__.py',
              'freevideo', 'setup.sh', 'test.sh',
              'freevideo.ps1', 'setup.ps1', 'test.ps1', 'freevideo.cmd', 'setup.cmd', 'test.cmd',
              'scripts/bootstrap_linux.sh', 'scripts/windows_app.py', 'scripts/build_windows.py',
              'scripts/check_installation.py', 'scripts/build_launcher_notices.py']
     # Older deployed Windows payloads may predate the optional Mac entry points.
-    files_optional = ('scripts/build_macos.py', 'scripts/macos_app.py')
+    files_optional = ('scripts/build_macos.py', 'scripts/macos_app.py',
+                      'freevideo_source_bootstrap.py', 'freevideo_ed25519.py', 'freevideo_update_keys.py',
+                      'scripts/source_build.py', 'scripts/build_source_delta.py', 'scripts/sign_update_manifest.py',
+                      'scripts/prune_qt_bundle.py', 'scripts/deduplicate_bundle_data.py', 'scripts/pyi_rth_bundle_data.py')
     names += [name for name in files_optional if (root / name).is_file()]
+    # Notice and licence files are carried when present; a launcher never fails to start without one.
+    names += [name for name in NOTICE_FILES if (root / name).is_file()]
+    names += ['web/vendor/three/LICENSE'] if (root / 'web/vendor/three/LICENSE').is_file() else []
     files = [root / name for name in names]
     files += [p for folder in ('freevideo_engine', 'constraints', 'web', 'example_workflows')
               for p in (root / folder).rglob('*')
-              if p.is_file() and p.suffix in ('.py', '.json', '.txt', '.ps1', '.sh', '.js', '.css', '.svg', '.png', '.ico', '.qml',
-                                             '.woff2')]
+              if p.is_file() and (p.suffix in ('.py', '.json', '.txt', '.ps1', '.sh', '.js', '.css', '.svg', '.png', '.ico', '.qml',
+                                             '.woff2', '.otf', '.webp')
+                 or folder == 'web' and p.parent.name == 'tutorial' and p.suffix == '.mp4')]
     return sorted(files)
 
 
@@ -64,7 +88,7 @@ def matching_source(bundled, installed):
         return True
     try:
         for path in source_files(bundled):
-            if path.name == 'comfyui.json':
+            if path.name == 'comfyui.json' or path.relative_to(bundled).as_posix() in NOTICE_FILES:
                 continue
             other = installed / path.relative_to(bundled)
             if not other.is_file() or path.read_bytes() != other.read_bytes():
@@ -147,6 +171,11 @@ def check_launcher_payload(source, destination):
 
 def materialize_source(bundle=None, destination=None):
     """A one-file executable's temporary extraction must never back an editable install."""
+    if bundle is None:
+        from .top_level_modules import update_modules
+        active = update_modules()[2].ACTIVE
+        if active:
+            return Path(plain(active['source']))
     if bundle is None and not getattr(sys, 'frozen', False):
         return Path(plain(resolved(__file__).parents[1]))
     bundle = io_path(bundle or Path(sys._MEIPASS) / 'engine-source')
@@ -216,18 +245,18 @@ def local_model_ui(message):
     label = {'scan': 'Find existing models', 'verify': 'Verify local model', 'copy': 'Copy local model',
              'link': 'Reuse local model', 'ready': 'Existing models checked'}.get(phase, 'Check local models')
     detail = message.get('file', '')
+    scanned = done if phase == 'scan' else 0
     if phase == 'scan':
         detail = '%d files / folders scanned' % done
         done = 0
     elif phase in ('verify', 'copy'):
         detail = '%.1f / %.1f MiB · %.1f MiB/s · %s' % (done/2**20, total/2**20, (rate or 0)/2**20, detail)
     return dict(kind='task_end' if phase == 'ready' else 'progress', key='local-models',
-                # The card names the step; byte counts, speed and scan counts stay in the detail.
                 activity={'verify': 'check', 'copy': 'copy', 'scan': 'note'}.get(phase, ''),
                 name=((message.get('name') or message.get('file', '')) if phase in ('verify', 'copy')
                       else 'Finding existing models' if phase == 'scan' else ''), unit='bytes',
                 label=label, detail=detail, state='complete' if phase == 'ready' else 'running',
-                done=done, total=total, elapsed_seconds=message.get('elapsed_seconds', 0),
+                done=done, total=total, rate=rate, scanned=scanned, elapsed_seconds=message.get('elapsed_seconds', 0),
                 remaining_seconds=(total-done)/rate if total and rate and phase in ('verify', 'copy') else None)
 
 
@@ -334,17 +363,12 @@ class Runner:
                     log.write(line)
                     output = (output + line)[-2 * 1024 * 1024:]
                     self.events.put(('log', line))
-                    if line.startswith('{'):
-                        try:
-                            message = plain_message(json.loads(line))
-                            if message.get('event') == 'freevideo_ui':
-                                if message.get('kind') == 'failure' and isinstance(message.get('error'), str):
-                                    error = message['error']
-                                self.events.put(('progress', message))
-                            elif message.get('event') == 'local_model_progress':
-                                self.events.put(('progress', local_model_ui(message)))
-                        except (ValueError, AttributeError):
-                            pass
+                    message = parse_progress_line(line)
+                    if message is not None:
+                        message = plain_message(message)
+                        if message.get('kind') == 'failure' and isinstance(message.get('error'), str):
+                            error = message['error']
+                        self.events.put(('progress', message))
                 code = process.wait(timeout=15)
                 process.stdout.close()
         except BaseException as failure:

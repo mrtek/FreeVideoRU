@@ -151,8 +151,12 @@ def summary_report(report):
     for row in failures:
         kind = row.get('kind')
         if kind in ('gpu_oom','ram_pressure','cuda_error','timeout','cancelled','code_error','unknown_worker_exit'):
-            result['errors'].append(dict(kind=kind, ram_guard=_measurements(row.get('ram_guard'),
-                ('working_bytes','budget_bytes','available_bytes','emergency_floor_bytes'))))
+            error = dict(kind=kind, ram_guard=_measurements(row.get('ram_guard'),
+                ('working_bytes','budget_bytes','available_bytes','emergency_floor_bytes')))
+            if isinstance(row.get('worker_exit'), dict):
+                from .exit_diagnostics import clean_reading
+                error['worker_exit'] = clean_reading(row['worker_exit'])
+            result['errors'].append(error)
     # Frame names from our own source help locate failures without retaining
     # arbitrary exception messages (which may contain a prompt or access key).
     known = {p.name for p in Path(__file__).parent.glob('*.py')}
@@ -198,6 +202,8 @@ def summary_report(report):
         retry = diagnostic.mapping(encoding.get('diagnostic_retry'))
         if type(retry.get('index')) is int and 1 <= retry['index'] <= 3:
             result['encoder_resources']['retry'] = dict(index=retry['index'], final_attempt=retry.get('final_attempt') is True)
+        result['encoder_resources']['workspace'] = diagnostic.encoder_workspace(encoding.get('encoder_workspace'))
+        result['encoder_resources']['resident_models'] = diagnostic.resident_decisions(encoding.get('resident_admission'))
         result['encoder_resources']['oom_attempts'] = []
         for row in diagnostic.sequence(encoding.get('encoder_attempts'))[:3]:
             row = diagnostic.mapping(row)
@@ -216,6 +222,7 @@ def summary_report(report):
     result['worker_resources'] = diagnostic.resources(diagnostic.mapping(report.get('memory')).get('video'))
     result['worker_resources'].update(diagnostic.encoder_discard(engine))
     result['worker_resources'].update(diagnostic.sampling_checkpoint(engine))
+    result['worker_resources']['resident_models'] = diagnostic.resident_decisions(engine.get('resident_admission'))
     if 'failure_cleanup' in engine:
         result['worker_resources']['failure_cleanup'] = diagnostic.failure_cleanup(engine['failure_cleanup'])
     # Keep the driver activity next to the kernel/backend receipt so a

@@ -7,5 +7,10 @@ export function firstFrameRow(t, className) {
     const input = el('input'); input.type = 'checkbox'; input.setAttribute('role', 'switch');
     input.setAttribute('aria-label', t('First-frame reference', '首帧参考'));
     row.append(input);
-    return {row, input};
+    const purpose = row.title;
+    return {row, input, setDisabled(disabled) {
+        input.disabled = disabled;
+        input.title = '';
+        row.title = disabled ? '' : purpose;
+    }};
 }

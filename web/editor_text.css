@@ -22,7 +22,7 @@
 .fv-ed-track-row[data-hidden=true] .fv-ed-clip{opacity:.45}.fv-ed-track-row[data-locked=true] .fv-ed-clip{cursor:not-allowed}
 .fv-ed-track-row[data-locked=true]{background-image:repeating-linear-gradient(135deg,color-mix(in srgb,var(--fv-ink) 8%,transparent) 0 2px,transparent 2px 8px)}
 .fv-ed-clip[data-past=true]{-webkit-mask-image:linear-gradient(to right,#000 var(--fv-ed-past,0),rgb(0 0 0/.3) var(--fv-ed-past,0));mask-image:linear-gradient(to right,#000 var(--fv-ed-past,0),rgb(0 0 0/.3) var(--fv-ed-past,0))}
-.fv-editor .fv-ed-text-buttons{gap:4px}.fv-editor .fv-ed-text-buttons button{display:inline-flex;gap:5px;padding:0 7px;height:28px}.fv-ed-text-icon{font-size:11px;font-weight:700;opacity:.7}
+.fv-editor .fv-ed-text-buttons{gap:4px}
 .fv-editor .fv-ed-text-notice{color:var(--fv-warning);background:none;border:0;height:auto;max-width:260px;font-size:11px;white-space:normal;text-align:left;line-height:1.4}
 .fv-ed-text-menu{position:absolute;z-index:20;min-width:230px;padding:4px;background:var(--fv-card);border:1px solid var(--fv-border);border-radius:6px;box-shadow:0 6px 30px #0008}
 .fv-editor .fv-ed-text-menu button{display:flex;justify-content:space-between;width:100%;height:32px;padding:4px 8px;border:0;background:none;text-align:left}.fv-ed-text-menu kbd{color:var(--fv-muted);margin-left:18px;font:11px inherit}
@@ -40,7 +40,11 @@
 .fv-ed-track-head[data-text-track=true]>svg{display:none}
 
 .fv-ed-text-notice{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;cursor:pointer}
-@media(max-width:480px){
- .fv-editor .fv-ed-toolbar>.fv-ed-text-buttons{grid-column:1/-1;grid-row:4;justify-self:start}
- .fv-editor .fv-ed-toolbar>.fv-ed-adjust-toggle{grid-column:1/-1;grid-row:4;justify-self:end;width:auto}
-}
+.fv-ed-style-presets{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.fv-ed-preset{position:relative;display:inline-flex}
+.fv-editor .fv-ed-preset-apply{width:40px;height:32px;padding:0;font-size:16px;font-weight:700;border:1px solid var(--fv-border);border-radius:4px}
+.fv-ed-preset[data-current=true] .fv-ed-preset-apply{outline:2px solid var(--fv-accent);outline-offset:1px}
+.fv-ed-preset-note{font-size:12px;color:var(--fv-muted)}
+.fv-editor .fv-ed-preset-remove{position:absolute;top:-6px;right:-6px;width:16px;height:16px;min-width:0;padding:0;font-size:11px;line-height:1;border-radius:50%;opacity:0;background:var(--fv-card);border:1px solid var(--fv-border);color:var(--fv-ink)}
+.fv-ed-preset:hover .fv-ed-preset-remove,.fv-ed-preset:focus-within .fv-ed-preset-remove{opacity:1}
+.fv-editor .fv-ed-preset-save{height:32px;padding:0 10px;font-size:12px}

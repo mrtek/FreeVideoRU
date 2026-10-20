@@ -15,6 +15,7 @@ import re
 from .long_paths import io_path, plain
 
 VIEW_ENV = 'FREEVIDEO_RUNTIME_VIEW'
+ONLINE_ENGINE = 'freevideo-engine'  # the folder an online installation is made in
 
 
 class View(namedtuple('View', 'real root rules', defaults=(os.path,))):
@@ -64,9 +65,18 @@ def view_for(real_root) -> View:
 
 
 def for_engine(engine_root) -> View:
-    """The view of the offline runtime around this engine folder, if it needs one."""
+    """The view of the offline runtime around this engine folder, if it needs one.
+
+    An installation made online is its engine folder: it gets a view only where the
+    system code page cannot spell its folder, and one that cannot be made is not an error.
+    """
     from . import runtime_alias
     engine = Path(plain(engine_root))
+    if engine.name.casefold() == ONLINE_ENGINE:
+        try:
+            return view_for(engine) if runtime_alias.needs_view(engine, spelling_only=True) else View(engine, engine)
+        except OSError:  # Includes a junction that cannot be made: the checks after it name what fails.
+            return View(engine, engine)
     root = engine.parent
     # The first two tests read nothing from disk wherever no junction is needed.
     # The third asks by the extended path: where a junction is needed, the plain

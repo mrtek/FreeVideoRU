@@ -6,7 +6,8 @@ import {audioClipFields, audioTrackFields, normalizeAudioEdits, splitAudioFields
 import {speedRange, parseSpeedData, validateSpeedPair, sourceFrame, speedEdited, trimSpeed, splitSpeed, connectSpeedOperations} from './editor_speed_model.js';
 export const VERSION = 1;
 export const FPS = 24;
-export const RULES = Object.freeze({maxSeconds: 15, singleSeconds: 30, minSeconds: 2, tailSeconds: 5,
+// followSeconds mirrors chain_plan.MIN_PART_SECONDS: a part that continues another is at least this long.
+export const RULES = Object.freeze({maxSeconds: 15, singleSeconds: 30, minSeconds: 2, tailSeconds: 5, followSeconds: 10,
     step: 17, first: 5, overlap: 22,
     maxTracks: 3, maxClips: 500, maxText: 8000, maxParts: 5});
 // Slice and bound user text by Unicode code points, never UTF-16 halves.
@@ -24,6 +25,10 @@ const check = (yes, code = 'invalid', message = code) => { if (!yes) reject(code
 const ID = /^c[1-9]\d{0,8}$/;
 // Who last wrote a block's description (its note on the timeline), and an outside reference (a shot id).
 const TEXT_BY = ['user', 'agent'], REF = /^[A-Za-z0-9_-]{1,128}$/;
+// A short line about a block for whoever looks at the timeline; regenerating never reads it.
+// One line: no control or line-break character anywhere, nothing at its ends that either side would strip.
+const NOTE_BREAK = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const validNote = text => validText(text) && text === text.trim() && !NOTE_BREAK.test(text) && Array.from(text).length >= 1 && Array.from(text).length <= 120;
 const WORK = /^\d{4}-\d{2}-\d{2}\/[0-9a-f]{32}$/;
 const PENDING = [null, 'draft', 'queued', 'running', 'failed', 'stopped'];
 const key = source => `${source.kind}:${source.id}`;
@@ -96,6 +101,7 @@ export function setFlag(record, key, value) {
     const next = serialize(record), settings = {...(next.settings || {})};
     if (value) settings[key] = true; else delete settings[key];
     next.settings = Object.keys(settings).length ? settings : null;
+    if (JSON.stringify(next.settings) !== JSON.stringify(record.settings)) next.keep_empty = true;
     return parse(next);
 }
 export function addAudioTrack(record) {
@@ -157,7 +163,7 @@ export function parse(value) {
             const versions = item.versions.map(value => versionData(value, kind)), versionKeys = versions.map(key);
             check(new Set(versionKeys).size === versions.length, 'versions');
             const clip = {id: item.id, start: item.start, frames: item.frames, in: item.in, length: item.length,
-                source, link, text, part, pending, reason, job, extend: item.extend, versions};
+                source, link, text, part, pending, reason, job, extend: item.extend || (source?.kind === 'import' && item.length >= TAIL_FRAMES), versions};
             if (kind === 'video') { Object.assign(clip, pictureFields(item)); clip.fit = pictureFit(item.fit); }
             else check(item.fit === undefined, 'fit');
             if (kind === 'audio') { check(typeof item.volume === 'number' && Number.isFinite(item.volume) && item.volume >= 0 && item.volume <= 2, 'volume'); clip.volume = item.volume; }
@@ -168,6 +174,7 @@ export function parse(value) {
             // Who last wrote the description, and an outside reference (a shot id) for callers.
             if (item.text_by !== undefined) { check(TEXT_BY.includes(item.text_by), 'text'); clip.text_by = item.text_by; }
             if (item.ref !== undefined) { check(typeof item.ref === 'string' && REF.test(item.ref), 'ref'); clip.ref = item.ref; }
+            if (item.note !== undefined) { check(validNote(item.note), 'text'); clip.note = item.note; }
             // The part this one was pulled out of, or the part before it in the same range.
             if (item.follows !== undefined) { check(kind === 'video' && typeof item.follows === 'string' && ID.test(item.follows) && item.follows !== item.id, 'follows'); clip.follows = item.follows; }
             check(source !== null || (item.take === undefined && item.made_text === undefined), 'versions'); madeFields(item, clip);
@@ -188,6 +195,8 @@ export function parse(value) {
         width: value.width, height: value.height, settings, serial: value.serial, tracks};
     check(value.size_mode === undefined || value.size_mode === 'first' || value.size_mode === 'fixed', 'size_mode');
     result.size_mode = value.size_mode ?? 'first';
+    check(value.keep_empty === undefined || typeof value.keep_empty === 'boolean', 'invalid');
+    if (value.keep_empty) result.keep_empty = true;
     Object.assign(result, markerFields(value));
     if (value.replacements !== undefined) {
         check(Array.isArray(value.replacements) && value.replacements.length > 0 && value.replacements.length <= RULES.maxClips, 'invalid');
@@ -217,6 +226,11 @@ export function serialize(record) {
     return value;
 }
 export const duration = record => Math.max(0, ...all(record).map(end));
+// Pixels per second when an edit opens: what is there plus ten seconds of room, between twenty and ninety seconds wide.
+export const openingZoom = (width, record) => {
+    const frames = duration(record), seconds = frames ? Math.min(90, Math.max(20, frames / FPS + 10)) : 90;
+    return width / seconds;
+};
 // An export runs as long as the picture and sound; text after them is not exported.
 export const exportFrames = record => Math.max(0, ...record.tracks.filter(track => ['video', 'audio'].includes(track.kind)).flatMap(track => track.clips).map(end));
 export const find = (record, id) => all(record).find(clip => clip.id === id) ?? null;
@@ -316,10 +330,12 @@ function audioTrack(record, id = 'a1') {
     return trackBy(record, id);
 }
 const freshId = record => `c${++record.serial}`;
+// A continued video needs this many frames for its encoded tail.
+const TAIL_FRAMES = 39;
 function newClip(record, track, {source = null, start, frames, part = null, text = ''}) {
     const clip = {id: freshId(record), start, frames, in: 0, length: frames, source, link: null,
         text, part, pending: source ? null : 'draft', reason: null, job: null,
-        extend: source ? source.kind !== 'import' : true, versions: []};
+        extend: source?.kind !== 'import' || frames >= TAIL_FRAMES, versions: []};
     if (track.kind === 'audio') clip.volume = 1;
     track.clips.push(clip); return clip;
 }
@@ -335,14 +351,31 @@ export function setRef(record, ids, ref) {
     check(typeof ref === 'string' && (!ref || REF.test(ref)), 'ref');
     return onBlocks(record, ids, clip => { if (ref) clip.ref = ref; else delete clip.ref; }, false);
 }
+// A note kept with the block; an empty value removes it. A block being generated can still be noted.
+export function setNote(record, ids, text) {
+    check(typeof text === 'string' && (!text.trim() || validNote(text.trim())), 'text');
+    return onBlocks(record, ids, clip => { if (text.trim()) clip.note = text.trim(); else delete clip.note; }, false, {picture: true, kept: true});
+}
 // Only an agent's description is marked; no mark means the user wrote it, as in every earlier edit.
-function written(clip, text, by) { clip.text = text; if (text && by === 'agent') clip.text_by = by; else delete clip.text_by; }
-function onBlocks(record, ids, change, refuseBusy) {
+// A note was written about the description it came with, so it goes when the user writes another one.
+function written(clip, text, by) {
+    if (by === 'user' && text !== clip.text) delete clip.note;
+    clip.text = text; if (text && by === 'agent') clip.text_by = by; else delete clip.text_by;
+}
+function onBlocks(record, ids, change, refuseBusy, {picture = false, kept = false} = {}) {
     check(Array.isArray(ids) && ids.length > 0 && ids.every(id => typeof id === 'string'), 'id');
     for (const id of ids) check(find(record, id), 'missing');
     const selected = linkedIds(record, ids), clips = all(record).filter(clip => selected.has(clip.id));
-    check(!clips.some(isText), 'text'); assertUnlocked(record, [...selected]); if (refuseBusy) busy(clips);
+    check(!clips.some(isText), 'text');
+    // A sound block takes the change only together with the picture it is linked to.
+    check(!picture || clips.every(clip => trackOf(record, clip.id).kind === 'video' || clip.link), 'text');
+    assertUnlocked(record, [...selected]); if (refuseBusy) busy(clips);
     const next = copy(record); for (const clip of all(next)) if (selected.has(clip.id)) change(clip);
+    // The blocks set aside while a part is being replaced take the change too: whichever of them comes back shows it.
+    if (kept) for (const tx of next.replacements || []) for (const row of [...tx.originals, ...tx.clips]) {
+        const shown = clips.filter(clip => trackOf(record, clip.id).id === row.id);
+        for (const clip of row.clips) if (shown.some(v => v.id === clip.id || (clip.start >= v.start && end(clip) <= end(v)))) change(clip);
+    }
     return finish(next);
 }
 export function linkedIds(record, ids) {
@@ -411,36 +444,62 @@ function sourceAudioTrack(record, start, frames, allowRoom = false) {
     }
     throw new EditError('audio_full');
 }
-export function insertSource(record, {source, frames, hasVideo, hasAudio, width, height, at: position = 0}) {
-    source = sourceData(source); check(whole(frames, 1) && whole(position), 'range');
+// A saved project file holds 8 MiB; every character outside plain ASCII is written there as six.
+const STORED_ROOM = 8 * 1024 * 1024 - 64 * 1024;
+function storedSize(record) {
+    const written = JSON.stringify(record); let size = written.length;
+    for (let i = 0; i < written.length; i++) { const code = written.charCodeAt(i); size += code > 126 ? 5 : code === 44 || code === 58 ? 1 : 0; }
+    return size;
+}
+// A saved video brings the description it was generated from; one that cannot be kept is left out.
+export function insertSource(record, {source, frames, hasVideo, hasAudio, width, height, at: position = 0, text = '', by = 'user', targetTrack}) {
+    const given = source; source = sourceData(source); check(whole(frames, 1) && whole(position), 'range');
     check(typeof hasVideo === 'boolean' && typeof hasAudio === 'boolean' && (hasVideo || hasAudio), 'source');
+    check(TEXT_BY.includes(by), 'text');
+    const words = hasVideo && typeof text === 'string' && validText(text.trim()) ? text.trim() : '';
     const next = copy(record);
     if (hasVideo) followFirstSize(next, width, height);
-    let track = trackBy(next, hasVideo ? 'v1' : 'a1');
-    if (!hasVideo && track.clips.some(clip => overlaps(clip, position, frames))) track = audioTrack(next, 'a2');
+    const explicitAudioTrack = !hasVideo && targetTrack !== undefined;
+    if (explicitAudioTrack) check(['a1', 'a2'].includes(targetTrack), 'track');
+    let track = explicitAudioTrack ? audioTrack(next, targetTrack) : trackBy(next, hasVideo ? 'v1' : 'a1');
+    if (!hasVideo && !explicitAudioTrack && track.clips.some(clip => overlaps(clip, position, frames))) track = audioTrack(next, 'a2');
+    check(!explicitAudioTrack || !track.locked, 'locked');
     const start = insertionAt(next, track.id, position);
     const available = hasVideo && hasAudio ? copy(makeRoom(next, start, frames, {tracks: [track.id]})) : null;
     const sound = available ? audioTrack(next, sourceAudioTrack(available, start, frames, true).id) : null;
     applyRoom(next, start, frames, {tracks: [track.id, ...(sound ? [sound.id] : [])]});
     const primary = newClip(next, track, {source, frames, start});
+    if (words) written(primary, words, by);
     if (hasVideo && hasAudio) {
         const mate = newClip(next, sound, {source, frames, start});
         primary.link = mate.id; mate.link = primary.id;
+        if (words) written(mate, words, by);
     }
-    return finish(next);
+    const result = finish(next);
+    // The description is a convenience: a project it would make too large to save takes the video without it.
+    if (words && storedSize(result) > STORED_ROOM) return insertSource(record, {source: given, frames, hasVideo, hasAudio, width, height, at: position, targetTrack});
+    return result;
 }
-export function move(record, id, start) {
+export function move(record, id, start, {targetTrack} = {}) {
     if (isText(find(record, id))) return changeText(record, id, {start});
     check(whole(start), 'range'); const selected = pair(record, id); check(selected.length, 'missing'); busy(selected);
     const next = copy(record), ids = new Set(selected.map(clip => clip.id));
-    const clips = all(next).filter(clip => ids.has(clip.id)), primary = clips[0], track = trackOf(next, primary.id);
+    const clips = all(next).filter(clip => ids.has(clip.id)), primary = clips[0];
+    let track = trackOf(next, primary.id);
+    // Only independent audio changes rows; linked pairs keep automatic routing.
+    if (clips.length === 1 && track.kind === 'audio' && targetTrack !== undefined) {
+        check(['a1', 'a2'].includes(targetTrack), 'track');
+        assertUnlocked(record, [primary.id]);
+        track = audioTrack(next, targetTrack);
+        check(!track.locked, 'locked');
+    }
     for (const row of next.tracks) row.clips = row.clips.filter(clip => !ids.has(clip.id));
     start = insertionAt(next, track.id, start);
     const sound = track.kind === 'video' && clips.find(clip => trackOf(record, clip.id).kind === 'audio');
     const available = sound ? makeRoom(next, start, primary.frames, {tracks: [track.id]}) : null;
     const soundTrack = sound ? sourceAudioTrack(available, start, primary.frames, true).id : null;
     applyRoom(next, start, primary.frames, {tracks: [track.id, ...(soundTrack ? [soundTrack] : [])], excluded: ids});
-    for (const clip of clips) { clip.start = start; (clip === sound ? audioTrack(next, soundTrack) : trackBy(next, trackOf(record, clip.id).id)).clips.push(clip); }
+    for (const clip of clips) { clip.start = start; (clip === sound ? audioTrack(next, soundTrack) : clip === primary ? track : trackBy(next, trackOf(record, clip.id).id)).clips.push(clip); }
     return finish(next);
 }
 // A selected group keeps its gaps and tracks; validation rejects occupied landings.
@@ -557,24 +616,47 @@ export function setVolume(record, id, volume) {
     }
     return finish(next);
 }
-export const rename = (record, name) => finish({...copy(record), name});
-export const setPictureSize = (record, width, height, size_mode = 'fixed') => finish({...copy(record), width, height, size_mode});
+export const rename = (record, name) => finish({...copy(record), name, ...(name !== record.name ? {keep_empty: true} : {})});
+export const setPictureSize = (record, width, height, size_mode = 'fixed') => finish({...copy(record), width, height, size_mode,
+    ...(width !== record.width || height !== record.height || size_mode !== record.size_mode ? {keep_empty: true} : {})});
 export const setPicture = pictureEditor({copy, trackBy, check, pictureFit, finish});
 export const setPictureFit = (record, id, fit) => setPicture(record, id, {fit: pictureFit(fit)});
 
-function segmentLengths(frames, maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds) {
+// The shortest a part that continues another may be; a device that cannot make a part that long keeps the general minimum.
+const followLeast = maxFollowSeconds => maxFollowSeconds >= RULES.followSeconds ? RULES.followSeconds : RULES.minSeconds;
+// A length to continue by, in whole seconds, raised to one that parts of followSeconds..maxFollowSeconds can add up to.
+export function continuedSeconds(seconds, maxFollowSeconds = RULES.maxSeconds) {
+    check(typeof seconds === 'number' && Number.isFinite(seconds) && typeof maxFollowSeconds === 'number' && Number.isFinite(maxFollowSeconds), 'range');
+    const least = followLeast(maxFollowSeconds), follow = Math.max(least, Math.floor(Math.min(RULES.maxSeconds, maxFollowSeconds)));
+    const length = Math.max(least, Math.round(seconds));
+    return Math.max(length, Math.ceil(length / follow) * least);
+}
+function segmentLengths(frames, maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds, continues = false) {
     check(typeof maxSeconds === 'number' && Number.isFinite(maxSeconds) && maxSeconds >= RULES.minSeconds, 'range');
     check(typeof maxFollowSeconds === 'number' && Number.isFinite(maxFollowSeconds) && maxFollowSeconds >= RULES.minSeconds, 'range');
     const max = Math.floor(Math.min(RULES.maxSeconds, maxSeconds)) * FPS, follow = Math.floor(Math.min(RULES.maxSeconds, maxFollowSeconds)) * FPS, lengths = [];
     let left = Math.max(RULES.minSeconds, Math.round(frames / FPS)) * FPS;
     // Under half a minute is one generation wherever this device makes it in one;
     // half a minute or more, or beyond the device, goes in parts of a quarter minute.
-    if (left < RULES.singleSeconds * FPS && left <= Math.floor(maxSeconds) * FPS) return [left];
+    if (!continues && left < RULES.singleSeconds * FPS && left <= Math.floor(maxSeconds) * FPS) return [left];
     check(left <= RULES.maxClips * max, 'range');
-    while (left) { const length = Math.min(left, lengths.length ? follow : max); lengths.push(length); left -= length; }
+    // Every part after the first continues the one before it and is at least followSeconds long, as chain_plan lays
+    // them out: the parts after the first share what is left evenly, and a rest too short for them comes off the first.
+    if (follow >= RULES.followSeconds * FPS) {
+        const seconds = continues ? continuedSeconds(left / FPS, follow / FPS) : left / FPS;
+        const head = continues ? 0 : Math.min(max / FPS, seconds), rest = seconds - head, count = Math.ceil(rest / (follow / FPS));
+        const shared = Math.max(rest, RULES.followSeconds * count);
+        if (continues || seconds - shared >= RULES.minSeconds) {
+            check(count <= RULES.maxClips, 'range');
+            const result = continues ? [] : [(seconds - shared) * FPS];
+            for (let i = 0; i < count; i++) result.push((Math.floor(shared / count) + (i < shared % count ? 1 : 0)) * FPS);
+            return result;
+        }
+    }
+    while (left) { const length = Math.min(left, lengths.length || continues ? follow : max); lengths.push(length); left -= length; }
     const last = lengths.length - 1;
     if (last > 0 && lengths[last] < Math.min(follow, RULES.tailSeconds * FPS)) {
-        const both = lengths[last - 1] + lengths[last]; lengths[last - 1] = Math.min(last === 1 ? max : follow, Math.max(both - follow, Math.ceil(both / 2 / FPS) * FPS)); lengths[last] = both - lengths[last - 1];
+        const both = lengths[last - 1] + lengths[last]; lengths[last - 1] = Math.min(last === 1 && !continues ? max : follow, Math.max(both - follow, Math.ceil(both / 2 / FPS) * FPS)); lengths[last] = both - lengths[last - 1];
     }
     return lengths;
 }
@@ -612,6 +694,8 @@ function remember(clip, source = null) {
 // A range drawn on its own starts a new video, even when it touches the part before it.
 const continuing = (clip, before) => !!clip && !!before && before.id !== clip.id && end(before) === clip.start
     && (clip.follows === before.id || (clip.part !== null && clip.part === before.part));
+const chainSource = clip => !!clip.job && !!clip.pending;
+const continuationKey = clip => chainSource(clip) ? `chain:${clip.job}:${clip.id}` : clip.source ? key(clip.source) : null;
 const wholeEnd = clip => !!clip.source && clip.extend && clip.in + clip.frames === clip.length;
 const partBefore = (record, clip) => trackBy(record, 'v1').clips.find(before => continuing(clip, before)) ?? null;
 // Whether the part is drawn attached to the one before it on its track.
@@ -621,7 +705,7 @@ export function continuesBefore(record, id) {
     return !!video && trackBy(record, 'v1').clips.includes(video) && !!partBefore(record, video);
 }
 // The lengths one range is generated in, as planRange lays them out on empty tracks.
-export const partLengths = (frames, {maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds} = {}) => segmentLengths(frames, maxSeconds, maxFollowSeconds);
+export const partLengths = (frames, {maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds, continues = false} = {}) => segmentLengths(frames, maxSeconds, maxFollowSeconds, continues);
 // One video is generated in at most RULES.maxParts parts: the longest range that still fits.
 export function maxRangeFrames(record, {continues = false, maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds}) {
     const before = continues;
@@ -633,24 +717,31 @@ export function maxRangeFrames(record, {continues = false, maxSeconds = RULES.ma
 export function rangeParts(record, {start, frames, parts, continues, maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds}) {
     // A range that starts on a part pulled out of the one before it keeps that part's shorter limit.
     const head = trackBy(record, 'v1').clips.find(clip => clip.start === start);
-    const first = continues ?? !!(head && partBefore(record, head)) ? maxFollowSeconds : maxSeconds;
+    const following = continues ?? !!(head && partBefore(record, head)), first = following ? maxFollowSeconds : maxSeconds;
+    // A part that continues another is at least followSeconds long.
+    const least = index => (index || following ? followLeast(maxFollowSeconds) : RULES.minSeconds) * FPS;
     const valid = Array.isArray(parts) && parts.length > 0 && parts.length <= RULES.maxClips
-        && parts.every((count, i) => whole(count, RULES.minSeconds * FPS) && count % FPS === 0
+        && parts.every((count, i) => whole(count, least(i)) && count % FPS === 0
             && count <= Math.floor(i ? maxFollowSeconds : first) * FPS)
         && parts.reduce((sum, count) => sum + count, 0) === frames;
-    return valid ? [...parts] : partLengths(frames, {maxSeconds: first, maxFollowSeconds});
+    return valid ? [...parts] : partLengths(frames, {maxSeconds: first, maxFollowSeconds, continues: following});
 }
-export function adjustPartBoundary(parts, index, leftFrames, {maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds} = {}) {
+export function adjustPartBoundary(parts, index, leftFrames, {maxSeconds = RULES.maxSeconds, maxFollowSeconds = maxSeconds, continues = false} = {}) {
     check(Array.isArray(parts) && whole(index) && index < parts.length - 1 && Number.isFinite(leftFrames), 'range');
     check(parts.every(count => whole(count, RULES.minSeconds * FPS) && count % FPS === 0), 'range');
     const minimum = RULES.minSeconds * FPS, total = parts[index] + parts[index + 1];
     const leftMax = Math.floor(index ? maxFollowSeconds : maxSeconds) * FPS, rightMax = Math.floor(maxFollowSeconds) * FPS;
-    const low = Math.max(minimum, total - rightMax), high = Math.min(leftMax, total - minimum);
+    // Every part that continues another is at least followSeconds long; a pair too short for that keeps the general minimum.
+    const follows = followLeast(maxFollowSeconds) * FPS, leftLeast = index || continues ? follows : minimum;
+    const tight = total >= leftLeast + follows;
+    const low = Math.max(tight ? leftLeast : minimum, total - rightMax), high = Math.min(leftMax, total - (tight ? follows : minimum));
     check(Number.isFinite(low) && Number.isFinite(high) && low <= high, 'range');
     const desired = Math.round(leftFrames / FPS) * FPS, left = Math.max(low, Math.min(high, desired));
     const result = [...parts]; result[index] = left; result[index + 1] = total - left;
+    // The left part also stops where the part after it would fall under followSeconds.
     return {parts: result, limited: desired >= leftMax && left === leftMax ? leftMax / FPS
-        : total - desired >= rightMax && total - left === rightMax ? rightMax / FPS : null};
+        : total - desired >= rightMax && total - left === rightMax ? rightMax / FPS
+            : tight && desired > left && left === total - follows ? left / FPS : null};
 }
 export function resizePlannedBoundary(record, leftId, rightId, frame, limits = {}) {
     const left = find(record, leftId), right = find(record, rightId);
@@ -662,7 +753,7 @@ export function resizePlannedBoundary(record, leftId, rightId, frame, limits = {
     const preceding = !!video && !!partBefore(record, video);
     const maxSeconds = limits.maxSeconds ?? RULES.maxSeconds, maxFollowSeconds = limits.maxFollowSeconds ?? maxSeconds;
     const result = adjustPartBoundary([left.frames, right.frames], 0, frame - left.start,
-        {maxSeconds: preceding ? maxFollowSeconds : maxSeconds, maxFollowSeconds});
+        {maxSeconds: preceding ? maxFollowSeconds : maxSeconds, maxFollowSeconds, continues: preceding});
     const next = copy(record); detachAttempt(next, members.map(clip => clip.id));
     for (const old of members) find(next, old.id).part = left.part;
     for (const clip of pair(next, leftId)) { clip.frames = clip.length = result.parts[0]; clearPlan(clip); }
@@ -673,13 +764,25 @@ export function resizePlanned(record, id, edge, frame, limits = {}) {
     check(['start', 'end'].includes(edge) && whole(frame), 'range');
     const members = pair(record, id); check(members.length, 'missing'); busy(members);
     check(members.every(clip => clip.pending && !clip.source), 'unsupported');
-    const primary = members[0], minimum = RULES.minSeconds * FPS;
+    const primary = members[0];
+    const video = trackOf(record, id).id === 'v1' ? primary : find(record, primary.link);
+    const maxFollowSeconds = limits.maxFollowSeconds ?? limits.maxSeconds ?? RULES.maxSeconds;
+    // A planned part that continues another is at least followSeconds long.
+    const minimum = (video && partBefore(record, video) ? followLeast(maxFollowSeconds) : RULES.minSeconds) * FPS;
     const neighbors = members.flatMap(clip => trackOf(record, clip.id).clips.filter(other => other.id !== clip.id));
     const low = Math.max(0, ...neighbors.filter(clip => end(clip) <= primary.start).map(end));
     const high = Math.min(1e7, ...neighbors.filter(clip => clip.start >= end(primary)).map(clip => clip.start));
     const position = Math.round(frame / FPS) * FPS;
-    const start = edge === 'start' ? Math.max(low, Math.min(end(primary) - minimum, position)) : primary.start;
-    const stop = edge === 'end' ? Math.min(high, Math.max(start + minimum, position)) : end(primary);
+    let start = edge === 'start' ? Math.max(low, Math.min(end(primary) - minimum, position)) : primary.start;
+    let stop = edge === 'end' ? Math.min(high, Math.max(start + minimum, position)) : end(primary);
+    if (minimum > RULES.minSeconds * FPS) {
+        // Lengths no run of continuing parts can fill (16–19 s at fifteen-second parts) are raised to the next one that fits.
+        const fitted = continuedSeconds((stop - start) / FPS, maxFollowSeconds) * FPS;
+        if (fitted > stop - start) {
+            if (edge === 'end' && start + fitted <= high) stop = start + fitted;
+            else if (edge === 'start' && stop - fitted >= low) start = stop - fitted;
+        }
+    }
     let next = copy(record); detachAttempt(next, members.map(clip => clip.id));
     const part = primary.part || freshId(next);
     for (const clip of pair(next, id)) { clip.start = start; clip.frames = clip.length = stop - start; clip.part = part; clearPlan(clip); }
@@ -809,7 +912,8 @@ export function extendClip(record, id, frames, {maxSeconds = RULES.maxSeconds, m
     const spare = Math.min(...selected.map(member => member.length - member.in - member.frames));
     const reveal = Math.min(spare, frames);
     if (frames <= spare) return trim(record, id, 'end', end(clip) + reveal);
-    const count = Math.max(RULES.minSeconds, Math.round((frames - spare) / FPS)) * FPS;
+    // Parts that continue this one are at least followSeconds long, so what is added is raised to a length they can fill.
+    const count = continuedSeconds((frames - spare) / FPS, maxFollowSeconds) * FPS;
     // One shift measured from the original visible edge, including restored media.
     const room = copy(record); makeRightEdgeRoom(room, id, reveal + count, {generating: true});
     const restored = trim(finish(room), id, 'end', end(clip) + reveal);
@@ -845,7 +949,7 @@ function generationPlan(record, clips) {
     return videos.flatMap(video => videoPlan(record, video, replacing));
 }
 function videoPlan(record, clips, replacing) {
-    const first = clips[0], before = trackBy(record, 'v1').clips.find(clip => continuing(first, clip) && wholeEnd(clip));
+    const first = clips[0], before = trackBy(record, 'v1').clips.find(clip => continuing(first, clip) && (chainSource(clip) || wholeEnd(clip)));
     // Revealing a predecessor's hidden tail reduces the new visible range.
     const credit = clips.every(clip => clip.target_frames !== undefined && !clip.source)
         ? clips.reduce((sum, clip) => sum + clip.target_frames - clip.frames, 0) : 0;
@@ -874,7 +978,7 @@ export function prepare(record, ids) {
             const spare = Math.min(...members.map(clip => clip.length - clip.in - clip.frames));
             const first = find(next, clips[0].id);
             // Leave at least one visible frame in every planned segment.
-            const credit = spare < first.frames ? spare : 0;
+            const credit = spare > 0 && spare < first.frames ? spare : 0;
             if (credit) {
                 busy(members);
                 for (const clip of members) clip.frames += credit;
@@ -896,7 +1000,19 @@ export function prepare(record, ids) {
     }
     return finish(next);
 }
-export function generationRequest(record, ids, {text, paths = {}} = {}) {
+// The finished footage each video of a generation request continues, as source keys; null for one that starts fresh.
+export function generationBefore(record, ids) {
+    const clips = generationClips(record, ids);
+    return generationPlan(record, clips).filter(row => !row.before || !clips.some(clip => clip.id === row.before.id))
+        .map(row => row.before ? continuationKey(row.before) : null);
+}
+// An imported video is continued from the copy the editor plays, which is upright and at 24 fps.
+function continuedPath(source, path) {
+    if (source.kind !== 'import') return sourceData({kind: 'generated', id: path}).id;
+    check(path === `FreeVideo/.editor/imports/${source.id}/preview.mp4`, 'source');
+    return path;
+}
+export function generationRequest(record, ids, {text, paths = {}, queue = false} = {}) {
     check(object(paths), 'source');
     if (text !== undefined) check(validText(text), 'text');
     const clips = generationClips(record, ids), rows = generationPlan(record, clips), plan = {}, blocks = [];
@@ -904,7 +1020,8 @@ export function generationRequest(record, ids, {text, paths = {}} = {}) {
         let after = null;
         if (row.before) {
             if (clips.some(clip => clip.id === row.before.id)) after = row.before.id;
-            else { const path = paths[key(row.before.source)]; check(typeof path === 'string' && path.length > 0, 'source', 'missing source path'); after = {work: sourceData({kind: 'generated', id: path}).id}; }
+            else if (queue && chainSource(row.before)) after = {chain: row.before.job, block: row.before.id};
+            else { const path = paths[continuationKey(row.before)]; check(typeof path === 'string' && path.length > 0, 'source', 'missing source path'); after = {work: continuedPath(row.before.source, path)}; }
         }
         blocks.push({id: row.clip.id, part: row.clip.part ?? row.clip.id, after, before: null, text: text ?? row.clip.text, frames: row.request_frames});
         plan[row.clip.id] = {target_frames: row.target_frames, net_frames: row.net_frames, request_frames: row.request_frames, audio: row.clip.link};
@@ -953,7 +1070,7 @@ export function fill(record, id, {source, frames, width, height, skip_frames = 0
         const take = numberTakes(clip) + 1;
         remember(clip, source); clip.source = source; clip.in = skip_frames; clip.length = frames; clip.take = take;
         if (clip.text) clip.made_text = clip.text; else delete clip.made_text;
-        clip.pending = clip.reason = clip.job = null; clip.extend = source.kind !== 'import';
+        clip.pending = clip.reason = clip.job = null; clip.extend = true;
         delete clip.splice;
         if (skip_frames || skip_audio_samples) clip.splice = {frames: skip_frames, audio_samples: skip_audio_samples};
         clearPlan(clip);
@@ -997,11 +1114,11 @@ export function restoreVersion(record, id, index, {by = 'user'} = {}) {
         remember(clip, version); clip.source = {kind: version.kind, id: version.id}; clip.in = version.in; clip.length = version.length;
         delete clip.take; delete clip.made_text; madeFields(version, clip); touchedBy(clip, by);
         // Placement belongs to this timeline part, including when its media changes.
-        clip.pending = clip.reason = clip.job = null; clip.extend = version.kind !== 'import'; clearPlan(clip);
+        clip.pending = clip.reason = clip.job = null; clip.extend = version.kind !== 'import' || version.length >= TAIL_FRAMES; clearPlan(clip);
         delete clip.splice; if (version.splice) clip.splice = version.splice;
     }
     return finish(next);
 }
-connectSpeedOperations({copy, finish, detachAttempt, trackOf, freshId,
+connectSpeedOperations({copy, finish, detachAttempt, trackOf, freshId, splitAudioFields,
     makeRoom: (record, track, start, frames, excluded) => applyRoom(record, start, frames, {tracks: [].concat(track), excluded: [...excluded]}),
 });

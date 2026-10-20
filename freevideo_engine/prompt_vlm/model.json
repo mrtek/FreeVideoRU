@@ -2,6 +2,7 @@
   "repo": "Qwen/Qwen3-VL-4B-Instruct",
   "revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17",
   "license": "Apache-2.0",
+  "modelscope": {"repo": "Qwen/Qwen3-VL-4B-Instruct", "revision": "master"},
   "files": [
     {
       "file": "chat_template.json",

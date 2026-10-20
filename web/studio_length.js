@@ -1,4 +1,5 @@
 import {capabilityPoints, interpolate} from './chain_support.js';
+import {issueButton} from './issue_button.js';
 import {buildPlanRequest, readLengthPlan, classifyPlanError, singleLimitSeconds, defaultBlockSeconds} from './length_plan.js?v=20261011-length';
 
 export const LENGTH_PROPERTIES = Object.freeze({seconds: 'freevideo_seconds', single: 'freevideo_single', block: 'freevideo_block_seconds'});
@@ -40,9 +41,13 @@ export function createStudioLength({api, node, seconds, advanced, fields, t, fie
     controls.append(toggle, explanation, unavailable, field(t('Part length · seconds', '每段时长 · 秒'), block), reset); advanced.append(controls);
     const note = el('div', 'fv-muted fv-length-plan');
     note.hidden = true; fields.after(note); note.setAttribute('role', 'status');
+    // The limits are stated before anything is typed, not only when a request is refused.
+    const NO_PARTS = t('This device cannot make longer videos in parts.', '此设备不支持分段生成长视频。');
+    let noParts = false;
+    const hint = el('p', 'fv-muted fv-length-hint', t('Longer videos are made in parts automatically, up to 5 parts.', '较长的视频会自动分段，最多 5 段。'));
+    fields.after(hint);
     let limits = null, planLimits = null, contextKey = '', revision = 0, timer = null, request = null, capabilityRequest = null, capabilityRevision = 0;
     let capabilityState = 'idle', waiting = false, waitingTimer = null, timeoutTimer = null, submitted = false;
-    let segmentationEdited = node.properties?.[LENGTH_PROPERTIES.single] === true || Object.hasOwn(node.properties || {}, LENGTH_PROPERTIES.block);
     let plan = null, error = null, absent = false, disposed = false, pending = null, edited = false, blockEdited = false;
     const remember = (key, value) => { node.properties ||= {}; node.properties[key] = value; node.graph?.change(); node.setDirtyCanvas?.(true, true); };
     const total = () => Number(seconds.value);
@@ -60,18 +65,31 @@ export function createStudioLength({api, node, seconds, advanced, fields, t, fie
         const cannot = total() > (forcedMaximum ?? 15);
         single.disabled = absent || seconds.disabled || cannot; single.checked = !absent && effectiveSingle();
         if (absent) seconds.max = '60';
-        unavailable.hidden = absent || !planLimits || (!cannot && !clamped);
-        unavailable.textContent = planLimits ? t(`Up to ${Math.floor(clamped ? maximum : forcedMaximum)} s in one run at this size.`, `当前画面大小单次最长 ${Math.floor(clamped ? maximum : forcedMaximum)} 秒。`) : '';
+        const reason = cannot ? positive(forcedMaximum)
+            ? t(`Up to ${Math.floor(forcedMaximum)}\u00a0s in one run at this size.`, `当前画面大小单次最长 ${Math.floor(forcedMaximum)}\u00a0秒。`)
+            : t('The maximum length is unknown for these settings.', '当前设置下无法确定最长时长。')
+            : seconds.disabled ? '' : clamped
+                ? t(`Up to ${Math.floor(maximum)}\u00a0s in one run at this size.`, `当前画面大小单次最长 ${Math.floor(maximum)}\u00a0秒。`) : '';
+        unavailable.hidden = absent || !reason; unavailable.textContent = reason;
+        single.title = single.disabled ? reason : ''; toggle.title = single.title;
         if (positive(maximum)) block.max = String(maximum); else block.removeAttribute('max');
         if (!edited) block.value = Math.min(node.properties?.[LENGTH_PROPERTIES.block] || defaultBlockSeconds(maximum), maximum || Infinity);
         block.disabled = absent || seconds.disabled || effectiveSingle() || (positive(maximum) && maximum < 5); controls.hidden = absent;
         reset.hidden = !Object.hasOwn(node.properties || {}, LENGTH_PROPERTIES.block); reset.disabled = block.disabled;
+        block.title = !block.disabled || absent || seconds.disabled || effectiveSingle() ? ''
+            : t('These settings cannot generate in parts.', '当前设置不能分段生成。');
+        reset.title = block.title;
+        // The same sentence is the problem note once a length needs parts: say it once.
+        hint.hidden = absent || (noParts && Boolean(error));
         note.hidden = absent || !error;
         note.textContent = error ? errorMessage(error) : '';
+        if (error === 'other') note.append(issueButton(t, () => ({where: ['Video length planning', '视频分段规划'], message: errorMessage('other')})));
+        note.style.margin = noParts && error === 'continuation_unavailable' ? '12px 0' : ''; // as spaced as the line it replaces
     }
     function errorMessage(kind) {
         return {single_unavailable: t('This length is beyond a single run.', '这个长度超出了单次能生成的范围。'),
-            continuation_unavailable: t('Choose a smaller picture size to make a longer video.', '如需生成更长的视频，请选择更小的画面大小。'),
+            continuation_unavailable: noParts ? NO_PARTS
+                : t('Choose a smaller picture size to make a longer video.', '如需生成更长的视频，请选择更小的画面大小。'),
             too_long: t('This video is too long. Choose a shorter duration.', '这条视频太长，请缩短时长。'),
             other: t('Could not plan this video. Try again.', '暂时无法安排这条视频的分段，请重试。')}[kind];
     }
@@ -98,24 +116,30 @@ export function createStudioLength({api, node, seconds, advanced, fields, t, fie
         return plan;
     }
     function schedule() { const version = revision; timer = setTimeout(() => { timer = null; pending = calculate(version); }, delay); }
-    single.onchange = () => { remember(LENGTH_PROPERTIES.single, single.checked); segmentationEdited = true; edited = true; invalidate(); schedule(); };
-    block.oninput = () => { segmentationEdited = true; edited = blockEdited = true; invalidate(); schedule(); };
+    single.onchange = () => { remember(LENGTH_PROPERTIES.single, single.checked); edited = true; invalidate(); schedule(); };
+    block.oninput = () => { edited = blockEdited = true; invalidate(); schedule(); };
     block.onchange = () => { if (block.reportValidity()) remember(LENGTH_PROPERTIES.block, Number(block.value)); };
     reset.onclick = () => {
         delete node.properties[LENGTH_PROPERTIES.block]; node.graph?.change(); submitted = false;
-        segmentationEdited = true; planLimits = limits;
+        planLimits = limits;
         edited = blockEdited = false; invalidate(); edited = true; schedule();
     };
-    const input = () => { submitted = false; if (!segmentationEdited) planLimits = limits; edited = false; invalidate(); schedule(); };
+    const input = () => { submitted = false; planLimits = limits; edited = false; invalidate(); schedule(); };
     seconds.addEventListener('input', input);
-    function commit() {
-        if (!seconds.value || !seconds.reportValidity()) return false;
+    function commit({report = true} = {}) {
+        const valid = report ? seconds.reportValidity() : seconds.checkValidity();
+        if (!seconds.value || !valid) return false;
         const value = total() > 30 ? Math.round(total()) : total(); seconds.value = value;
         if (value > 60) remember(LENGTH_PROPERTIES.seconds, value);
         else if (node.properties && Object.hasOwn(node.properties, LENGTH_PROPERTIES.seconds)) { delete node.properties[LENGTH_PROPERTIES.seconds]; node.graph?.change(); }
         setSeconds(Math.min(60, value)); invalidate(); schedule(); return true;
     }
     paint();
+    // Devices that cannot continue a video say so up front. An unreadable answer keeps the general line.
+    Promise.resolve().then(() => api.fetchApi('/freevideo/chains')).then(reply => reply?.ok ? reply.json() : null).then(value => {
+        if (disposed || value?.continuation !== false) return;
+        noParts = true; hint.textContent = NO_PARTS; invalidate(); schedule();
+    }).catch(() => {});
     return {
         commit, options, get plan() { return plan; }, get absent() { return absent; },
         get needsPlan() { return !absent && !effectiveSingle() && (total() > singleLimitSeconds(planLimits?.maximum)
@@ -147,7 +171,9 @@ export function createStudioLength({api, node, seconds, advanced, fields, t, fie
                 if (disposed || controller.signal.aborted || version !== capabilityRevision) return;
                 clearTimeout(waitingTimer); clearTimeout(timeoutTimer); waiting = false;
                 limits = value; capabilityState = value ? 'ready' : 'unavailable';
-                if (value && !segmentationEdited && !submitted) { planLimits = value; invalidate(); schedule(); }
+                // Draft edits choose segmentation, not a permanent device limit.
+                // A submitted job keeps the exact bounds used for its snapshot.
+                if (value && !submitted) { planLimits = value; invalidate(); schedule(); }
                 else { paint(); onChange(); }
             };
             timeoutTimer = setTimeout(() => { settle(null); controller.abort(); }, capabilityTimeout);

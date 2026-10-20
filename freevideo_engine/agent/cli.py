@@ -76,6 +76,15 @@ def build_parser():
     schema.cli_arguments(command, schema.contracts()['GET', '/jobs']['query'])
     command = commands.add_parser('upload', help='Copy a local media file into FreeVideo inputs')
     command.add_argument('path')
+    command = commands.add_parser('imports', help='Bring local video or audio into the editing timeline')
+    imports = command.add_subparsers(dest='operation', required=True)
+    command = imports.add_parser('add', help='Upload content; poll imports list until ready before insert')
+    command.add_argument('path')
+    schema.cli_arguments(command, schema.obj({'ref': schema.REF}))
+    imports.add_parser('list', help='List imported sources and preparation progress')
+    command = commands.add_parser('generate-image', help='Generate or change a picture with the local image model')
+    schema.cli_arguments(command, schema.image(), exclude=('kind',))
+    command.add_argument('--wait', action='store_true', help='Wait for the picture and print the result')
     command = commands.add_parser('drama', help='Plan, start, review and finish a durable film')
     drama = command.add_subparsers(dest='operation', required=True)
     for name, (method, path, summary) in schema.DRAMA_OPERATIONS.items():
@@ -118,6 +127,15 @@ def build_parser():
         if name == 'operations':
             sub.add_argument('--operations-file', help='JSON array of operations (- = stdin)')
         schema.cli_arguments(sub, schema.image_schema(name))
+    command = commands.add_parser('whitebox', help='Render a rough 3D white-model reference video in the user\'s open page')
+    whitebox = command.add_subparsers(dest='operation', required=True)
+    for name, (method, path, summary) in schema.WHITEBOX_OPERATIONS.items():
+        sub = whitebox.add_parser(name, help=summary)
+        if '{id}' in path:
+            sub.add_argument('id')
+        if name == 'submit':
+            sub.add_argument('file', nargs='?', help='JSON {code, summary?} request (- = stdin); options override it')
+        schema.cli_arguments(sub, schema.whitebox_schema(name))
     command = commands.add_parser('sessions', help='Share messages and plans with the user in a work conversation')
     sessions = command.add_subparsers(dest='operation', required=True)
     for name in ('list', 'create', 'events', 'post'):
@@ -196,6 +214,12 @@ def main(argv=None):
             if args.wait:
                 jobs = [client.wait(job['id'], on_progress=progress) for job in jobs]
             result = jobs[0] if len(jobs) == 1 and args.command == 'submit' else {'jobs': jobs}
+        elif args.command == 'generate-image':
+            value = dict(kind='image', **{k: values[k] for k in schema.image()['properties'] if k in values})
+            schema.validate_job(value)
+            result = client.submit(value)
+            if args.wait:
+                result = client.wait(result['id'], on_progress=progress)
         elif args.command == 'job':
             result = client.job(args.id, **({'wait': values['wait']} if 'wait' in values else {}))
         elif args.command == 'wait':
@@ -227,9 +251,10 @@ def main(argv=None):
                 schema.validate(schema.CAST, values['id'])
                 path = path.replace('{id}', values['id'])
             result = client.get(path, **value) if method == 'GET' else client.send(method, path, value)
-        elif args.command in ('projects', 'images'):
-            table, shape_of, ident = ((schema.PROJECT_OPERATIONS, schema.project_schema, schema.PROJECT)
-                                      if args.command == 'projects' else (schema.IMAGE_OPERATIONS, schema.image_schema, schema.IMAGE))
+        elif args.command in ('projects', 'images', 'whitebox'):
+            table, shape_of, ident = {'projects': (schema.PROJECT_OPERATIONS, schema.project_schema, schema.PROJECT),
+                                      'images': (schema.IMAGE_OPERATIONS, schema.image_schema, schema.IMAGE),
+                                      'whitebox': (schema.WHITEBOX_OPERATIONS, schema.whitebox_schema, schema.WHITEBOX)}[args.command]
             method, path, _ = table[args.operation]
             shape = shape_of(args.operation)
             value = read(args.file) if getattr(args, 'file', None) else {}
@@ -261,6 +286,9 @@ def main(argv=None):
             result = client.get(path, **value) if method == 'GET' else client.post(path, value)
         elif args.command == 'upload':
             result = client.upload(args.path)
+        elif args.command == 'imports':
+            result = (client.import_media(args.path, **({'ref': args.ref} if hasattr(args, 'ref') else {}))
+                      if args.operation == 'add' else client.get('/imports'))
         else:
             result = client.frame(source(args.source), values.get('at', 'last'))
     except ApiError as error:

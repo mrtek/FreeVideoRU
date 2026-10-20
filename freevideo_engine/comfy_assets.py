@@ -4,7 +4,8 @@ import math
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from . import launcher_bridge
-from .monitoring import thermal_slowdown
+from .comfy_continuation import optional_text
+from .monitoring import thermal_slowdown, shared_gpu_note, worker_gpu
 from .paths import data_root
 from .support_report import encoder_sizes
 
@@ -30,6 +31,7 @@ REFERENCE_INPUTS = ('reference', *(f'reference_{i}' for i in range(2, 9)))
 
 def resolve_loras(serialized, names, resolve, previous=None):
     """Resolve a UI stack through Comfy's registered libraries, never raw paths."""
+    serialized = optional_text(serialized, '[]')
     if not isinstance(serialized, str) or len(serialized) > 128 * 1024:
         raise ValueError('Invalid LoRA selection')
     rows = json.loads(serialized)
@@ -46,8 +48,8 @@ def resolve_loras(serialized, names, resolve, previous=None):
             continue
         name, strength = row.get('name'), row.get('strength', 1.)
         if (isinstance(strength, bool) or not isinstance(strength, (int, float))
-                or not math.isfinite(strength) or not -4 <= strength <= 4):
-            raise ValueError('LoRA strength must be a finite number between -4 and 4')
+                or not math.isfinite(strength) or not -100 <= strength <= 100):
+            raise ValueError('LoRA strength must be a finite number between -100 and 100')
         if not isinstance(name, str) or name not in available or not name.lower().endswith('.safetensors'):
             raise ValueError('Select an available safetensors LoRA from your ComfyUI model folders')
         if strength != 0:
@@ -64,6 +66,7 @@ def media_kind(filename):
 
 
 def resolve_assets(serialized, input_directory):
+    serialized = optional_text(serialized, '[]')
     if not isinstance(serialized, str) or len(serialized) > 128 * 1024:
         raise ValueError('Invalid media selection')
     rows = json.loads(serialized)
@@ -72,7 +75,11 @@ def resolve_assets(serialized, input_directory):
     root = Path(input_directory).resolve()
     result = {}
     for row in rows:
-        if not isinstance(row, dict) or set(row) - {'file', 'role', 'enabled'}:
+        if not isinstance(row, dict) or set(row) - {'file', 'role', 'enabled', 'cast', 'early_steps', 'sound'}:
+            raise ValueError('Invalid media item')
+        # The character an @ mention added the row for; a continued part keeps one picture per character.
+        if 'cast' in row and (set(row['cast'] if isinstance(row['cast'], dict) else ('?',)) != {'id'}
+                              or not isinstance(row['cast']['id'], str) or not 0 < len(row['cast']['id']) <= 128):
             raise ValueError('Invalid media item')
         if type(row.get('enabled', True)) is not bool:
             raise ValueError('Media enabled must be a boolean')
@@ -98,12 +105,61 @@ def resolve_assets(serialized, input_directory):
                 raise ValueError('Select only one ' + role + ' frame')
             result[role] = str(path)
         elif role == 'reference':
-            result.setdefault('references', []).append({'kind': kind, 'path': str(path)})
+            reference = {'kind': kind, 'path': str(path)}
+            if cast_id(row) is not None:
+                reference['cast'] = cast_id(row)   # only a continued part reads it (comfy_media.continued)
+            if 'early_steps' in row:
+                from .media_request import validate_early_steps
+                validate_early_steps(dict(row, kind=kind))
+                reference['early_steps'] = row['early_steps']
+            if 'sound' in row:
+                from .media_request import validate_sound
+                validate_sound(dict(row, kind=kind))
+                if not row['sound']:
+                    reference['sound'] = False
+            result.setdefault('references', []).append(reference)
         else:
             raise ValueError('Media role must be first, last or reference')
-    if result.get('references') and any(name in result for name in ('first', 'last')):
-        raise ValueError('Use first/last frames or references in this request. Disable unused media cards.')
+    # Mixing keyframes and references is checked when the video is made (comfy_media.export):
+    # a part that continues a video uses its keyframes as pictures.
     return result
+
+
+def continued_assets(serialized):
+    """The panel rows a continued part uses: enabled image references in panel order, at most three
+    (continuation.pick_pictures: with two or more characters, one picture each).
+
+    Its frames and sounds stay in the panel for parts that start fresh, but never reach a continued part's checks."""
+    from .continuation import pick_pictures
+    try:
+        rows = json.loads(serialized)
+    except (TypeError, ValueError):
+        return '[]'
+    pictures = []
+    for row in rows if isinstance(rows, list) else ():
+        if (isinstance(row, dict) and row.get('enabled', True) is True and row.get('role') == 'reference'
+                and isinstance(row.get('file'), str)):
+            try:
+                image = media_kind(row['file']) == 'image'
+            except ValueError:
+                image = False
+            if image:
+                pictures.append(row)
+    return json.dumps([_kept_row(row) for row in pick_pictures(pictures, cast_id)])
+
+
+def cast_id(row):
+    """The character a panel row belongs to (the media list marks rows added by an @ mention), else None."""
+    cast = row.get('cast') if isinstance(row, dict) else None
+    value = cast.get('id') if isinstance(cast, dict) else None
+    return value if isinstance(value, (str, int)) and not isinstance(value, bool) else None
+
+
+def _kept_row(row):
+    kept = dict(file=row['file'], role='reference')
+    if cast_id(row) is not None:
+        kept['cast'] = dict(id=cast_id(row))
+    return kept
 
 
 def connect_assets(assets, *, first=None, last=None, reference=None, reference_audio=None, **images):
@@ -126,12 +182,16 @@ def connect_assets(assets, *, first=None, last=None, reference=None, reference_a
     if count > 32:
         raise ValueError(f'There are {count} references and the limit is 32. '
                          'For a long image batch, connect a clip to the Reference node\'s video input; a clip counts as one reference.')
-    if count and any(
-            name in result or name in connected for name in ('first', 'last')):
-        raise ValueError('Choose keyframes or references; disable the unused inputs')
     if connected:
         result['_connected'] = connected
     return result
+
+
+def sampling_plan(report):
+    """The report's sampling plan, with the step cache its first pass used (names High and Max)."""
+    from .effort_forecast import report_step_cache
+    plan, cache = report.get('sampling_plan'), report_step_cache(report)
+    return dict(plan, step_cache=cache) if isinstance(plan, dict) and cache else plan
 
 
 def output_summary(report, relative_video):
@@ -153,14 +213,19 @@ def output_summary(report, relative_video):
                 gpu_total_bytes=report.get('profile', {}).get('policy', {}).get('hardware', {}).get('vram_total'),
                 # A small size is sampled larger and scaled back; people see the size they asked for.
                 geometry=dict(report.get('geometry', {}), **(report.get('output_size') or {})),
-                sampling_plan=report.get('sampling_plan'),
+                sampling_plan=sampling_plan(report),
                 low_memory=bool(report.get('low_memory_mode')),
-                thermal=thermal_slowdown(((report.get('memory') or {}).get('video') or {}).get('gpu')),
+                thermal=thermal_slowdown(worker_gpu(report)),
+                shared_gpu=shared_gpu_note(worker_gpu(report)),
                 reference_trims=report.get('encoding', {}).get('reference_trims') or [],
                 preview=bool(report.get('preview')), upscaled_preview=bool(report.get('upscaled_preview')),
                 video=relative_video.as_posix(), report=relative_video.with_suffix(
                     '.debug.json' if report.get('diagnostic_file') == relative_video.with_suffix('.debug.json').name
                     else '.request.json').as_posix())
+    if type(report.get('output_frames')) is int and report['output_frames'] > 0:
+        # Resource reports keep the generated canvas; result cards show only saved frames.
+        result['geometry'].update(frames=report['output_frames'],
+                                  seconds=report['output_frames'] / (result['geometry'].get('fps') or 24))
     checkpoint = encoding.get('checkpoint') or {}
     sizes = checkpoint.get('bytes'), checkpoint.get('expected_bytes')
     # Reports are read back from disk; a malformed one gets no notice rather than failing the library.

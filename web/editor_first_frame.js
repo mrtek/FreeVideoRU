@@ -6,7 +6,7 @@ export const firstFrameOn = record => record.settings?.[FIRST_FRAME_KEY] === tru
 // actions.firstFrameVisible(): the selection continues earlier footage and this machine can;
 // actions.setFirstFrame(value): saves the choice with the project.
 export function createFirstFrameSwitch(host, {state, t, actions}) {
-    const {row, input} = firstFrameRow(t, 'fv-ed-first-frame');
+    const {row, input, setDisabled} = firstFrameRow(t, 'fv-ed-first-frame');
     host.append(row);
     let shown = false;
     // While generating the row stays as it was and cannot be changed.
@@ -14,7 +14,7 @@ export function createFirstFrameSwitch(host, {state, t, actions}) {
         if (!busy) shown = !!actions.firstFrameVisible?.();
         row.hidden = !shown;
         input.checked = firstFrameOn(state.record);
-        input.disabled = busy;
+        setDisabled(busy);
     }
     input.onchange = () => { try { actions.setFirstFrame(input.checked); } catch (error) { actions.error?.(error); } finally { input.checked = firstFrameOn(state.record); } };
     update();

@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
+import * as modules from 'node:module';
+import {resolve} from './editor_test_hooks.mjs';
+if (modules.registerHooks) modules.registerHooks({resolve});
+else modules.register('./editor_test_hooks.mjs', import.meta.url);
+import {uploadMedia} from '../web/media_upload.js';
 import {outputDownloadURL} from '../web/output_download.js';
-import {regenerateResult, upscaleResult} from '../web/studio_queue.js';
-import {referenceInputs} from '../web/prompt_references.js';
+import {regenerateResult, upscaleResult, createSecondPassQueue, enableNode} from '../web/studio_queue.js';
+import {referenceInputs, mediaRows} from '../web/prompt_references.js';
+import {expandCast} from '../web/cast_mention.js';
+import {cleanOptionalPrompt, cleanOptionalWidgets, optionalInputValue} from '../web/optional_inputs.js';
 
 class Element {
     constructor(tag) {
@@ -11,7 +18,14 @@ class Element {
         this.classList = {toggle() {}, add() {}};
         this.style = {setProperty(name, value) { this[name] = value; }}; this.offsetHeight = 66;
     }
-    append(...children) { this.children.push(...children); }
+    append(...children) { for (const child of children) { child.parentNode = this; this.children.push(child); } }
+    after(...children) {
+        if (!this.parentNode) return;
+        const parent = this.parentNode, index = parent.children.indexOf(this);
+        for (const child of children) { child.remove?.(); child.parentNode = parent; }
+        parent.children.splice(index + 1, 0, ...children);
+    }
+    remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this); this.parentNode = null; }
     prepend(...children) { this.children.unshift(...children); }
     replaceChildren(...children) { this.children = [...children]; }
     setAttribute(name, value) { this.attributes[name] = value; }
@@ -21,23 +35,39 @@ class Element {
     getClientRects() { return this.unrendered ? [] : [{}]; }
     get childElementCount() { return this.children.length; }
     click() { this.clicked = true; }
+    showModal() { this.open = true; }
+    close() { this.open = false; this.onclose?.(); }
 }
 
 test('main browser entry registers both views and preserves node hooks', async t => {
     const extensions = [], opened = [], installed = [], events = new EventTarget();
-    let refreshed = 0, compatibilityChecks = 0, updateChecks = 0, rememberedView = null;
-    let progressView, progressOptions, realProgressFactory;
+    const issueURLs = [];
+    let refreshed = 0, compatibilityChecks = 0, updateChecks = 0, doneNotifyStarts = 0, rememberedView = null;
+    const openingEvents = [];
+    let restoreReleases = 0;
+    let launchReady = null;
+    const opening = {setName: name => openingEvents.push(['name', name]), cover: () => openingEvents.push(['cover']), finish: () => openingEvents.push(['finish'])};
+    const casts = [];
+    let progressView, progressOptions, realProgressFactory, studioView;
     const app = {
         registerExtension(extension) { extensions.push(extension); },
         graph: {extra: {freevideo_studio: true}, _nodes: [], getNodeById() {}},
     };
     const api = Object.assign(events, {apiURL: value => value});
-    const document = {head: new Element('head'), createElement: tag => new Element(tag)};
+    const document = {head: new Element('head'), body: new Element('body'), createElement: tag => new Element(tag),
+        createElementNS: (namespaceURI, tag) => Object.assign(new Element(tag), {namespaceURI}),
+        createRange: () => ({createContextualFragment: () => new Element('span')})};
     const dependencies = {
-        app, api, outputDownloadURL, regenerateResult, upscaleResult, referenceInputs,
+        app, api, uploadMedia, outputDownloadURL, regenerateResult, upscaleResult, createSecondPassQueue, enableNode, referenceInputs, mediaRows, expandCast, cleanOptionalPrompt, cleanOptionalWidgets, optionalInputValue,
+        createCastLibrary: options => {
+            const cast = {element: new Element('cast'), options, destroyed: false, destroy() { this.destroyed = true; }};
+            casts.push(cast); return cast;
+        },
+        secondPassAction: () => new Element('button'),
         createErrorPanel: () => ({element: new Element('error'), show() {}, clear() {}}),
+        createErrorReport: () => ({}), adviceFor: () => ({advice: {}}),
         errorText: value => String(value),
-        openStudio: node => opened.push(node),
+        openStudio: node => { opened.push(node); return studioView; },
         loraPanel: () => () => {}, loraWarning: () => 'LoRA warning', promptGuide: () => new Element('guide'),
         createGenerationProgress: (_t, _now, options) => {
             if (realProgressFactory) {
@@ -53,20 +83,24 @@ test('main browser entry registers both views and preserves node hooks', async t
         },
         referenceTrimText: row => `trimmed ${row.kind} ${row.number}`,
         thermalText: thermal => `thermal ${thermal.sm_clock_mean_mhz}`,
+        sharedGpuText: shared => `shared GPU ${shared.other_mean_percent}%`,
         encoderFileText: file => `encoder ${file.sizes.join(' / ')} GiB`,
         encoderFilePath: file => file?.offline_installation ? file.path || '' : '',
         createProgressConnection: () => ({start() {}, refresh() {}, reset() {}}),
         notifyCompatibility: async () => { compatibilityChecks++; },
         startUpdateChecks: () => { updateChecks++; },
+        startWhiteboxWorker: () => ({stop() {}}),
+        startDoneNotify: () => { doneNotifyStarts++; }, askDesktopPermission: () => {},
         installNavigation: callback => installed.push(callback),
         refreshNavigation: () => refreshed++, preferredView: () => rememberedView,
+        beginWorkspaceRestore: () => { openingEvents.push(['begin']); return opening; }, finishWorkspaceRestore: () => { restoreReleases++; }, waitForLauncherRestore: () => launchReady,
         attachReferencePicker() {}, referenceItems: () => [], syncReferencePrompt() {},
         shareButton: () => new Element('button'), reportFileName: () => 'FreeVideo-report-20261008-101530.json',
         rememberPromptDraft() {}, savePromptDraft: async () => false, openImageEditor: async () => null, icon: () => '',
     };
     const previous = new Map();
     for (const [name, value] of Object.entries({
-        document, navigator: {language: 'en'}, window: events,
+        document, navigator: {language: 'en'}, window: events, open: url => issueURLs.push(new URL(url)), addEventListener: (type, fn, options) => events.addEventListener(type, fn, options),
         getComputedStyle: element => ({marginTop: '8px', marginBottom: '8px', display: element.hidden ? 'none' : 'block', ...element.style}),
         CustomEvent: class extends Event { constructor(name, options) { super(name); this.detail = options?.detail; } },
         requestAnimationFrame: callback => callback(), __freevideoEntryTest: dependencies,
@@ -76,24 +110,40 @@ test('main browser entry registers both views and preserves node hooks', async t
     }
     try {
         let source = await readFile(new URL('../web/freevideo.js', import.meta.url), 'utf8');
+        source = source.replace("import { beginWorkspaceRestore, finishWorkspaceRestore, waitForLauncherRestore } from './workspace_restore.js';", 'const {beginWorkspaceRestore,finishWorkspaceRestore,waitForLauncherRestore} = globalThis.__freevideoEntryTest;');
         source = source.replace("import { openEditorView } from './editor_loader.js';", 'const openEditorView = (...args) => globalThis.__freevideoEntryTest.openEditorView?.(...args);');
+        source = source.replace("from './issue_button.js'", `from '${new URL('../web/issue_button.js', import.meta.url).href}'`);
         source = source
-            .replace("import { createErrorPanel, errorText } from './error_panel.js';", 'const {createErrorPanel,errorText} = globalThis.__freevideoEntryTest;')
+            .replace("import { createErrorPanel, errorText, createErrorReport, adviceFor } from './error_panel.js';", 'const {createErrorPanel,errorText,createErrorReport,adviceFor} = globalThis.__freevideoEntryTest;')
             .replace('import { app } from "../../scripts/app.js";', 'const {app} = globalThis.__freevideoEntryTest;')
             .replace('import { api } from "../../scripts/api.js";', 'const {api} = globalThis.__freevideoEntryTest;')
             .replace("import { openStudio, loraPanel, loraWarning, promptGuide } from \"./studio.js\";", 'const {openStudio,loraPanel,loraWarning,promptGuide} = globalThis.__freevideoEntryTest;')
-            .replace("import { createGenerationProgress, referenceTrimText, thermalText, encoderFileText, encoderFilePath } from './generation_progress.js';", 'const {createGenerationProgress,referenceTrimText,thermalText,encoderFileText,encoderFilePath} = globalThis.__freevideoEntryTest;')
+            .replace("import { createGenerationProgress, referenceTrimText, thermalText, sharedGpuText, encoderFileText, encoderFilePath } from './generation_progress.js';", 'const {createGenerationProgress,referenceTrimText,thermalText,sharedGpuText,encoderFileText,encoderFilePath} = globalThis.__freevideoEntryTest;')
             .replace("import { createProgressConnection } from './progress_connection.js';", 'const {createProgressConnection} = globalThis.__freevideoEntryTest;')
             .replace("import { notifyCompatibility } from './compatibility.js';", 'const {notifyCompatibility} = globalThis.__freevideoEntryTest;')
+            .replace("import { startWhiteboxWorker } from './whitebox_worker.js';", 'const {startWhiteboxWorker} = globalThis.__freevideoEntryTest;')
             .replace("import { startUpdateChecks } from './updates.js';", 'const {startUpdateChecks} = globalThis.__freevideoEntryTest;')
-            .replace("import { attachReferencePicker, referenceItems, syncReferencePrompt, referenceInputs } from './prompt_references.js';", 'const {attachReferencePicker,referenceItems,syncReferencePrompt,referenceInputs} = globalThis.__freevideoEntryTest;')
+            .replace("import { startDoneNotify, askDesktopPermission, DESKTOP_SETTING } from './done_notify.js';", 'const {startDoneNotify,askDesktopPermission} = globalThis.__freevideoEntryTest; const DESKTOP_SETTING = "FreeVideo.DoneNotify.Desktop";')
+            .replace("import { attachReferencePicker, referenceItems, syncReferencePrompt, referenceInputs, mediaRows } from './prompt_references.js';", 'const {attachReferencePicker,referenceItems,syncReferencePrompt,referenceInputs,mediaRows} = globalThis.__freevideoEntryTest;')
+            .replace("import { expandCast } from './cast_mention.js';", 'const {expandCast} = globalThis.__freevideoEntryTest;')
             .replace("import { outputDownloadURL } from './output_download.js';", 'const {outputDownloadURL} = globalThis.__freevideoEntryTest;')
             .replace("import { shareButton } from './share.js';", 'const {shareButton} = globalThis.__freevideoEntryTest;')
             .replace("import { reportFileName } from './report_issue.js';", 'const {reportFileName} = globalThis.__freevideoEntryTest;')
-            .replace("import { rememberPromptDraft, savePromptDraft } from './prompt_draft.js';", 'const {rememberPromptDraft,savePromptDraft} = globalThis.__freevideoEntryTest;')
+            .replace("import { rememberPromptDraft, savePromptDraft, trackPromptDraft, watchPromptHistory, promptHistoryRestoring } from './prompt_draft.js';", 'const {rememberPromptDraft,savePromptDraft} = globalThis.__freevideoEntryTest; const trackPromptDraft = () => {}; const watchPromptHistory = () => {}; const promptHistoryRestoring = () => false;')
+            .replace("import { cleanOptionalWidgets, cleanOptionalPrompt, optionalInputValue } from './optional_inputs.js';", 'const {cleanOptionalWidgets,cleanOptionalPrompt,optionalInputValue} = globalThis.__freevideoEntryTest;')
             .replace("import { regenerateResult, upscaleResult } from './studio_queue.js';", 'const {regenerateResult,upscaleResult} = globalThis.__freevideoEntryTest;')
+            .replace("import { regenerateResult, createSecondPassQueue, enableNode } from './studio_queue.js';", 'const {regenerateResult,createSecondPassQueue,enableNode} = globalThis.__freevideoEntryTest;')
+            .replace("import { secondPassAction } from './result_actions.js';", 'const {secondPassAction} = globalThis.__freevideoEntryTest;')
             .replace("import { openImageEditor, icon } from './image_editor.js';", 'const {openImageEditor,icon} = globalThis.__freevideoEntryTest;')
-            .replace("import { installNavigation, refreshNavigation, preferredView } from './view_navigation.js';", 'const {installNavigation,refreshNavigation,preferredView} = globalThis.__freevideoEntryTest;');
+            .replace("import { installNavigation, refreshNavigation, preferredView, collapseWorkspaces } from './view_navigation.js';", 'const {installNavigation,refreshNavigation,preferredView} = globalThis.__freevideoEntryTest; const collapseWorkspaces = () => { globalThis.__freevideoEntryTest.collapsed = (globalThis.__freevideoEntryTest.collapsed || 0) + 1; };')
+            .replace("import { isLaunchVisit } from './launch_visit.js';", 'const isLaunchVisit = () => false;')
+            .replace("import { openFreeVideoWorkflow } from './launcher.js';", 'const openFreeVideoWorkflow = (...args) => globalThis.__freevideoEntryTest.openFreeVideoWorkflow?.(...args);')
+            .replace("import { imageGenerationSupported } from './image_generation.js';", 'const imageGenerationSupported = () => true;')
+            .replace("import { uploadMedia } from './media_upload.js';", 'const {uploadMedia} = globalThis.__freevideoEntryTest;')
+            .replace("import { createCastLibrary } from './cast_library.js';", 'const {createCastLibrary} = globalThis.__freevideoEntryTest;')
+            .replace("import { agentInterfaceEnabled } from './agent_connect.js';", 'const agentInterfaceEnabled = async () => false;')
+            .replace("import { installNativeErrorGuard } from './native_errors.js';", 'const installNativeErrorGuard = () => {};')
+            .replace("import { installTranslateGuard } from './translate_guard.js';", 'const installTranslateGuard = () => {};');
         await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
         const extension = extensions.find(row => row.name === 'FreeVideo.UnifiedMedia');
         assert.ok(extension, 'the main extension must register');
@@ -101,6 +151,7 @@ test('main browser entry registers both views and preserves node hooks', async t
         assert.equal(installed.length, 1, 'the Create / Nodes navigation must be installed');
         assert.equal(compatibilityChecks, 1);
         assert.equal(updateChecks, 1);
+        assert.equal(doneNotifyStarts, 1);
 
         class GenerateNode {
             constructor() {
@@ -120,6 +171,68 @@ test('main browser entry registers both views and preserves node hooks', async t
             arrange() { this.arranged = (this.arranged || 0) + 1; }
             computeSize() { return [this.size[0], this.dom.reduce((height, row) => height + (row.options?.getMinHeight?.() || 0), 0)]; }
         }
+        for (const [language, tooltip] of [
+            ['en', 'Changing sampling steps may lower generation quality. Default: 8 first-pass and 3 second-pass steps. Two-pass acceleration runs only with 8 first-pass steps. Other step counts use a single pass. Other second-pass counts must be fewer than first-pass steps.'],
+            ['zh', '修改采样步数可能降低生成质量。默认一采 8 步、二采 3 步；只有一采为 8 步时才会使用二次采样加速，其他步数只采样一遍；其他二采步数需小于一采步数。'],
+        ]) {
+            await t.test(`${language} node step tooltips include the three-step exception for valid plans`, async () => {
+                navigator.language = language;
+                try {
+                    await import('data:text/javascript;base64,' + Buffer.from(source + `\n// tooltip language: ${language}`).toString('base64'));
+                    const localized = extensions.at(-1);
+                    class LocalizedGenerateNode extends GenerateNode {}
+                    await localized.beforeRegisterNodeDef(LocalizedGenerateNode, {name: 'FreeVideoGenerate'});
+                    for (const [base, refine] of [[1, 3], [2, 3], [3, 3], [8, 3], [8, 2]]) {
+                        const node = new LocalizedGenerateNode();
+                        node.widgets[0].value = base; node.widgets[1].value = refine;
+                        node.onNodeCreated();
+                        assert.equal(node.widgets[0].tooltip, tooltip, `${base} + ${refine}: first-pass tooltip`);
+                        assert.equal(node.widgets[1].tooltip, tooltip, `${base} + ${refine}: refine tooltip`);
+                        assert.deepEqual(node.widgets.slice(0, 2).map(widget => widget.value), [base, refine]);
+                        node.onRemoved();
+                    }
+                } finally { navigator.language = 'en'; }
+            });
+            await t.test(`${language} advanced node labels preserve keys, values and untranslated copy`, async () => {
+                navigator.language = language;
+                try {
+                    await import('data:text/javascript;base64,' + Buffer.from(source + `\n// label language: ${language}`).toString('base64'));
+                    const localized = extensions.at(-1);
+                    class LocalizedGenerateNode extends GenerateNode {}
+                    await localized.beforeRegisterNodeDef(LocalizedGenerateNode, {name: 'FreeVideoGenerate'});
+                    const rows = [
+                        ['width', 'width', '宽度', 1344],
+                        ['height', 'height', '高度', 768],
+                        ['seconds', 'Duration (s)', '时长（秒）', 10],
+                        ['seed', 'seed', '种子', 2026090903],
+                        ['force_regenerate', 'Force regeneration', '重新生成', false, '跳过已保存结果的缓存。'],
+                        ['preview', 'Two-pass: preview first pass', '先出预览', false,
+                            '先出半分辨率预览，满意后在结果里点“继续二采”，成片与直接生成一致。'],
+                        ['refine_from', 'Second pass of preview', '继续二采', 'preview.mp4', '从这个预览继续生成全分辨率视频。'],
+                        ['continue_from', 'Continue from video', '接着生成', 'previous.mp4'],
+                        ['frames', 'Total frames', '帧数', 141],
+                        ['first_frame_reference', 'First-frame reference', '首帧参考', true, '减小漂移'],
+                        ['step_cache', 'Step cache', '步间缓存', 'none',
+                            '复用相近采样步之间的计算，更快完成，结果会有细微变化。'],
+                        ['upscale_factor', 'Upscale factor', '放大倍数', '2', '二次采样时成片相对首遍的放大倍数。'],
+                        ['voice_reference', 'Voice reference', 'Voice reference', true],
+                        ['hide_tail', 'Hide dialogue tail', 'Hide dialogue tail', true],
+                    ];
+                    const node = new LocalizedGenerateNode();
+                    node.widgets = rows.map(([name, label, , value]) => ({name, label, value, tooltip: `original ${name}`}));
+                    node.onNodeCreated();
+                    assert.deepEqual(node.widgets.map(w => [w.name, w.value]), rows.map(([name, , , value]) => [name, value]));
+                    for (const [name, en, zh, , tooltip] of rows) {
+                        const widget = node.widgets.find(w => w.name === name);
+                        assert.equal(widget.label, language === 'zh' ? zh : en, name);
+                        assert.equal(widget.tooltip, language === 'zh' && tooltip ? tooltip : `original ${name}`, name);
+                    }
+                    assert.equal(node.widgets.find(w => w.name === 'force_regenerate').type, 'hidden');
+                    assert.equal(node.widgets.find(w => w.name === 'force_regenerate').serializeValue(), false);
+                    node.onRemoved();
+                } finally { navigator.language = 'en'; }
+            });
+        }
         await extension.beforeRegisterNodeDef(GenerateNode, {name: 'FreeVideoGenerate'});
         const node = new GenerateNode(); app.graph._nodes = [node];
         assert.equal(node.onNodeCreated(), 'created');
@@ -137,19 +250,101 @@ test('main browser entry registers both views and preserves node hooks', async t
         node.widgets[0].value = false; node.onConfigure();
         assert.equal(node.widgets[0].value, 8, 'Migrate the previous private force-checkbox slot');
         node.buttons[0].callback();
+        const quiet = opened.length;
+        const releasesBefore = restoreReleases;
+        extension.afterConfigureGraph();
+        assert.equal(opened.length, quiet, 'a tab restored with the page does not open the workspace on its own');
+        assert.equal(restoreReleases, releasesBefore + 1, 'the page-load cover is released when nothing opens');
+        events.dispatchEvent(new Event('pointerdown'));
         extension.afterConfigureGraph();
         assert.deepEqual(opened, [node, node]);
+        // A workflow without FreeVideo nodes is the user's own: every workspace makes way and none opens.
+        const nodes = app.graph._nodes, collapsed = dependencies.collapsed || 0;
+        app.graph._nodes = [];
+        extension.afterConfigureGraph();
+        assert.equal(dependencies.collapsed, collapsed + 1); assert.deepEqual(opened, [node, node]);
+        // The menu entry opens the workspace of the workflow in front, or FreeVideo's own workflow when it has no node.
+        const entry = extension.commands.find(row => row.id === 'FreeVideo.Open');
+        assert.equal(entry.label, 'FreeVideo'); assert.deepEqual(extension.menuCommands[0].commands, ['FreeVideo.Open']);
+        let workflows = 0;
+        dependencies.openFreeVideoWorkflow = async () => { workflows++; return node; };
+        const before = opened.length;
+        await entry.function();
+        assert.equal(workflows, 1); assert.equal(opened.length, before + 1); assert.equal(app.graph._nodes.length, 0);
+        app.graph._nodes = nodes;
+        await entry.function();
+        assert.equal(workflows, 1); assert.equal(opened.length, before + 2);
+        app.graph._nodes = [];
+        dependencies.openFreeVideoWorkflow = async () => { throw new Error('workflow fixture unavailable'); };
+        const warn = console.warn; console.warn = () => {};
+        try { await entry.function(); } finally { console.warn = warn; }
+        const menuFailure = document.body.children.find(child => child.className?.includes('fv-menu-failure'));
+        assert.ok(menuFailure.open);
+        const menuIssue = menuFailure.children[1].children[0];
+        assert.ok(menuIssue.className.includes('fv-issue-button')); assert.notEqual(menuIssue.hidden, true);
+        await menuIssue.onclick();
+        assert.match(issueURLs.at(-1).searchParams.get('feedback'), /Error: Could not complete\. Try again\./);
+        app.graph._nodes = nodes; await entry.function();
+        assert.equal(document.body.children.includes(menuFailure), false, 'successful opening clears the failure and its report button');
         rememberedView = 'editor';
         const restored = [];
-        dependencies.openEditorView = (value, options) => restored.push({node:value, studio:options.studio});
+        let finishLaunch, finishEditor;
+        launchReady = new Promise(resolve => { finishLaunch = resolve; });
+        const ready = new Promise(resolve => { finishEditor = resolve; });
+        dependencies.openEditorView = (value, options) => { restored.push({node:value, studio:options.studio}); options.onProjectLoaded({name: 'saved project'}); return {ready}; };
+        const beforeRestore = opened.length;
         extension.afterConfigureGraph();
+        assert.equal(restored.length, 0, 'wait for launcher/session restoration before choosing the workspace');
+        finishLaunch(); await Promise.resolve(); await Promise.resolve();
         assert.equal(restored[0].node, node);
-        assert.ok(restored[0].studio, 'restore opens the studio before the editor');
+        assert.equal(restored[0].studio, undefined, 'restore enters the editor directly');
+        assert.equal(opened.length, beforeRestore, 'the creation panel never flashes during a successful recovery');
+        assert.deepEqual(openingEvents, [['begin'], ['name', 'saved project'], ['cover']]);
+        finishEditor(); await Promise.resolve(); await Promise.resolve();
+        assert.deepEqual(openingEvents.at(-1), ['finish'], 'keep the opening status and update suppression until editor.ready');
+        launchReady = null;
+        await t.test('a graph replaced while launcher restoration waits cannot reopen its editor', async () => {
+            let release, calls = 0;
+            launchReady = new Promise(resolve => { release = resolve; });
+            dependencies.openEditorView = () => { calls++; return {ready: Promise.resolve()}; };
+            extension.beforeConfigureGraph(); extension.afterConfigureGraph();
+            extension.beforeConfigureGraph(); app.graph._nodes = [];
+            const releases = restoreReleases; extension.afterConfigureGraph();
+            assert.equal(restoreReleases, releases + 1);
+            release(); await Promise.resolve(); await Promise.resolve();
+            assert.equal(calls, 0, 'a stale launcher callback must not import or open an editor');
+            launchReady = null; app.graph._nodes = nodes;
+        });
+        await t.test('a graph replaced while the editor import waits cannot cover the new workflow', async () => {
+            let release, options;
+            dependencies.openEditorView = async (_node, value) => {
+                options = value;
+                await new Promise(resolve => { release = resolve; });
+                return value.isCurrent() ? {ready: Promise.resolve()} : null;
+            };
+            extension.beforeConfigureGraph(); extension.afterConfigureGraph();
+            assert.equal(options.isCurrent(), true);
+            extension.beforeConfigureGraph(); app.graph._nodes = []; extension.afterConfigureGraph();
+            const covered = openingEvents.filter(row => row[0] === 'cover').length;
+            assert.equal(options.isCurrent(), false);
+            release(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+            assert.equal(openingEvents.filter(row => row[0] === 'cover').length, covered);
+            app.graph._nodes = nodes;
+        });
         // The lazy loader owns failed imports: it notifies, reports through onFailure and resolves null.
+        const studioStatus = new Element('div'); studioView = {querySelector: () => studioStatus};
         dependencies.openEditorView = async (node, options) => { options.onFailure(new Error('editor unavailable')); return null; };
-        extension.afterConfigureGraph(); await Promise.resolve();
+        extension.afterConfigureGraph(); for (let i = 0; i < 10; i++) await Promise.resolve();
         assert.ok(window.__freevideoHealth.some(row => row.where === 'editor'));
         assert.equal(opened.at(-1), node, 'editor failure leaves the restored studio available');
+        const editorIssue = studioStatus.children.find(child => child.className?.includes('fv-issue-button'));
+        assert.ok(editorIssue); assert.notEqual(editorIssue.hidden, true);
+        await editorIssue.onclick();
+        assert.match(issueURLs.at(-1).searchParams.get('feedback'), /Where: Open editor\nError: Could not complete\. Try again\./);
+        studioStatus.replaceChildren(); dependencies.openEditorView = async () => ({ready: Promise.resolve()});
+        extension.afterConfigureGraph(); for (let i = 0; i < 10; i++) await Promise.resolve();
+        assert.equal(studioStatus.children.length, 0, 'successful editor opening adds no issue button');
+        studioView = null;
         rememberedView = 'nodes';
         const count = opened.length; extension.afterConfigureGraph();
         assert.equal(opened.length, count, 'remembered Nodes does not open either dialog');
@@ -190,12 +385,14 @@ test('main browser entry registers both views and preserves node hooks', async t
             launcher: true, offline_installation: false};
         const resultWidth = node.size[0];
         node.setSize([resultWidth, 100]);
-        node.freevideoShowResult({freevideo_summary: [{video, result_cache_hit: true, sample_seconds: 99, encoder_file}]});
+        node.freevideoShowResult({freevideo_summary: [{video, result_cache_hit: true, sample_seconds: 99, encoder_file,
+            thermal: {sm_clock_mean_mhz: 900}, shared_gpu: {other_mean_percent: 42}}]});
         const reused = node.dom.find(row => row.name === 'freevideo_result').element;
         assert.equal(reused.children[0].hidden, true, 'Do not show the old sampling time as current work');
         assert.ok(reused.children[1].children.some(e => e.textContent === 'Reused previous result'));
         assert.ok(reused.children.some(e => e.className === 'fv-note' && e.textContent === 'encoder 25.3 / 14.6 GiB'),
             'A cached result still came from the same encoder file');
+        assert.ok(!reused.children.some(e => e.textContent === 'shared GPU 42%'), 'A cached result did not share the GPU this time');
         assert.deepEqual(node.size, [resultWidth, node.computeSize()[1]], 'Grow the node after appending the encoder notice');
         const again = reused.children[1].children.at(-1);
         assert.equal(again.textContent, 'Regenerate');
@@ -217,11 +414,12 @@ test('main browser entry registers both views and preserves node hooks', async t
         assert.ok(node.computeSize()[1] < progressHeight);
         assert.deepEqual(node.size, [resultWidth, progressHeight], 'Shorter results must not shrink the node');
         node.freevideoShowResult({freevideo_summary: [{video, sample_seconds: 5, encoder_file, thermal: {sm_clock_mean_mhz: 900},
+            shared_gpu: {other_mean_percent: 42},
             reference_trims: [{kind: 'video', number: 1, seconds: 20.3, used_seconds: 5.17}]}]});
         assert.deepEqual(reused.children.filter(e => e.className === 'fv-note fv-trim-note').map(e => e.textContent),
             ['trimmed video 1'], 'Say which reference was shortened, never cut silently');
         assert.deepEqual(reused.children.filter(e => e.className === 'fv-note' && !e.hidden).map(e => e.textContent),
-            ['thermal 900', 'encoder 25.3 / 14.6 GiB'], 'Show the encoder notice after the thermal notice');
+            ['thermal 900', 'shared GPU 42%', 'encoder 25.3 / 14.6 GiB'], 'Show thermal, shared GPU and encoder notices in order');
         assert.ok(node.computeSize()[1] > progressHeight);
         assert.deepEqual(node.size, [resultWidth, node.computeSize()[1]], 'Measure the result height after all notices are appended');
 
@@ -264,8 +462,9 @@ test('main browser entry registers both views and preserves node hooks', async t
             node.freevideoShowFailure({exception_message: 'Failed'});
             assert.equal(options.getMinHeight(), 420, 'Failure keeps its existing height');
             node.freevideoShowResult({freevideo_summary: [{video, low_memory: true, thermal: {sm_clock_mean_mhz: 900},
+                shared_gpu: {other_mean_percent: 42},
                 reference_trims: [{kind: 'video', number: 1}]}]});
-            assert.equal(options.getMinHeight(), 461, 'Measure memory, thermal and reference trim notices');
+            assert.equal(options.getMinHeight(), 543, 'Add 82 px for the shared GPU notice: 66 px text height and two 8 px margins');
         });
 
         class MediaNode extends GenerateNode {
@@ -279,13 +478,17 @@ test('main browser entry registers both views and preserves node hooks', async t
         await extension.beforeRegisterNodeDef(MediaNode, {name: 'FreeVideoMedia'});
         const media = new MediaNode(); media.onNodeCreated();
         const panel = media.dom.find(row => row.name === 'freevideo_media').element;
-        const [toolbar, mode, note, audioHelp, connections] = panel.children;
+        const [castRow, toolbar, mode, note, audioHelp, connections] = panel.children;
+        assert.equal(castRow, casts[0].element);
+        assert.equal(casts[0].options.api, api);
+        assert.equal(typeof casts[0].options.uploadOne, 'function');
+        assert.equal(typeof casts[0].options.viewURL, 'function');
         assert.match(mode.textContent, /Reference/);
         assert.equal(audioHelp.hidden, false);
         assert.match(audioHelp.textContent, /<Audio 1>/);
         assert.match(connections.children[0].textContent, /Reference audio.*Connected/);
         const audioButton = toolbar.children.find(e => e.tag === 'button' && e.textContent === 'Reference audio');
-        const audioPicker = toolbar.children.find(e => e.tag === 'input' && e.accept.startsWith('audio/'));
+        const audioPicker = toolbar.children.find(e => e.tag === 'input' && e.accept.startsWith('.wav'));
         audioButton.onclick(); assert.equal(audioPicker.clicked, true);
         api.fetchApi = async (url, options) => {
             assert.equal(url, '/freevideo/media/upload');
@@ -302,7 +505,7 @@ test('main browser entry registers both views and preserves node hooks', async t
         assert.equal(audioHelp.hidden, true);
         assert.match(mode.textContent, /Text to video/);
         const imageRole = toolbar.children.find(e => e.tag === 'select');
-        const imagePicker = toolbar.children.find(e => e.tag === 'input' && e.accept.startsWith('image/'));
+        const imagePicker = toolbar.children.find(e => e.tag === 'input' && e.accept.startsWith('.png'));
         assert.equal(imageRole.value, 'reference');
         api.fetchApi = async () => ({ok: true, json: async () => ({file: 'image.png'})});
         imagePicker.files = [new File(['image'], 'image.png', {type: 'image/png'})];
@@ -313,6 +516,10 @@ test('main browser entry registers both views and preserves node hooks', async t
         await imagePicker.onchange();
         assert.deepEqual(JSON.parse(media.widgets[0].value).map(row => row.role), ['reference', 'first']);
         media.onRemoved();
+        assert.equal(casts[0].destroyed, true);
+        const mounted = new Element('mount'), disposeMedia = media.freevideoCreateMediaEditor(mounted);
+        assert.equal(mounted.children[0].children[0], casts[1].element);
+        disposeMedia(); assert.equal(casts[1].destroyed, true);
 
         await t.test('Generate node removal preserves the original hook when setSize throws', async () => {
             const previousInterval = globalThis.setInterval, previousClear = globalThis.clearInterval;
@@ -329,17 +536,18 @@ test('main browser entry registers both views and preserves node hooks', async t
                 removalNode = new GenerateNode(); removalNode.id = 10; removalNode.onNodeCreated();
                 removalNode.freevideoShowProgress({phase: 'load', received_at: 0});
                 const progress = progressView;
-                assert.deepEqual(progress.element.children.slice(0, 8).map(child => child.className), [
+                assert.deepEqual(progress.element.children.slice(0, 10).map(child => child.className), [
                     'fv-generation-heading', 'fv-generation-track', 'fv-generation-label',
-                    'fv-generation-mini', 'fv-generation-times', 'fv-generation-compatibility', 'fv-generation-status', 'fv-generation-live']);
+                    'fv-generation-mini', 'fv-generation-frames', 'fv-generation-times', 'fv-generation-late', 'fv-generation-compatibility', 'fv-generation-status', 'fv-generation-live']);
                 const activity = progress.snapshot().label;
                 removalNode.freevideoShowProgress({compatibility: {level: 2, name_en: 'Compatible', name_zh: '兼容'}});
                 assert.equal(progress.snapshot().label, activity, 'The node must not replace the activity for settings-only events');
-                assert.match(progress.snapshot().status, /Compatibility setting Compatible|兼容档/);
+                assert.match(progress.snapshot().status, /so far|已进行/, 'pause has priority over a settings-only compatibility notice');
                 removalNode.freevideoShowProgress({phase: 'recovery', retry: {kind: 'ram_pressure'}});
                 assert.match(progress.snapshot().status, /Out of RAM|内存不足/);
                 removalNode.freevideoShowProgress({new_request: true, phase: 'load', received_at: 0});
-                assert.equal(progress.snapshot().status, '', 'A new request clears the old retry and compatibility notice');
+                assert.match(progress.snapshot().status, /so far|已进行/, 'An aged new request clears retry and compatibility but shows its own pause');
+                assert.doesNotMatch(progress.snapshot().status, /Out of RAM|内存不足|Compatibility setting|兼容档/);
                 assert.equal(progress.stall.hidden, false);
                 assert.equal(timers.size, 1);
                 let layoutCalls = 0, timersDuringLayout;

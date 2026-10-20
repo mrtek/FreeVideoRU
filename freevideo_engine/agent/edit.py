@@ -114,7 +114,7 @@ def _apply(m, x, y):
 # Colour and rasters: float32 premultiplied RGBA in 0..1, like a canvas.
 
 def _color(value, path='/'):
-    if value is None or value == 'transparent':
+    if value is None or isinstance(value, str) and value.strip().lower() in ('transparent', 'none'):
         return (0., 0., 0., 0.)
     try:
         r, g, b, a = ImageColor.getcolor(str(value), 'RGBA')

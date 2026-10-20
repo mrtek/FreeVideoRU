@@ -7,6 +7,7 @@ import sys
 
 from .hardware import installed_backends
 from .paths import data_root
+from .triton_compat import temp_root
 
 PACKAGES = ('torch', 'triton', 'triton-windows', 'diffusers', 'sageattention', 'flash-attn', 'flash-attn-4')
 COMPUTE_FILES = ('attention.py', 'backends/__init__.py', 'backends/base.py', 'backends/cuda.py',
@@ -47,7 +48,21 @@ def receipt_path():
     return data_root() / 'kernel-capabilities.json'
 
 
+def view_root(environ=None):
+    """The short folder this process runs the installation from; None from the installation's own."""
+    from . import launch_view
+    view = launch_view.current(environ) or launch_view.current()
+    return str(view.root) if view is not None and view.used else None
+
+
 LINEAR_PROBES = ('linear', 'linear-int8')
+
+
+def needs_path_recheck(receipt, environ=None):
+    """Retry failed checks once after changing the installation or temporary view."""
+    return (not readiness(receipt['kernel_probes'])['ready']
+            and (receipt.get('view_root') != view_root(environ)
+                 or receipt.get('temp_root') != temp_root(environ)))
 
 
 def readiness(rows):
@@ -89,6 +104,10 @@ def available_backends(hardware, *, discovered=None, probe_missing=True):
     """
     discovered = set(installed_backends() if discovered is None else discovered)
     receipt = matching_receipt(hardware, discovered)
+    if receipt is not None and probe_missing and needs_path_recheck(receipt):
+        # They failed while the installation ran from another folder, and compilers take some
+        # paths only as that folder spells them. What passed is kept wherever it ran from.
+        receipt = None
     if receipt is None:
         if not probe_missing:
             return discovered
